@@ -1341,6 +1341,20 @@ class CoregPipeline(Coreg):
 
             tba_dem_mod = coreg.apply(tba_dem_mod, transform)
 
+    def _fit_pts_func(self, ref_dem: pd.DataFrame, tba_dem: RasterType, transform: Optional[rio.transform.Affine],
+                  weights: Optional[np.ndarray], verbose: bool = False, input_latlon: bool = False):
+        """Fit each coregistration step with the previously transformed DEM."""
+        tba_dem_mod = tba_dem.copy()
+
+        for i, coreg in enumerate(self.pipeline):
+            if verbose:
+                print(f"Running pipeline step: {i + 1} / {len(self.pipeline)}")
+            coreg._fit_pts_func(ref_dem, tba_dem_mod, transform=transform, weights=weights, verbose=verbose,
+                                input_latlon=input_latlon)
+            coreg._fit_called = True
+
+            tba_dem_mod = coreg.apply(tba_dem_mod, transform)
+
     def _apply_func(self, dem: np.ndarray, transform: rio.transform.Affine) -> np.ndarray:
         """Apply the coregistration steps sequentially to a DEM."""
         dem_mod = dem.copy()
