@@ -1580,8 +1580,8 @@ class NuthKaab(Coreg):
             print("   Calculate slope and aspect")
         # slope, aspect = xdem.terrain.get_terrain_attribute(tba_dem, attribute=['slope', 'aspect'], degrees=False)
         slope, aspect = calculate_slope_and_aspect(tba_arr)
-        slope_r = tba_dem.copy(new_array=slope[None, :, :])
-        aspect_r = tba_dem.copy(new_array=aspect[None, :, :])
+        slope_r = tba_dem.copy(new_array=np.ma.masked_array(slope[None, :, :], mask=~np.isfinite(slope[None, :, :])))
+        aspect_r = tba_dem.copy(new_array=np.ma.masked_array(aspect[None, :, :], mask=~np.isfinite(aspect[None, :, :])))
 
         # Make index grids for the east and north dimensions
         east_grid = np.arange(tba_arr.shape[1])
@@ -1589,7 +1589,7 @@ class NuthKaab(Coreg):
 
         # Make a function to estimate the aligned DEM (used to construct an offset DEM)
         elevation_function = scipy.interpolate.RectBivariateSpline(
-            x=north_grid, y=east_grid, z=np.where(np.isnan(tba_arr), -9999, tba_arr), kx=1, ky=1
+            x=north_grid, y=east_grid, z=np.where(np.isnan(tba_arr), tba_dem.nodata, tba_arr), kx=1, ky=1
         )
 
         # Make a function to estimate nodata gaps in the aligned DEM (used to fix the estimated offset DEM)
@@ -1669,10 +1669,13 @@ class NuthKaab(Coreg):
 
             # Set NaNs where NaNs were in the original data
             new_nans = nodata_function(y=east_grid + offset_east, x=north_grid - offset_north)
-            new_elevation[new_nans >= 1] = np.nan
+            mask_nans = new_nans > 0
+            new_elevation[mask_nans] = tba_dem.nodata
+
+            ma_elevation = np.ma.masked_array(new_elevation[None, :, :], mask=mask_nans)
 
             # Assign the newly calculated elevations to the aligned_dem
-            aligned_dem = tba_dem.copy(new_array=new_elevation[None, :, :])
+            aligned_dem = tba_dem.copy(new_array=ma_elevation)
 
             # Assign the newly calculated elevations to the aligned_dem
             # aligned_dem.shift(east_diff, north_diff)
@@ -1705,8 +1708,8 @@ class NuthKaab(Coreg):
             print("   Statistics on coregistered dh:")
             print("      Median = {:.2f} - NMAD = {:.2f}".format(bias, nmad_new))
 
-        self._meta["offset_east_px"] = -offset_east
-        self._meta["offset_north_px"] = -offset_north
+        self._meta["offset_east_px"] = offset_east
+        self._meta["offset_north_px"] = offset_north
         self._meta["bias"] = bias
         self._meta["resolution"] = resolution
 
@@ -1785,27 +1788,27 @@ def apply_matrix(dem: np.ndarray, transform: rio.transform.Affine, matrix: np.nd
         return demc + matrix[2, 3]
 
     # Check if the matrix only contains a X, Y and Z correction. In that case, only shift the DEM grid and values.
-    empty_matrix[0, 3] = matrix[0, 3]
-    empty_matrix[1, 3] = matrix[1, 3]
-    if np.array_equal(empty_matrix, matrix):
-        east_grid = np.arange(dem.shape[1])
-        north_grid = np.arange(dem.shape[0])
-
-        # Make a function to estimate the DEM (used to construct an offset DEM)
-        elevation_function = scipy.interpolate.RectBivariateSpline(x=north_grid, y=east_grid,
-                                                                   z=np.where(np.isnan(demc), -9999, dem))
-        # Make a function to estimate nodata gaps in the aligned DEM (used to fix the estimated offset DEM)
-        nodata_function = scipy.interpolate.RectBivariateSpline(x=north_grid, y=east_grid, z=np.isnan(demc))
-
-        shifted_east_grid = east_grid + matrix[0, 3] / transform[0]
-        # The typical negative sign is in the transform
-        shifted_north_grid = north_grid + matrix[1, 3] / transform[4]
-
-        shifted_dem = elevation_function(y=shifted_east_grid, x=shifted_north_grid)
-        new_nans = nodata_function(y=shifted_east_grid, x=shifted_north_grid)
-        shifted_dem[new_nans >= 1] = np.nan
-
-        return shifted_dem + matrix[2, 3]
+    # empty_matrix[0, 3] = matrix[0, 3]
+    # empty_matrix[1, 3] = matrix[1, 3]
+    # if np.array_equal(empty_matrix, matrix):
+    #     east_grid = np.arange(dem.shape[1])
+    #     north_grid = np.arange(dem.shape[0])
+    #
+    #     # Make a function to estimate the DEM (used to construct an offset DEM)
+    #     elevation_function = scipy.interpolate.RectBivariateSpline(x=north_grid, y=east_grid,
+    #                                                                z=np.where(np.isnan(demc), -9999, dem))
+    #     # Make a function to estimate nodata gaps in the aligned DEM (used to fix the estimated offset DEM)
+    #     nodata_function = scipy.interpolate.RectBivariateSpline(x=north_grid, y=east_grid, z=np.isnan(demc))
+    #
+    #     shifted_east_grid = east_grid + matrix[0, 3] / transform[0]
+    #     # The typical negative sign is in the transform
+    #     shifted_north_grid = north_grid + matrix[1, 3] / transform[4]
+    #
+    #     shifted_dem = elevation_function(y=shifted_east_grid, x=shifted_north_grid)
+    #     new_nans = nodata_function(y=shifted_east_grid, x=shifted_north_grid)
+    #     shifted_dem[new_nans > 0] = np.nan
+    #
+    #     return shifted_dem + matrix[2, 3]
 
     # Opencv is required down from here
     if not _has_cv2:
