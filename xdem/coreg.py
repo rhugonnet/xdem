@@ -583,7 +583,7 @@ class Coreg:
         # If any input is a Raster, use its transform if 'transform is None'.
         # If 'transform' was given and any input is a Raster, trigger a warning.
         # Finally, extract only the data of the raster.
-        for name, dem in [("reference_dem", reference_dem)]:
+        for name, dem in [("dem_to_be_aligned", dem_to_be_aligned)]:
             if hasattr(dem, "transform"):
                 if transform is None:
                     transform = getattr(dem, "transform")
@@ -593,48 +593,59 @@ class Coreg:
         if transform is None:
             raise ValueError("'transform' must be given if the dem_to_be_align DEM is array-like.")
 
-        tba_dem, tba_mask = spatial_tools.get_array_and_mask(dem_to_be_aligned)
-        ref_mask = ~np.isfinite(reference_dem['z'])
-        ref_dem = reference_dem[ref_mask]
+        _, tba_mask = spatial_tools.get_array_and_mask(dem_to_be_aligned)
 
-        # points = np.array(reference_dem['lat'], reference_dem['lon'])
-        # tba_pts = dem_to_be_aligned.interp_points(points, input_latlon=input_latlon)
-        # final_mask = ~np.isfinite(tba_pts)
+        if np.all(tba_mask):
+            raise ValueError("'dem_to_be_aligned' had only NaNs")
+
+        tba_dem = dem_to_be_aligned.copy()
+        ref_valid = np.isfinite(reference_dem['z'].values)
+
+        if np.all(~ref_valid):
+            raise ValueError("'reference_dem' point data only contains NaNs")
+
+        ref_dem = reference_dem[ref_valid]
+
+        points = np.array((ref_dem['lat'].values, ref_dem['lon'].values)).T
+
+        planc, profc = xdem.terrain.get_terrain_attribute(tba_dem, attribute=['planform_curvature', 'profile_curvature'])
+        maxc = np.maximum(np.abs(planc), np.abs(profc))
+        # Mask very high curvatures to avoid resolution biases
+        mask_highcurv = maxc > 5.
 
         # Make sure that the mask has an expected format.
         if inlier_mask is not None:
-            inlier_mask = np.asarray(inlier_mask).squeeze()
+            inlier_mask = np.asarray(inlier_mask)
             assert inlier_mask.dtype == bool, f"Invalid mask dtype: '{inlier_mask.dtype}'. Expected 'bool'"
 
             if np.all(~inlier_mask):
                 raise ValueError("'inlier_mask' had no inliers.")
 
-            tba_dem[~inlier_mask] = np.nan
+            final_mask = np.logical_and.reduce((tba_dem.data.mask, inlier_mask, ~mask_highcurv))
+        else:
+            final_mask = np.logical_and(tba_dem.data.mask, ~mask_highcurv)
 
-        if np.all(ref_mask):
-            raise ValueError("'reference_dem' had only NaNs")
-        if np.all(tba_mask):
-            raise ValueError("'dem_to_be_aligned' had only NaNs")
+        mask_raster = tba_dem.copy(new_array=final_mask.astype(np.int8))
+
+        ref_inlier = mask_raster.interp_points(points, input_latlon=input_latlon, order=0)
+        ref_inlier = ref_inlier.astype(bool)
+
+        if np.all(~ref_inlier):
+            raise ValueError("Intersection of 'reference_dem' and 'dem_to_be_aligned' had only NaNs")
+
+        ref_dem = ref_dem[ref_inlier]
 
         # If subsample is not equal to one, subsampling should be performed.
-        # if subsample != 1.0:
-        #     # The full mask (inliers=True) is the inverse of the above masks and the provided mask.
-        #     full_mask = final_mask
-        #     # If subsample is less than one, it is parsed as a fraction (e.g. 0.8 => retain 80% of the values)
-        #     if subsample < 1.0:
-        #         subsample = int(np.count_nonzero(full_mask) * (1 - subsample))
-        #
-        #     # Randomly pick N inliers in the full_mask where N=subsample
-        #     random_falses = np.random.choice(np.argwhere(full_mask.flatten()).squeeze(), int(subsample), replace=False)
-        #     # Convert the 1D indices to 2D indices
-        #     cols = (random_falses // full_mask.shape[0]).astype(int)
-        #     rows = random_falses % full_mask.shape[0]
-        #     # Set the N random inliers to be parsed as outliers instead.
-        #     full_mask[rows, cols] = False
+        if subsample != 1.0:
 
+            # Randomly pick N inliers in the full_mask where N=subsample
+            random_valids = spatial_tools.subsample_raster(ref_dem['z'].values, subsample=subsample, return_indices=True)
+
+            # Subset to the N random inliers
+            ref_dem = ref_dem.iloc[random_valids]
 
         # Run the associated fitting function
-        self._fit_pts_func(ref_dem=ref_dem, tba_dem=dem_to_be_aligned, transform=transform, weights=weights, verbose=verbose,
+        self._fit_pts_func(ref_dem=ref_dem, tba_dem=tba_dem, transform=transform, weights=weights, verbose=verbose,
                            input_latlon=input_latlon)
 
         # Flag that the fitting function has been called.
@@ -988,8 +999,8 @@ class BiasCorr(Coreg):
         if verbose:
             print("Estimating bias...")
 
-        x_coords, y_coords = ref_dem['lat'], ref_dem['lon']
-        tba_pts = tba_dem.interp_points(np.array(x_coords, y_coords), input_latlon=input_latlon)
+        x_coords, y_coords = (ref_dem['lat'].values, ref_dem['lon'].values)
+        tba_pts = tba_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
         diff = ref_dem['z'] - tba_pts
         diff = diff[np.isfinite(diff)]
 
@@ -1200,10 +1211,19 @@ class Deramp(Coreg):
                   weights: Optional[np.ndarray], verbose: bool = False, input_latlon: bool = False):
         """Fit the dDEM between the DEMs to a least squares polynomial equation."""
 
-        x_coords, y_coords = ref_dem['lat'], ref_dem['lon']
+        x_ref, y_ref = (ref_dem['lat'].values, ref_dem['lon'].values)
+        import pyproj
+        init_crs = pyproj.CRS(4326)
+        dest_crs = pyproj.CRS(tba_dem.crs)
+        transformer = pyproj.Transformer.from_crs(init_crs, dest_crs)
+        x_coords, y_coords = transformer.transform(x_ref, y_ref)
 
-        tba_pts = tba_dem.interp_points(np.array(x_coords, y_coords), input_latlon=input_latlon)
+        tba_pts = tba_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=False, order=1)
+
         ddem = ref_dem['z'] - tba_pts
+
+        # Filter large outliers
+        ddem[np.abs(ddem) > 4 * xdem.spatialstats.nmad(ddem)] = np.nan
 
         valid_mask = np.isfinite(ddem)
         ddem = ddem[valid_mask]
@@ -1264,6 +1284,10 @@ class Deramp(Coreg):
             x0=np.zeros(shape=((self.degree + 1) * (self.degree + 2) // 2)),
             args=(x_coords, y_coords, ddem)
         )
+
+        if verbose:
+            print('Found coefficients:')
+            print(coefs)
 
         self._meta["coefficients"] = coefs[0]
         self._meta["func"] = lambda x, y: poly2d(x, y, coefs[0])
@@ -1353,7 +1377,8 @@ class CoregPipeline(Coreg):
                                 input_latlon=input_latlon)
             coreg._fit_called = True
 
-            tba_dem_mod = coreg.apply(tba_dem_mod, transform)
+            tba_arr, _ = spatial_tools.get_array_and_mask(tba_dem_mod.data)
+            tba_dem_mod.data[0, :] = coreg.apply(tba_arr, transform)
 
     def _apply_func(self, dem: np.ndarray, transform: rio.transform.Affine) -> np.ndarray:
         """Apply the coregistration steps sequentially to a DEM."""
@@ -1543,23 +1568,26 @@ class NuthKaab(Coreg):
         if verbose:
             print("Running Nuth and Kääb (2011) coregistration")
 
-        bounds, resolution = _transform_to_bounds_and_res(tba_dem.shape, transform)
+        tba_arr, _ = spatial_tools.get_array_and_mask(tba_dem)
+
+        # bounds, resolution = _transform_to_bounds_and_res(tba_dem.shape, transform)
+        resolution = tba_dem.res[0]
         # Make a new DEM which will be modified inplace
         aligned_dem = tba_dem.copy()
 
         # Calculate slope and aspect maps from the reference DEM
         if verbose:
             print("   Calculate slope and aspect")
-        slope, aspect = calculate_slope_and_aspect(tba_dem)
+        slope, aspect = xdem.terrain.get_terrain_attribute(tba_dem, attribute=['slope', 'aspect'], degrees=False)
 
         # Initialise east and north pixel offset variables (these will be incremented up and down)
         offset_east, offset_north, bias = 0.0, 0.0, 0.0
 
         # Calculate initial dDEM statistics
-        x_coords, y_coords = ref_dem['lat'], ref_dem['lon']
-        tba_pts = tba_dem.interp_points(np.array(x_coords, y_coords), input_latlon=input_latlon)
+        x_coords, y_coords = (ref_dem['lat'].values, ref_dem['lon'].values)
+        tba_pts = tba_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
 
-        elevation_difference = ref_dem['z'] - tba_pts
+        elevation_difference = ref_dem['z'].values - tba_pts
         bias = np.nanmedian(elevation_difference)
         nmad_old = xdem.spatialstats.nmad(elevation_difference)
         if verbose:
@@ -1575,16 +1603,18 @@ class NuthKaab(Coreg):
         for i in pbar:
 
             # Calculate the elevation difference and the residual (NMAD) between them.
-            elevation_difference = ref_dem['z'] - aligned_dem.interp_points(np.array(x_coords, y_coords), input_latlon=input_latlon)
+            diff_pts = ref_dem['z'].values - aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+            slope_pts = slope.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+            aspect_pts = aspect.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
             bias = np.nanmedian(elevation_difference)
             # Correct potential biases
             elevation_difference -= bias
 
             # Estimate the horizontal shift from the implementation by Nuth and Kääb (2011)
             east_diff, north_diff, _ = get_horizontal_shift(  # type: ignore
-                elevation_difference=elevation_difference,
-                slope=slope,
-                aspect=aspect
+                elevation_difference=diff_pts,
+                slope=slope_pts,
+                aspect=aspect_pts
             )
             if verbose:
                 pbar.write("      #{:d} - Offset in pixels : ({:.2f}, {:.2f})".format(i + 1, east_diff, north_diff))
@@ -1595,9 +1625,10 @@ class NuthKaab(Coreg):
 
             # Assign the newly calculated elevations to the aligned_dem
             aligned_dem.shift(east_diff, north_diff)
+            aligned_dem.data += bias
 
             # Update statistics
-            elevation_difference = ref_dem['z'] - aligned_dem.interp_points(np.array(x_coords, y_coords), input_latlon=input_latlon)
+            elevation_difference = ref_dem['z'] - aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon)
             bias = np.nanmedian(elevation_difference)
             nmad_new = xdem.spatialstats.nmad(elevation_difference)
             nmad_gain = (nmad_new - nmad_old) / nmad_old*100
