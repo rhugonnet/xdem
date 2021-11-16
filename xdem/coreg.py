@@ -621,11 +621,11 @@ class Coreg:
             if np.all(~inlier_mask):
                 raise ValueError("'inlier_mask' had no inliers.")
 
-            final_mask = np.logical_and.reduce((tba_dem.data.mask, inlier_mask, ~mask_highcurv))
+            final_mask = np.logical_and.reduce((~tba_dem.data.mask, inlier_mask, ~mask_highcurv))
         else:
-            final_mask = np.logical_and(tba_dem.data.mask, ~mask_highcurv)
+            final_mask = np.logical_and(~tba_dem.data.mask, ~mask_highcurv)
 
-        mask_raster = tba_dem.copy(new_array=final_mask.astype(np.int8))
+        mask_raster = tba_dem.copy(new_array=final_mask.astype(np.float32))
 
         ref_inlier = mask_raster.interp_points(points, input_latlon=input_latlon, order=0)
         ref_inlier = ref_inlier.astype(bool)
@@ -1578,14 +1578,32 @@ class NuthKaab(Coreg):
         # Calculate slope and aspect maps from the reference DEM
         if verbose:
             print("   Calculate slope and aspect")
-        slope, aspect = xdem.terrain.get_terrain_attribute(tba_dem, attribute=['slope', 'aspect'], degrees=False)
+        # slope, aspect = xdem.terrain.get_terrain_attribute(tba_dem, attribute=['slope', 'aspect'], degrees=False)
+        slope, aspect = calculate_slope_and_aspect(tba_arr)
+        slope_r = tba_dem.copy(new_array=slope[None, :, :])
+        aspect_r = tba_dem.copy(new_array=aspect[None, :, :])
+
+        # Make index grids for the east and north dimensions
+        east_grid = np.arange(tba_arr.shape[1])
+        north_grid = np.arange(tba_arr.shape[0])
+
+        # Make a function to estimate the aligned DEM (used to construct an offset DEM)
+        elevation_function = scipy.interpolate.RectBivariateSpline(
+            x=north_grid, y=east_grid, z=np.where(np.isnan(tba_arr), -9999, tba_arr), kx=1, ky=1
+        )
+
+        # Make a function to estimate nodata gaps in the aligned DEM (used to fix the estimated offset DEM)
+        # Use spline degree 1, as higher degrees will create instabilities around 1 and mess up the nodata mask
+        nodata_function = scipy.interpolate.RectBivariateSpline(
+            x=north_grid, y=east_grid, z=np.isnan(tba_arr), kx=1, ky=1
+        )
 
         # Initialise east and north pixel offset variables (these will be incremented up and down)
         offset_east, offset_north, bias = 0.0, 0.0, 0.0
 
         # Calculate initial dDEM statistics
         x_coords, y_coords = (ref_dem['lat'].values, ref_dem['lon'].values)
-        tba_pts = tba_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+        tba_pts = aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
 
         elevation_difference = ref_dem['z'].values - tba_pts
         bias = np.nanmedian(elevation_difference)
@@ -1603,12 +1621,35 @@ class NuthKaab(Coreg):
         for i in pbar:
 
             # Calculate the elevation difference and the residual (NMAD) between them.
-            diff_pts = ref_dem['z'].values - aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
-            slope_pts = slope.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
-            aspect_pts = aspect.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+            tba_pts = aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+
+            print('Minimum x coords: '+str(np.min(x_coords)))
+            print('Minimum y coords: '+str(np.min(y_coords)))
+            print('Maximum x coords: '+str(np.max(x_coords)))
+            print('Maximum y coords: '+str(np.max(y_coords)))
+
+            print('Count of valid interpolated point on Raster: '+str(np.count_nonzero(np.isfinite(tba_pts))))
+            print('Count of valid point data: ' +str(np.count_nonzero(np.isfinite(ref_dem['z'].values))))
+            print('Minimum elevation:' +str(np.nanmin(tba_pts)))
+            print('Maximum elevation:' +str(np.nanmax(tba_pts)))
+
+            diff_pts = ref_dem['z'].values - tba_pts
+
+            print('Median difference:'+str(np.nanmedian(diff_pts)))
+            print('80th percentile:'+str(np.nanpercentile(diff_pts, 80)))
+            print('20th percentile:'+str(np.nanpercentile(diff_pts, 20)))
+
+            slope_pts = slope_r.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+            aspect_pts = aspect_r.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+
+            print('Count of valid point data for slope: ' +str(np.count_nonzero(np.isfinite(slope_pts))))
+            print('Median slope: '+str(np.nanmedian(slope_pts)))
+            print('Count of valid point data for aspect: ' +str(np.count_nonzero(np.isfinite(aspect_pts))))
+            print('Median aspect: '+str(np.nanmedian(aspect_pts)))
+
             bias = np.nanmedian(elevation_difference)
             # Correct potential biases
-            elevation_difference -= bias
+            diff_pts -= bias
 
             # Estimate the horizontal shift from the implementation by Nuth and Kääb (2011)
             east_diff, north_diff, _ = get_horizontal_shift(  # type: ignore
@@ -1623,12 +1664,23 @@ class NuthKaab(Coreg):
             offset_east += east_diff
             offset_north += north_diff
 
+            # Calculate new elevations from the offset x- and y-coordinates
+            new_elevation = elevation_function(y=east_grid + offset_east, x=north_grid - offset_north)
+
+            # Set NaNs where NaNs were in the original data
+            new_nans = nodata_function(y=east_grid + offset_east, x=north_grid - offset_north)
+            new_elevation[new_nans >= 1] = np.nan
+
             # Assign the newly calculated elevations to the aligned_dem
-            aligned_dem.shift(east_diff, north_diff)
-            aligned_dem.data += bias
+            aligned_dem = tba_dem.copy(new_array=new_elevation[None, :, :])
+
+            # Assign the newly calculated elevations to the aligned_dem
+            # aligned_dem.shift(east_diff, north_diff)
+            # aligned_dem += bias
 
             # Update statistics
-            elevation_difference = ref_dem['z'] - aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon)
+            tba_pts = aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+            elevation_difference = ref_dem['z'].values - tba_pts
             bias = np.nanmedian(elevation_difference)
             nmad_new = xdem.spatialstats.nmad(elevation_difference)
             nmad_gain = (nmad_new - nmad_old) / nmad_old*100
@@ -1653,8 +1705,8 @@ class NuthKaab(Coreg):
             print("   Statistics on coregistered dh:")
             print("      Median = {:.2f} - NMAD = {:.2f}".format(bias, nmad_new))
 
-        self._meta["offset_east_px"] = offset_east
-        self._meta["offset_north_px"] = offset_north
+        self._meta["offset_east_px"] = -offset_east
+        self._meta["offset_north_px"] = -offset_north
         self._meta["bias"] = bias
         self._meta["resolution"] = resolution
 
@@ -1731,6 +1783,29 @@ def apply_matrix(dem: np.ndarray, transform: rio.transform.Affine, matrix: np.nd
     empty_matrix[2, 3] = matrix[2, 3]
     if np.mean(np.abs(empty_matrix - matrix)) == 0.0:
         return demc + matrix[2, 3]
+
+    # Check if the matrix only contains a X, Y and Z correction. In that case, only shift the DEM grid and values.
+    empty_matrix[0, 3] = matrix[0, 3]
+    empty_matrix[1, 3] = matrix[1, 3]
+    if np.array_equal(empty_matrix, matrix):
+        east_grid = np.arange(dem.shape[1])
+        north_grid = np.arange(dem.shape[0])
+
+        # Make a function to estimate the DEM (used to construct an offset DEM)
+        elevation_function = scipy.interpolate.RectBivariateSpline(x=north_grid, y=east_grid,
+                                                                   z=np.where(np.isnan(demc), -9999, dem))
+        # Make a function to estimate nodata gaps in the aligned DEM (used to fix the estimated offset DEM)
+        nodata_function = scipy.interpolate.RectBivariateSpline(x=north_grid, y=east_grid, z=np.isnan(demc))
+
+        shifted_east_grid = east_grid + matrix[0, 3] / transform[0]
+        # The typical negative sign is in the transform
+        shifted_north_grid = north_grid + matrix[1, 3] / transform[4]
+
+        shifted_dem = elevation_function(y=shifted_east_grid, x=shifted_north_grid)
+        new_nans = nodata_function(y=shifted_east_grid, x=shifted_north_grid)
+        shifted_dem[new_nans >= 1] = np.nan
+
+        return shifted_dem + matrix[2, 3]
 
     # Opencv is required down from here
     if not _has_cv2:
