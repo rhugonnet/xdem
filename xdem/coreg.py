@@ -1623,29 +1623,29 @@ class NuthKaab(Coreg):
             # Calculate the elevation difference and the residual (NMAD) between them.
             tba_pts = aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
 
-            print('Minimum x coords: '+str(np.min(x_coords)))
-            print('Minimum y coords: '+str(np.min(y_coords)))
-            print('Maximum x coords: '+str(np.max(x_coords)))
-            print('Maximum y coords: '+str(np.max(y_coords)))
-
-            print('Count of valid interpolated point on Raster: '+str(np.count_nonzero(np.isfinite(tba_pts))))
-            print('Count of valid point data: ' +str(np.count_nonzero(np.isfinite(ref_dem['z'].values))))
-            print('Minimum elevation:' +str(np.nanmin(tba_pts)))
-            print('Maximum elevation:' +str(np.nanmax(tba_pts)))
+            # print('Minimum x coords: '+str(np.min(x_coords)))
+            # print('Minimum y coords: '+str(np.min(y_coords)))
+            # print('Maximum x coords: '+str(np.max(x_coords)))
+            # print('Maximum y coords: '+str(np.max(y_coords)))
+            #
+            # print('Count of valid interpolated point on Raster: '+str(np.count_nonzero(np.isfinite(tba_pts))))
+            # print('Count of valid point data: ' +str(np.count_nonzero(np.isfinite(ref_dem['z'].values))))
+            # print('Minimum elevation:' +str(np.nanmin(tba_pts)))
+            # print('Maximum elevation:' +str(np.nanmax(tba_pts)))
 
             diff_pts = ref_dem['z'].values - tba_pts
 
-            print('Median difference:'+str(np.nanmedian(diff_pts)))
-            print('80th percentile:'+str(np.nanpercentile(diff_pts, 80)))
-            print('20th percentile:'+str(np.nanpercentile(diff_pts, 20)))
+            # print('Median difference:'+str(np.nanmedian(diff_pts)))
+            # print('80th percentile:'+str(np.nanpercentile(diff_pts, 80)))
+            # print('20th percentile:'+str(np.nanpercentile(diff_pts, 20)))
 
             slope_pts = slope_r.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
             aspect_pts = aspect_r.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
 
-            print('Count of valid point data for slope: ' +str(np.count_nonzero(np.isfinite(slope_pts))))
-            print('Median slope: '+str(np.nanmedian(slope_pts)))
-            print('Count of valid point data for aspect: ' +str(np.count_nonzero(np.isfinite(aspect_pts))))
-            print('Median aspect: '+str(np.nanmedian(aspect_pts)))
+            # print('Count of valid point data for slope: ' +str(np.count_nonzero(np.isfinite(slope_pts))))
+            # print('Median slope: '+str(np.nanmedian(slope_pts)))
+            # print('Count of valid point data for aspect: ' +str(np.count_nonzero(np.isfinite(aspect_pts))))
+            # print('Median aspect: '+str(np.nanmedian(aspect_pts)))
 
             bias = np.nanmedian(elevation_difference)
             # Correct potential biases
