@@ -555,6 +555,7 @@ def sample_empirical_variogram(values: Union[np.ndarray, RasterType], gsd: float
                                subsample: int = 10000, subsample_method: str = 'cdist_equidistant',
                                n_variograms: int = 1, n_jobs: int = 1, verbose=False,
                                random_state: None | np.random.RandomState | np.random.Generator | int = None,
+                               raster_shape: None | tuple[int, ...] = None,
                                **kwargs) -> pd.DataFrame:
     """
     Sample empirical variograms with binning adaptable to multiple ranges and spatial subsampling adapted for raster data.
@@ -609,7 +610,9 @@ def sample_empirical_variogram(values: Union[np.ndarray, RasterType], gsd: float
     values = values.squeeze()
 
     # Then, check if the logic between values, coords and gsd is respected
-    if (gsd is not None or subsample_method in ['cdist_equidistant', 'pdist_disk','pdist_ring']) and values.ndim == 1:
+    if subsample_method == 'cdist_equidistant' and values.ndim == 1 and raster_shape is None:
+        raise TypeError('Raster shape must be passed when using "cdist_equidistant" with a 1D array.')
+    elif (gsd is not None or subsample_method in ['cdist_equidistant', 'pdist_disk','pdist_ring']) and (values.ndim == 1 and raster_shape is None):
         raise TypeError('Values array must be 2D when using any of the "cdist_equidistant", "pdist_disk" and '
                         '"pdist_ring" methods, or providing a ground sampling distance instead of coordinates.')
     elif coords is not None and values.ndim != 1:
@@ -642,6 +645,11 @@ def sample_empirical_variogram(values: Union[np.ndarray, RasterType], gsd: float
         x, y = np.meshgrid(np.arange(0, values.shape[0] * gsd, gsd), np.arange(0, values.shape[1] * gsd, gsd))
         coords = np.dstack((x.flatten(), y.flatten())).squeeze()
         values = values.flatten()
+
+    if raster_shape is not None:
+        if nx is not None and ny is not None:
+            warnings.warn('Using the provided Raster shape instead of the array.')
+        nx, ny = raster_shape
 
     # Get the ground sampling distance from the coordinates before keeping only valid data, if it was not provided
     if gsd is None:
