@@ -35,6 +35,10 @@ import pandas as pd
 
 import xdem
 
+#XXX
+import matplotlib.pyplot as plt
+import pdb
+
 try:
     import richdem as rd
     _has_rd = True
@@ -141,8 +145,8 @@ def get_terrainattr(ds: rio.DatasetReader, attrib='slope_degrees') -> rd.rdarray
     return terrattr
 
 
-def get_horizontal_shift(elevation_difference: np.ndarray, slope: np.ndarray, aspect: np.ndarray,
-                         min_count: int = 20) -> tuple[float, float, float]:
+def get_horizontal_shift(elevation_difference: np.ndarray, slope: np.ndarray, 
+                         aspect: np.ndarray, min_count: int = 20) -> tuple[float, float, float]:
     """
     Calculate the horizontal shift between two DEMs using the method presented in Nuth and Kääb (2011).
 
@@ -1453,16 +1457,17 @@ class NuthKaab(Coreg):
     https://doi.org/10.5194/tc-5-271-2011
     """
 
-    def __init__(self, max_iterations: int = 10, offset_threshold: float = 0.05):
+    def __init__(self, max_iterations: int = 10, offset_threshold: float = 0.05,return_for_plot=False):
         """
         Instantiate a new Nuth and Kääb (2011) coregistration object.
 
         :param max_iterations: The maximum allowed iterations before stopping.
         :param offset_threshold: The residual offset threshold after which to stop the iterations.
+        :param return_for_plot: Flag for the option of returning elevation differences and their aspect for plotting purposes
         """
         self.max_iterations = max_iterations
         self.offset_threshold = offset_threshold
-
+        self.return_for_plot = return_for_plot
         super().__init__()
 
     def _fit_func(self, ref_dem: np.ndarray, tba_dem: np.ndarray, transform: Optional[rio.transform.Affine],
@@ -1508,10 +1513,21 @@ class NuthKaab(Coreg):
 
         # Iteratively run the analysis until the maximum iterations or until the error gets low enough
         if verbose:
-            print("   Iteratively estimating horizontal shit:")
+            print("   Iteratively estimating horizontal shift:")
 
         # If verbose is True, will use progressbar and print additional statements
         pbar = trange(self.max_iterations, disable=not verbose, desc="   Progress")
+        
+        # If return_for_plot flag is true, intialize lists to be filled in the next loop
+        if self.return_for_plot:
+           
+            self._meta["aspect"] = (aspect.ravel())
+            self._meta["differences"] = []
+            self._meta["slopes"]=[]
+            self._meta["partial_offset_east_px"]=[]
+            self._meta["partial_offset_north_px"]=[]
+            self._meta["partial_offset_vertical"]=[]
+            
         for i in pbar:
 
             # Calculate the elevation difference and the residual (NMAD) between them.
@@ -1521,13 +1537,21 @@ class NuthKaab(Coreg):
             elevation_difference -= bias
 
             # Estimate the horizontal shift from the implementation by Nuth and Kääb (2011)
-            east_diff, north_diff, _ = get_horizontal_shift(  # type: ignore
+            east_diff, north_diff, C = get_horizontal_shift(  # type: ignore
                 elevation_difference=elevation_difference,
                 slope=slope,
                 aspect=aspect
             )
+            
             if verbose:
                 pbar.write("      #{:d} - Offset in pixels : ({:.2f}, {:.2f})".format(i + 1, east_diff, north_diff))
+
+            if self.return_for_plot:
+                self._meta["differences"].append(elevation_difference.ravel())
+                self._meta["slopes"].append(slope.ravel())
+                self._meta["partial_offset_east_px"].append(east_diff)
+                self._meta["partial_offset_north_px"].append(north_diff)
+                self._meta["partial_offset_vertical"].append(C)
 
             # Increment the offsets with the overall offset
             offset_east += east_diff
@@ -1548,6 +1572,8 @@ class NuthKaab(Coreg):
             bias = np.nanmedian(elevation_difference)
             nmad_new = xdem.spatialstats.nmad(elevation_difference)
             nmad_gain = (nmad_new - nmad_old) / nmad_old*100
+
+
 
             if verbose:
                 pbar.write("      Median = {:.2f} - NMAD = {:.2f}  ==>  Gain = {:.2f}%".format(bias, nmad_new, nmad_gain))
@@ -1579,7 +1605,7 @@ class NuthKaab(Coreg):
         """Estimate the x/y/z offset between two DEMs."""
 
         if verbose:
-            print("Running Nuth and Kääb (2011) coregistration")
+            print("Running Nuth and Kääb (2011) coregistration for point data")
 
         tba_arr, _ = spatial_tools.get_array_and_mask(tba_dem)
 
@@ -1615,11 +1641,29 @@ class NuthKaab(Coreg):
         offset_east, offset_north, bias = 0.0, 0.0, 0.0
 
         # Calculate initial dDEM statistics
-        x_coords, y_coords = (ref_dem['lat'].values, ref_dem['lon'].values)
-        tba_pts = aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+        if verbose:
+            print("   Calculate initial dh")
+        x_coords, y_coords = (ref_dem['lon'].values, ref_dem['lat'].values) # XXX switched, x_coords was LAT before
+        interp_args = dict(pts = np.array((x_coords, y_coords)).T)
+        interp_kwargs = dict(input_latlon=input_latlon, order=1)
+        
+        tba_pts = aligned_dem.interp_points(**interp_args, **interp_kwargs) #set to >5 to break it...
+        # interp_points is in geoutils.georaster.raster
+        
 
+        aspect_pts = aspect_r.interp_points(**interp_args, **interp_kwargs)
         elevation_difference = ref_dem['z'].values - tba_pts
         bias = np.nanmedian(elevation_difference)
+        
+        if self.return_for_plot:
+           
+            self._meta["aspect"] = (aspect_pts)
+            self._meta["differences"] = []
+            self._meta["slopes"]=[]
+            self._meta["partial_offset_east_px"]=[]
+            self._meta["partial_offset_north_px"]=[]
+            self._meta["partial_offset_vertical"]=[]
+            
         nmad_old = xdem.spatialstats.nmad(elevation_difference)
         if verbose:
             print("   Statistics on initial dh:")
@@ -1627,7 +1671,7 @@ class NuthKaab(Coreg):
 
         # Iteratively run the analysis until the maximum iterations or until the error gets low enough
         if verbose:
-            print("   Iteratively estimating horizontal shit:")
+            print("   Iteratively estimating horizontal shift:")
 
         # If verbose is True, will use progressbar and print additional statements
         pbar = trange(self.max_iterations, disable=not verbose, desc="   Progress")
@@ -1665,11 +1709,19 @@ class NuthKaab(Coreg):
             diff_pts -= bias
 
             # Estimate the horizontal shift from the implementation by Nuth and Kääb (2011)
-            east_diff, north_diff, _ = get_horizontal_shift(  # type: ignore
-                elevation_difference=diff_pts,
+            # XXX added plot functionality. Plots if verbose = True
+            east_diff, north_diff, C = get_horizontal_shift(  # type: ignore
+               elevation_difference=diff_pts,
                 slope=slope_pts,
                 aspect=aspect_pts
             )
+            if self.return_for_plot:
+                self._meta["differences"].append(diff_pts)
+                self._meta["slopes"].append(slope_pts) 
+                self._meta["partial_offset_east_px"].append(east_diff)
+                self._meta["partial_offset_north_px"].append(north_diff)
+                self._meta["partial_offset_vertical"].append(C)
+                
             if verbose:
                 pbar.write("      #{:d} - Offset in pixels : ({:.2f}, {:.2f})".format(i + 1, east_diff, north_diff))
 
@@ -1695,9 +1747,9 @@ class NuthKaab(Coreg):
             # aligned_dem += bias
 
             # Update statistics
-            tba_pts = aligned_dem.interp_points(np.array((x_coords, y_coords)).T, input_latlon=input_latlon, order=1)
+            
+            tba_pts = aligned_dem.interp_points(**interp_args, **interp_kwargs)
             elevation_difference = ref_dem['z'].values - tba_pts
-            bias = np.nanmedian(elevation_difference)
             nmad_new = xdem.spatialstats.nmad(elevation_difference)
             nmad_gain = (nmad_new - nmad_old) / nmad_old*100
 
@@ -1737,6 +1789,81 @@ class NuthKaab(Coreg):
         matrix[2, 3] += self._meta["bias"]
 
         return matrix
+    
+    
+    def _plot_iterations(self, min_count : int = 0) -> None :
+        """ 
+        Plot the iterations to inspect the estimated parameters
+        
+        :param min_count: the minimum number of data points for plotting in a specific aspect.
+        
+        
+        """
+        
+        
+        for j in range(len(self._meta['partial_offset_east_px'])):
+            
+            input_x_values = self._meta['aspect']
+            
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                input_y_values = self._meta['differences'][j] / self._meta['slopes'][j]
+
+            # Remove non-finite values
+            x_values = input_x_values[np.isfinite(input_x_values) & np.isfinite(input_y_values)]
+            y_values = input_y_values[np.isfinite(input_x_values) & np.isfinite(input_y_values)]
+
+            assert y_values.shape[0] > 0
+
+            # Remove outliers
+            lower_percentile = np.percentile(y_values, 1)
+            upper_percentile = np.percentile(y_values, 99)
+            valids = np.where((y_values > lower_percentile) & (y_values < upper_percentile) & (np.abs(y_values) < 200))
+            x_values = x_values[valids]
+            y_values = y_values[valids]
+
+            
+            #retrace the estimated parameters from the _meta information
+            c_parameter  = self._meta['partial_offset_vertical'][j]
+            b_parameter = np.arctan2(self._meta['partial_offset_east_px'][j],self._meta['partial_offset_north_px'][j])
+            a_parameter  = self._meta['partial_offset_east_px'][j]/np.sin(b_parameter)
+            
+            
+            # Slice the dataset into appropriate aspect bins
+            step = np.pi / 36
+            slice_bounds = np.arange(start=0, stop=2 * np.pi, step=step)
+            y_medians = np.zeros([len(slice_bounds)])
+            count = y_medians.copy()
+            
+            
+            # Compute the bin median
+            for i, bound in enumerate(slice_bounds):
+                y_slice = y_values[(bound < x_values) & (x_values < (bound + step))]
+                if y_slice.shape[0] > min_count:
+                    y_medians[i] = np.median(y_slice)
+                count[i] = y_slice.shape[0]
+                
+            # Define the plotted curve 
+            ycurve = a_parameter * np.cos(b_parameter - slice_bounds) + c_parameter
+            
+            # Compute horizontal offsets in meters:
+            east_off=self._meta['partial_offset_east_px'][j]*self._meta['resolution']
+            north_off=self._meta['partial_offset_north_px'][j]*self._meta['resolution']
+            
+            # plot
+            fig,ax=plt.subplots(figsize=(8,5))
+            plt.plot(slice_bounds/2/np.pi*360, np.zeros([len(slice_bounds)]),'k')
+            plt.plot(x_values/2/np.pi*360,y_values,'k.', markersize=0.05,alpha = 0.1,label='dh',)
+            plt.plot(slice_bounds/2/np.pi*360,y_medians,'b-',label='aspect bin medians')
+            plt.plot(slice_bounds/2/np.pi*360, ycurve, '-r',label='fitted curve')
+            plt.xlabel('Aspect [°]')
+            plt.ylabel('Normalized el. difference*')
+            plt.legend()
+            plt.title(f"Iteration: {j}: offset[m] in east: {'%.2f' % east_off}, north: {'%.2f' % north_off}, z: {'%.2f' % c_parameter}")
+            ax.set_ylim([np.quantile(y_values,0.05), np.quantile(y_values,0.95)])
+            ax.set_xlim(0,360)
+            #if len(filename)>0:
+            #    plt.savefig(filename)
 
 
 def invert_matrix(matrix: np.ndarray) -> np.ndarray:
