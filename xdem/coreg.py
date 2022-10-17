@@ -195,6 +195,9 @@ def get_horizontal_shift(elevation_difference: np.ndarray, slope: np.ndarray,
     if slice_bounds.shape[0] < 10:
         raise ValueError("Less than 10 different cells exist.")
 
+
+    # Define weight for each bin depending on the numerosity
+    weights = count / count.sum()
     # Make an initial guess of the a, b, and c parameters
     initial_guess: tuple[float, float, float] = (3 * np.std(y_medians) / (2 ** 0.5), 0.0, np.mean(y_medians))
 
@@ -211,7 +214,7 @@ def get_horizontal_shift(elevation_difference: np.ndarray, slope: np.ndarray,
         """
         return parameters[0] * np.cos(parameters[1] - x_values) + parameters[2]
 
-    def residuals(parameters: tuple[float, float, float], y_values: np.ndarray, x_values: np.ndarray):
+    def residuals(parameters: tuple[float, float, float], y_values: np.ndarray, x_values: np.ndarray, weights :np.ndarray):
         """
         Get the residuals between the estimated and measured values using the given parameters.
 
@@ -219,15 +222,17 @@ def get_horizontal_shift(elevation_difference: np.ndarray, slope: np.ndarray,
 
         :param parameters: The a, b, and c parameters to use for the estimation.
         :param y_values: The measured y-values.
-        :param x_values: The measured x-values
+        :param x_values: The measured x-values.
+        :param weights: The weight to assign to each y,x couple.
 
         :returns: An array of residuals with the same shape as the input arrays.
         """
-        err = estimate_ys(x_values, parameters) - y_values
+        err = (estimate_ys(x_values, parameters) - y_values) * weights
+        print(weights.sum())
         return err
 
     # Estimate the a, b, and c parameters with least square minimisation
-    plsq = scipy.optimize.leastsq(func=residuals, x0=initial_guess, args=(y_medians, slice_bounds), full_output=1)
+    plsq = scipy.optimize.leastsq(func=residuals, x0=initial_guess, args=(y_medians, slice_bounds, weights), full_output=1)
 
     a_parameter, b_parameter, c_parameter = plsq[0]
 
@@ -1515,9 +1520,6 @@ class NuthKaab(Coreg):
         if verbose:
             print("   Iteratively estimating horizontal shift:")
 
-        # If verbose is True, will use progressbar and print additional statements
-        pbar = trange(self.max_iterations, disable=not verbose, desc="   Progress")
-        
         # If return_for_plot flag is true, intialize lists to be filled in the next loop
         if self.return_for_plot:
            
@@ -1527,6 +1529,9 @@ class NuthKaab(Coreg):
             self._meta["partial_offset_east_px"]=[]
             self._meta["partial_offset_north_px"]=[]
             self._meta["partial_offset_vertical"]=[]
+        
+        # If verbose is True, will use progressbar and print additional statements
+        pbar = trange(self.max_iterations, disable=not verbose, desc="   Progress")
             
         for i in pbar:
 
@@ -1791,7 +1796,7 @@ class NuthKaab(Coreg):
         return matrix
     
     
-    def _plot_iterations(self, min_count : int = 0) -> None :
+    def _plot_iterations(self, min_count : int = 0, file_name : str = None) -> None :
         """ 
         Plot the iterations to inspect the estimated parameters
         
@@ -1850,10 +1855,13 @@ class NuthKaab(Coreg):
             east_off=self._meta['partial_offset_east_px'][j]*self._meta['resolution']
             north_off=self._meta['partial_offset_north_px'][j]*self._meta['resolution']
             
+            alpha_factor = x_values.size/(7*10**5)
+            if alpha_factor > 1 : alpha_factor = 1
+            
             # plot
             fig,ax=plt.subplots(figsize=(8,5))
             plt.plot(slice_bounds/2/np.pi*360, np.zeros([len(slice_bounds)]),'k')
-            plt.plot(x_values/2/np.pi*360,y_values,'k.', markersize=0.05,alpha = 0.1,label='dh',)
+            plt.plot(x_values/2/np.pi*360,y_values,'k.', markersize=0.1,alpha = 0.5-0.2*alpha_factor,label='dh',)
             plt.plot(slice_bounds/2/np.pi*360,y_medians,'b-',label='aspect bin medians')
             plt.plot(slice_bounds/2/np.pi*360, ycurve, '-r',label='fitted curve')
             plt.xlabel('Aspect [°]')
@@ -1862,8 +1870,9 @@ class NuthKaab(Coreg):
             plt.title(f"Iteration: {j}: offset[m] in east: {'%.2f' % east_off}, north: {'%.2f' % north_off}, z: {'%.2f' % c_parameter}")
             ax.set_ylim([np.quantile(y_values,0.05), np.quantile(y_values,0.95)])
             ax.set_xlim(0,360)
-            #if len(filename)>0:
-            #    plt.savefig(filename)
+            
+            if file_name != None :
+                plt.savefig(file_name+'i'+str(j))
 
 
 def invert_matrix(matrix: np.ndarray) -> np.ndarray:
