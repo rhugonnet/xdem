@@ -228,7 +228,7 @@ def get_horizontal_shift(elevation_difference: np.ndarray, slope: np.ndarray,
         :returns: An array of residuals with the same shape as the input arrays.
         """
         err = (estimate_ys(x_values, parameters) - y_values) * weights
-        print(weights.sum())
+        
         return err
 
     # Estimate the a, b, and c parameters with least square minimisation
@@ -1801,7 +1801,7 @@ class NuthKaab(Coreg):
         Plot the iterations to inspect the estimated parameters
         
         :param min_count: the minimum number of data points for plotting in a specific aspect.
-        
+        :param file_name: the path and name pattern where the iteration plots will be saved.
         
         """
         
@@ -1861,7 +1861,7 @@ class NuthKaab(Coreg):
             # plot
             fig,ax=plt.subplots(figsize=(8,5))
             plt.plot(slice_bounds/2/np.pi*360, np.zeros([len(slice_bounds)]),'k')
-            plt.plot(x_values/2/np.pi*360,y_values,'k.', markersize=0.1,alpha = 0.5-0.2*alpha_factor,label='dh',)
+            plt.plot(x_values/2/np.pi*360,y_values,'k.', markersize=0.1,alpha = 0.7-0.2*alpha_factor,label='dh',)
             plt.plot(slice_bounds/2/np.pi*360,y_medians,'b-',label='aspect bin medians')
             plt.plot(slice_bounds/2/np.pi*360, ycurve, '-r',label='fitted curve')
             plt.xlabel('Aspect [°]')
