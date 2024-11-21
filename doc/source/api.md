@@ -94,6 +94,7 @@ See the full list in [the Raster API of GeoUtils](https://geoutils.readthedocs.i
     DEM.width
     DEM.height
     DEM.shape
+    DEM.tags
 ```
 
 ### Georeferencing
