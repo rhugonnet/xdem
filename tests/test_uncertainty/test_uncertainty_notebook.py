@@ -169,6 +169,28 @@ class TestUncertaintyNotebook:
         for k in ("tx", "ty", "tz"):
             assert np.isfinite(summary.loc[k, "std"])
 
+    def test_parallel_reproducible_across_n_jobs(self) -> None:
+        """Parallel runs (n_jobs>1) use deterministic per-simulation seeds, so the report is identical
+        regardless of the number of workers."""
+        pytest.importorskip("skgstat")
+        warnings.filterwarnings("ignore", category=UserWarning)
+        dem_ref, dem_tba = _load_dems()
+        kw = dict(
+            reference_elev=dem_ref,
+            to_be_aligned_elev=dem_tba,
+            coreg_method=coreg.LZD(),
+            nsim=6,
+            error_applied_to="tba",
+            random_state=SEED,
+        )
+        r2 = _propag_uncertainty_coreg(**kw, n_jobs=2)[0]
+        r3 = _propag_uncertainty_coreg(**kw, n_jobs=3)[0]
+        r_auto = _propag_uncertainty_coreg(**kw, n_jobs=-1)[0]  # auto worker count, same seeding scheme
+
+        pd.testing.assert_frame_equal(r2, r3, check_exact=False, rtol=0, atol=0)
+        pd.testing.assert_frame_equal(r2, r_auto, check_exact=False, rtol=0, atol=0)
+        assert np.isfinite(r2.loc[["tx", "ty", "tz"], "std"]).all()
+
     def test_variogram_plotting_invariant(self) -> None:
         """Fitted variogram (rises 0->sill) and correlation (falls 1->0) satisfy gamma = sill*(1 - rho).
 

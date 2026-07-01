@@ -21,7 +21,10 @@
 from __future__ import annotations
 
 import warnings
+import contextlib
 import logging
+import multiprocessing as mp
+import os
 from typing import Callable, Any, Literal, TYPE_CHECKING
 
 import pandas as pd
@@ -75,6 +78,98 @@ def _postproc_coreg_metadata(c: coreg.Coreg) -> pd.DataFrame:
     return df
 
 
+@contextlib.contextmanager
+def _single_threaded_blas() -> Any:
+    """Pin BLAS/OpenMP to one thread per process, so parallel workers don't oversubscribe the cores
+    (which slows them down and makes results non-deterministic). Spawned workers inherit it via the env.
+    """
+    thread_vars = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                   "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+    saved = {k: os.environ.get(k) for k in thread_vars}
+    os.environ.update(dict.fromkeys(thread_vars, "1"))
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _estimate_sim_memory(reference_elev: Any, to_be_aligned_elev: Any) -> float | None:
+    """Rough per-worker memory estimate (bytes) for the automatic RAM cap; None if not a gridded input."""
+    sizes = [int(d.nbytes) for d in (getattr(reference_elev, "data", None), getattr(to_be_aligned_elev, "data", None))
+             if d is not None and hasattr(d, "nbytes")]
+    if not sizes:
+        return None
+    # Pickled inputs + simulated error field + coregistration working set: ~6x the largest grid.
+    return 6.0 * max(sizes)
+
+
+def _resolve_n_jobs(n_jobs: int, nsim: int, mem_per_job_bytes: float | None = None) -> int:
+    """Resolve the worker count: n_jobs >= 1 is used directly (capped at nsim); n_jobs <= 0 is automatic
+    (available cores minus current load, capped by nsim and, if psutil is present, by available RAM)."""
+    if n_jobs >= 1:
+        return max(1, min(n_jobs, nsim))
+    n_cpu = os.cpu_count() or 1
+    n = max(1, n_cpu - 1)
+    try:  # back off under current CPU load (Unix only)
+        n = max(1, min(n, int(round(n_cpu - os.getloadavg()[0]))))
+    except (OSError, AttributeError):
+        pass
+    if mem_per_job_bytes:  # cap by available RAM if psutil is installed
+        try:
+            import psutil
+
+            n = max(1, min(n, int(0.8 * psutil.virtual_memory().available / mem_per_job_bytes)))
+        except Exception:
+            pass
+    return max(1, min(n, nsim))
+
+
+def _wrapper_propag_sim(argdict: dict[str, Any]) -> tuple[pd.DataFrame, coreg.Coreg] | None:
+    """Run one simulation (simulate an error field, apply it, re-coregister) from a single dict argument,
+    so it can be dispatched with ``multiprocessing.Pool.map`` (the GSTools model, not picklable, is
+    rebuilt from ``params`` inside the worker). Returns (metadata, coreg), or None if it did not converge."""
+    i = argdict["i"]
+    nsim = argdict["nsim"]
+    rng = argdict["random_state"]
+    source_elev = argdict["source_elev"]
+    error_applied_to = argdict["error_applied_to"]
+    reference_elev = argdict["reference_elev"]
+    to_be_aligned_elev = argdict["to_be_aligned_elev"]
+
+    logging.info(f"Running simulation {i+1} out of {nsim}\n"
+                 f"######################################")
+
+    # Derive error field for this simulation
+    logging.info(f"  Simulating error field...")
+    corr_func = params_to_gstools_model(argdict["params"])
+    error_field = _simu_random_error_field(elev=source_elev, sig_elev=argdict["sig_elev"], corr_func=corr_func,
+                                           random_state=rng)
+    # Apply error to proper input
+    if error_applied_to == "ref":
+        ref_elev = reference_elev + error_field
+        tba_elev = to_be_aligned_elev
+    else:
+        ref_elev = reference_elev
+        tba_elev = to_be_aligned_elev + error_field
+
+    # A simulation can occasionally fail to converge; skip it with a warning rather than aborting the run.
+    logging.info(f"  Running coregistration fit...")
+    c = argdict["coreg_method"].copy()  # Avoid carrying over the state over multiple simulations
+    try:
+        c.fit(reference_elev=ref_elev, to_be_aligned_elev=tba_elev, inlier_mask=argdict["inlier_mask"],
+              random_state=rng, **argdict["kwargs_coreg_fit"])
+    except Exception as err:
+        logging.warning(f"  Simulation {i+1} of {nsim} failed to converge and was skipped: {err}")
+        return None
+    df_it = _postproc_coreg_metadata(c)
+    df_it["nsim"] = i + 1
+    return df_it, c
+
+
 def _propag_uncertainty_coreg(
     reference_elev: DEM | gpd.GeoDataFrame | xdem.EPC,
     to_be_aligned_elev: DEM | gpd.GeoDataFrame | xdem.EPC,
@@ -86,6 +181,7 @@ def _propag_uncertainty_coreg(
     random_state: int | np.random.Generator | None = None,
     kwargs_coreg_fit: dict[str, Any] | None = None,
     kwargs_infer_uncertainty: dict[str, Any] | None = None,
+    n_jobs: int = 1,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[coreg.Coreg]]:
     """
     Propagate uncertainties to any coregistration by Monte Carlo simulations of errors.
@@ -105,6 +201,10 @@ def _propag_uncertainty_coreg(
     :param random_state: Random state.
     :param kwargs_coreg_fit: Keyword arguments passed to `Coreg.fit`.
     :param kwargs_infer_uncertainty: Keyword arguments passed to `DEM/EPC.infer_uncertainty`.
+    :param n_jobs: Number of processes for the simulations. 1 (default) runs them serially on a single
+        random stream (unchanged); >1 runs them in parallel and <=0 auto-selects a count from the
+        available resources. Parallel/automatic runs use independent per-simulation streams, so results
+        are reproducible for any number of workers.
     """
 
     # Normalize input dicts if empty
@@ -143,41 +243,44 @@ def _propag_uncertainty_coreg(
                                              **kwargs_infer_uncertainty)
     sig_elev = hetesc_out[0]
     params = corr_out[1]
-    corr_func = params_to_gstools_model(params)
     logging.info(f"Found spatial correlation parameters:\n{params}")
 
-    # Then, run simulations
-    list_df = []
-    list_coreg = []
-    for i in range(nsim):
-        logging.info(f"Running simulation {i+1} out of {nsim}\n"
-                     f"######################################")
-
-        # Derive error field for this simulation
-        logging.info(f"  Simulating error field...")
-        error_field = _simu_random_error_field(elev=source_elev, sig_elev=sig_elev, corr_func=corr_func,
-                                               random_state=rng)
-        # Apply error to proper input
-        if error_applied_to == "ref":
-            ref_elev = reference_elev + error_field
-            tba_elev = to_be_aligned_elev
+    # Run the simulations. They are independent, so the loop is parallelizable (see n_jobs).
+    base_args = {
+        "nsim": nsim,
+        "source_elev": source_elev,
+        "sig_elev": sig_elev,
+        "params": params,
+        "error_applied_to": error_applied_to,
+        "reference_elev": reference_elev,
+        "to_be_aligned_elev": to_be_aligned_elev,
+        "coreg_method": coreg_method,
+        "inlier_mask": inlier_mask,
+        "kwargs_coreg_fit": kwargs_coreg_fit,
+    }
+    # Seeding depends on whether parallelism was requested (n_jobs != 1), not on the resolved worker
+    # count, so an automatic run is reproducible regardless of how many workers it uses.
+    use_shared_stream = n_jobs == 1
+    n_jobs = _resolve_n_jobs(n_jobs, nsim, _estimate_sim_memory(reference_elev, to_be_aligned_elev))
+    if use_shared_stream:
+        # Single shared, advancing random stream (original behaviour, bit-identical).
+        results = [_wrapper_propag_sim({"i": i, "random_state": rng, **base_args}) for i in range(nsim)]
+    else:
+        # Independent per-simulation streams: reproducible for any number of workers.
+        sim_seeds = np.random.SeedSequence(int(rng.integers(0, 2**63 - 1))).spawn(nsim)
+        list_argdict = [{"i": i, "random_state": np.random.default_rng(sim_seeds[i]), **base_args} for i in range(nsim)]
+        if n_jobs == 1:
+            results = [_wrapper_propag_sim(argdict) for argdict in list_argdict]
         else:
-            ref_elev = reference_elev
-            tba_elev = to_be_aligned_elev + error_field
+            logging.info(f"Running {nsim} simulations on {n_jobs} cores...")
+            with _single_threaded_blas():
+                pool = mp.Pool(n_jobs, maxtasksperchild=1)
+                results = pool.map(_wrapper_propag_sim, list_argdict, chunksize=1)
+                pool.close()
+                pool.join()
 
-        # A simulation can occasionally fail to converge; skip it with a warning rather than aborting.
-        logging.info(f"  Running coregistration fit...")
-        c = coreg_method.copy()  # Avoid carrying over the state over multiple simulations
-        try:
-            c.fit(reference_elev=ref_elev, to_be_aligned_elev=tba_elev, inlier_mask=inlier_mask, random_state=rng,
-                  **kwargs_coreg_fit)
-        except Exception as err:
-            logging.warning(f"  Simulation {i+1} of {nsim} failed to converge and was skipped: {err}")
-            continue
-        df_it = _postproc_coreg_metadata(c)
-        df_it["nsim"] = i + 1
-        list_df.append(df_it)
-        list_coreg.append(c)
+    list_df = [res[0] for res in results if res is not None]
+    list_coreg = [res[1] for res in results if res is not None]
 
     # Require at least two successful simulations to estimate a standard deviation
     if len(list_df) < 2:
