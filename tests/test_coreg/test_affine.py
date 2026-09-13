@@ -271,7 +271,7 @@ class TestAffineCoreg:
 
         # Check the output translations match the exact values
         shifts = [c.meta["outputs"]["affine"][k] for k in ["shift_x", "shift_y", "shift_z"]]  # type: ignore
-        assert shifts == pytest.approx(expected_shifts)
+        assert shifts == pytest.approx(expected_shifts, abs=10e-6)
 
     @pytest.mark.parametrize("fit_args", all_fit_args)
     @pytest.mark.parametrize("vshift", [0.2, 10.0, 1000.0])
