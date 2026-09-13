@@ -104,15 +104,15 @@ import geoutils as gu
 fn_glacier_outlines = xdem.examples.get_path("longyearbyen_glacier_outlines")
 vect_gla = gu.Vector(fn_glacier_outlines)
 
-# Reproject to local projected CRS
-epc = epc.reproject(crs=epc.get_metric_crs())
+# Reproject a copy to a local projected CRS for plotting
+epc_metric = epc.reproject(crs=epc.get_metric_crs())
 
 # Crop outlines to those intersecting the EPC
-vect_gla = vect_gla.crop(epc)
+vect_gla = vect_gla.crop(epc_metric)
 
 # Plot the DEM and the vector file
-epc.plot(cmap="terrain", markersize=0.5, cbar_title="Elevation (m)")
-vect_gla.plot(epc, ec="k", fc="none")  # We pass the EPC as reference for the plot CRS
+epc_metric.plot(cmap="terrain", markersize=0.5, cbar_title="Elevation (m)")
+vect_gla.plot(epc_metric, ec="k", fc="none")  # We pass the EPC as reference for the plot CRS
 ```
 
 ## Vertical referencing

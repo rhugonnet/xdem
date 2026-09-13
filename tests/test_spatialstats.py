@@ -543,6 +543,9 @@ class TestVariogram:
     def test_sample_empirical_variogram_no_fork_warning(self) -> None:
         """Forking a multi-threaded parent is deprecated and can deadlock the child."""
 
+        # Import optional skgstat or skip test
+        pytest.importorskip("skgstat")
+
         stop = threading.Event()
         thread = threading.Thread(target=stop.wait)
         thread.start()

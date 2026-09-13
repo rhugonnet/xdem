@@ -545,4 +545,6 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
             from xdem.epc.pd_accessor import _register_dask_epc_accessor
 
             _register_dask_epc_accessor()
+            # Restore the combined CRS because assembling Dask point partitions can drop geometry metadata
+            output.epc._set_vcrs_crs(self.crs)
         return output
