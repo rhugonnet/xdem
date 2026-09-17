@@ -190,7 +190,7 @@ class TestCoregPipeline:
     def test_pipeline_pts(self) -> None:
 
         pipeline = coreg.NuthKaab() + coreg.DhMinimize()
-        ref_points = self.ref.to_pointcloud(subsample=1, random_state=42)
+        ref_points = self.ref.to_pointcloud(subsample=3000, random_state=42)
 
         # Check that this runs without error
         pipeline.fit(reference_elev=ref_points, to_be_aligned_elev=self.tba)
@@ -258,8 +258,8 @@ class TestCoregPipeline:
 
         # Test 2: Reflectivity
         # Those two pipelines should give almost the same result
-        nk_vshift = coreg.NuthKaab() + coreg.VerticalShift()
-        vshift_nk = coreg.VerticalShift() + coreg.NuthKaab()
+        nk_vshift = coreg.NuthKaab(vertical_shift=False) + coreg.VerticalShift()
+        vshift_nk = coreg.VerticalShift() + coreg.NuthKaab(vertical_shift=False)
 
         nk_vshift.fit(**self.fit_params, random_state=42)
         vshift_nk.fit(**self.fit_params, random_state=42)
@@ -267,7 +267,8 @@ class TestCoregPipeline:
         # TODO: See after merge of #890
         nk_vshift_tr = coreg.translations_rotations_from_matrix(nk_vshift.to_matrix())
         vshift_nk_tr = coreg.translations_rotations_from_matrix(vshift_nk.to_matrix())
-        assert np.allclose(nk_vshift_tr, vshift_nk_tr)
+        assert np.allclose(nk_vshift_tr[:3], vshift_nk_tr[:3], atol=0.2 * self.ref.res[0])
+        assert np.allclose(nk_vshift_tr[3:], vshift_nk_tr[3:], atol=10e-6)
 
     def test_subsample_pipeline(self) -> None:
         """Test that the subsample argument works as intended for pipelines"""

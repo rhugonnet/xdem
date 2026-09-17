@@ -2,7 +2,7 @@
 # Migrating uncertainty workflows
 
 The entire `xdem.spatialstats` module is deprecated. Its public functions retain their original implementations,
-arguments and return formats and emit a `DeprecationWarning` when called. 
+arguments and return formats and emit a `DeprecationWarning` when called.
 `DEM.estimate_uncertainty()` is also deprecated. No module-wide removal version is assigned yet;
 `spatialstats.nmad()` retains its previously announced removal in version 0.4.
 

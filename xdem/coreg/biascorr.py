@@ -709,7 +709,7 @@ class Deramp(BiasCorr):
     ) -> None:
 
         # The number of parameters in the first guess defines the polynomial order when calling np.polyval2d
-        x0 = np.ones(shape=((self._meta["inputs"]["specific"]["poly_order"] + 1) ** 2))
+        p0 = np.ones(shape=((self._meta["inputs"]["specific"]["poly_order"] + 1) ** 2))
 
         # Coordinates (we don't need the actual ones, just array coordinates)
         xx, yy = np.meshgrid(np.arange(0, ref_elev.shape[1]), np.arange(0, ref_elev.shape[0]))
@@ -724,7 +724,7 @@ class Deramp(BiasCorr):
             crs=crs,
             area_or_point=area_or_point,
             weights=weights,
-            x0=x0,
+            p0=p0,
             **kwargs,
         )
 
@@ -746,7 +746,7 @@ class Deramp(BiasCorr):
         rast_elev = ref_elev if not isinstance(ref_elev, gpd.GeoDataFrame) else tba_elev
 
         # The number of parameters in the first guess defines the polynomial order when calling np.polyval2d
-        x0 = np.ones(shape=((self._meta["inputs"]["specific"]["poly_order"] + 1) ** 2))
+        p0 = np.ones(shape=((self._meta["inputs"]["specific"]["poly_order"] + 1) ** 2))
 
         # Coordinates (we don't need the actual ones, just array coordinates)
         xx, yy = np.meshgrid(np.arange(0, rast_elev.shape[1]), np.arange(0, rast_elev.shape[0]))
@@ -762,7 +762,7 @@ class Deramp(BiasCorr):
             area_or_point=area_or_point,
             z_name=z_name,
             weights=weights,
-            x0=x0,
+            p0=p0,
             **kwargs,
         )
 

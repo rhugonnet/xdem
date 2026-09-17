@@ -263,7 +263,7 @@ class TestBiasCorr:
         elev_fit_args.update({"bias_vars": bias_vars_dict})
 
         # Run with input parameter, and using only 100 subsamples for speed
-        # Passing x0 defines the number of parameters to solve for
+        # Passing p0 defines the number of parameters to solve for
         bcorr.fit(**elev_fit_args, subsample=100, p0=[0, 0, 0, 0], random_state=42)
 
         # Check that variable names are defined during fit
@@ -404,7 +404,7 @@ class TestBiasCorr:
         elev_fit_args.update({"bias_vars": bias_vars_dict})
 
         # Run with input parameter, and using only 100 subsamples for speed
-        # Passing x0 defines the number of parameters to solve for
+        # Passing p0 defines the number of parameters to solve for
         bcorr.fit(**elev_fit_args, subsample=1000, p0=[0, 0, 0, 0], random_state=42)
 
         # Check that variable names are defined during fit

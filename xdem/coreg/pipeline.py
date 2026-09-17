@@ -37,7 +37,7 @@ import numpy as np
 import rasterio as rio
 import rasterio.warp
 from geoutils.pointcloud.pointcloud import PointCloud, PointCloudType
-from geoutils.raster import Raster, RasterType, raster
+from geoutils.raster import Raster, RasterType
 
 from xdem._typing import MArrayf, NDArrayb, NDArrayf
 from xdem.coreg.base import (
@@ -45,7 +45,6 @@ from xdem.coreg.base import (
     CoregType,
     _postprocess_coreg_apply,
     _preprocess_coreg_apply,
-    _preprocess_coreg_fit,
 )
 
 
@@ -69,7 +68,7 @@ class CoregPipeline(Coreg):
                 if not isinstance(step, CoregPipeline):
                     list_coreg.append(step)
                 else:
-                    list_coreg += put_coreg_in_series(step)
+                    list_coreg += put_coreg_in_series(step.pipeline)
             return list_coreg
 
         self.pipeline = put_coreg_in_series(pipeline)

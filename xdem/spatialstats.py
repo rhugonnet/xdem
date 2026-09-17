@@ -826,7 +826,7 @@ def infer_heteroscedasticity_from_stable(
 
 
 @overload
-def infer_heteroscedasticity_from_stable(
+def infer_heteroscedasticity_from_stable(  # type: ignore[overload-cannot-match]
     dvalues: RasterType,
     list_var: list[NDArrayf | RasterType],
     stable_mask: NDArrayf | Raster | VectorType | gpd.GeoDataFrame = None,
@@ -1020,7 +1020,6 @@ def _subsample_wrapper(
         subsample=subsample,
         return_indices=True,
         random_state=random_state,
-        strategy="sequential",
     )
     values_sub = values_sp[index[0]]
     coords_sub = coords_sp[index[0], :]

@@ -765,14 +765,14 @@ class TestDEMEagerAnalysis:
             "dem": reference,
             "dataarray": reference_ds,
             "accessor": reference_ds.dem,
-            "epc": reference.to_pointcloud(data_column_name="height"),
+            "epc": reference.to_pointcloud(data_column_name="height", subsample=1000, random_state=42),
         }
         references["dataframe"] = references["epc"].ds.copy()
         references["dataframe"].attrs["data_column"] = "height"
 
         # 2/ Run DEM and Xarray calls with the same reference type and random seed
-        expected = source.coregister_3d(references[reference_kind], method(), random_state=42)
-        actual = ds.dem.coregister_3d(references[reference_kind], method(), random_state=42)
+        expected = source.coregister_3d(references[reference_kind], method(), subsample=5000, random_state=42)
+        actual = ds.dem.coregister_3d(references[reference_kind], method(), subsample=5000, random_state=42)
         assert isinstance(expected, DEM)
         assert isinstance(actual, xr.DataArray)
         assert_output_equal(expected, actual)

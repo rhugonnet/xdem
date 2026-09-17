@@ -510,7 +510,6 @@ def robust_norder_polynomial_fit(
             subsample=subsample,
             return_indices=True,
             random_state=random_state,
-            strategy="sequential",
         )
         x = x[subsamp]
         y = y[subsamp]

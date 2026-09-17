@@ -62,6 +62,16 @@ from xdem.coreg.base import (
 )
 from xdem.fit import index_trimmed
 
+_LzdInterpolator = Callable[[tuple[NDArrayf, NDArrayf]], NDArrayf]
+_CorrelationModel = tuple[Callable[..., NDArrayf], float]
+_LzdErrorInterpolators = tuple[
+    _LzdInterpolator | None,
+    _CorrelationModel | None,
+    _LzdInterpolator | None,
+    _CorrelationModel | None,
+]
+_LzdSampledErrors = tuple[NDArrayf | None, _CorrelationModel | None, NDArrayf | None, _CorrelationModel | None]
+
 ######################################
 # Generic functions for affine methods
 ######################################
@@ -111,9 +121,9 @@ def _iterate_method(
     method: Callable[..., Any],
     iterating_input: Any,
     constant_inputs: tuple[Any, ...],
-    tolerances: dict[str, float],
+    tolerances: dict[str, float | None],
     max_iterations: int,
-) -> tuple[Any, Any, OutAffineDict, Any]:
+) -> tuple[Any, Any, OutIterativeDict, Any]:
     """
     Function to iterate a method (e.g. ICP, Nuth and Kääb) until it reaches tolerances or maximum number of iterations.
 
@@ -153,7 +163,7 @@ def _iterate_method(
         # Check that all statistics have a matching tolerance, otherwise the process should fail with a dev error
         new_statistics_keys = list(new_statistics.keys())
         tolerance_keys = list(tolerances.keys())
-        if not all([n in tolerance_keys for n in new_statistics_keys]):
+        if not all(n in tolerance_keys for n in new_statistics_keys):
             raise NotImplementedError(
                 "Developer Error: The keys of the tolerances dictionary passed "
                 "to _iterate_method in the coregistration method call should match the keys of "
@@ -168,16 +178,16 @@ def _iterate_method(
                 pbar.write(f"   Last {k[j]} offset: {new_statistics[k[j]]}")
 
         # Check that all statistics are below their respective tolerance
-        if all(new_statistics[k] < tolerances[k] if k is not None else True for k in tolerances.keys()):
+        if all(tolerances[k] is None or new_statistics[k] < tolerances[k] for k in tolerances):
             if logging.getLogger().getEffectiveLevel() <= logging.INFO:
-                pbar.write(f"   The last offset(s) were all below the set tolerance(s) -> stopping")
+                pbar.write("   The last offset(s) were all below the set tolerance(s) -> stopping")
                 all_tolerances = ";".join(f"{k}: {v}" for k, v in tolerances.items())
                 pbar.write(f"   Set tolerance(s) were: {all_tolerances}.")
 
             break
 
     df_all_it = pd.concat(list_df)
-    output_iterative: OutAffineDict = {"last_iteration": i + 1, "iteration_stats": df_all_it}
+    output_iterative = OutIterativeDict(last_iteration=i + 1, iteration_stats=df_all_it)
 
     return new_inputs, new_statistics, output_iterative, static_outputs
 
@@ -187,9 +197,10 @@ def _subsample_on_mask_interpolator(
     tba_elev: NDArrayf | gpd.GeoDataFrame,
     aux_vars: None | dict[str, NDArrayf],
     sub_mask: NDArrayb,
-    transform: rio.transform.Affine,
+    ref_transform: rio.transform.Affine | None,
+    tba_transform: rio.transform.Affine | None,
     area_or_point: Literal["Area", "Point"] | None,
-    z_name: str,
+    z_name: str | None,
 ) -> tuple[Callable[[float, float], NDArrayf], None | dict[str, NDArrayf]]:
     """
     Mirrors coreg.base._subsample_on_mask, but returning an interpolator of elevation difference and subsampled
@@ -203,9 +214,10 @@ def _subsample_on_mask_interpolator(
     if isinstance(ref_elev, np.ndarray) and isinstance(tba_elev, np.ndarray):
 
         # Derive coordinates and interpolator
-        coords = _coords(transform=transform, shape=ref_elev.shape, area_or_point=area_or_point, grid=True)
+        assert ref_transform is not None and tba_transform is not None
+        coords = _coords(transform=ref_transform, shape=ref_elev.shape, area_or_point=area_or_point, grid=True)
         tba_elev_interpolator = _reproject_horizontal_shift_samecrs(
-            tba_elev, src_transform=transform, return_interpolator=True
+            tba_elev, src_transform=tba_transform, return_interpolator=True
         )
 
         # Subsample coordinates
@@ -228,10 +240,14 @@ def _subsample_on_mask_interpolator(
 
     # For one raster and one point cloud
     else:
+        if z_name is None:
+            raise ValueError("'z_name' must be given when either elevation input is a point cloud.")
 
         # Identify which dataset is point or raster
         pts_elev: gpd.GeoDataFrame = ref_elev if isinstance(ref_elev, gpd.GeoDataFrame) else tba_elev
         rst_elev: NDArrayf = ref_elev if not isinstance(ref_elev, gpd.GeoDataFrame) else tba_elev
+        rst_transform = ref_transform if isinstance(ref_elev, np.ndarray) else tba_transform
+        assert rst_transform is not None
         # Check which input is reference, to compute the dh always in the same direction (ref minus tba) further below
         ref = "point" if isinstance(ref_elev, gpd.GeoDataFrame) else "raster"
 
@@ -245,7 +261,7 @@ def _subsample_on_mask_interpolator(
         # Convert ref or tba depending on which is the point dataset
         rst_elev_interpolator = _interp_points_base(
             array=rst_elev,
-            transform=transform,
+            transform=rst_transform,
             area_or_point=area_or_point,
             points=sub_coords,
             return_interpolator=True,
@@ -272,7 +288,7 @@ def _subsample_on_mask_interpolator(
             sub_bias_vars = {}
             for var in aux_vars.keys():
                 sub_bias_vars[var] = _interp_points_base(
-                    array=aux_vars[var], transform=transform, points=sub_coords, area_or_point=area_or_point
+                    array=aux_vars[var], transform=rst_transform, points=sub_coords, area_or_point=area_or_point
                 )
         else:
             sub_bias_vars = None
@@ -285,9 +301,11 @@ def _subsample_rst_pts_interpolator(
     ref_elev: NDArrayf | gpd.GeoDataFrame,
     tba_elev: NDArrayf | gpd.GeoDataFrame,
     inlier_mask: NDArrayb,
-    transform: rio.transform.Affine,
+    ref_transform: rio.transform.Affine | None,
+    tba_transform: rio.transform.Affine | None,
+    crs: rio.crs.CRS,
     area_or_point: Literal["Area", "Point"] | None,
-    z_name: str,
+    z_name: str | None,
     aux_vars: None | dict[str, NDArrayf] = None,
 ) -> tuple[Callable[[float, float], NDArrayf], None | dict[str, NDArrayf], int]:
     """
@@ -307,7 +325,9 @@ def _subsample_rst_pts_interpolator(
         ref_elev=ref_elev,
         tba_elev=tba_elev,
         inlier_mask=inlier_mask,
-        transform=transform,
+        ref_transform=ref_transform,
+        tba_transform=tba_transform,
+        crs=crs,
         area_or_point=area_or_point,
         z_name=z_name,
         aux_vars=aux_vars,
@@ -319,7 +339,8 @@ def _subsample_rst_pts_interpolator(
         tba_elev=tba_elev,
         aux_vars=aux_vars,
         sub_mask=sub_mask,
-        transform=transform,
+        ref_transform=ref_transform,
+        tba_transform=tba_transform,
         area_or_point=area_or_point,
         z_name=z_name,
     )
@@ -405,11 +426,11 @@ def _standardize_epc(
     """
 
     # Convert centroid to array
-    centroid = np.array(centroid)
+    centroid_array = np.asarray(centroid)
 
     # Subtract centroid from point clouds
-    ref_epc = ref_epc - centroid[:, None]
-    tba_epc = tba_epc - centroid[:, None]
+    ref_epc = ref_epc - centroid_array[:, None]
+    tba_epc = tba_epc - centroid_array[:, None]
 
     # Standardize point clouds
     if scale != 1:
@@ -510,7 +531,7 @@ def _dem_normals_curvature(
 
         # Map to (0, 1) with a robust scale c0 (median is a good default)
         c0 = float(np.nanmedian(curv_dimless))
-        c0 = max(c0, np.finfo(float).eps)
+        c0 = max(c0, float(np.finfo(float).eps))
         curvature = curv_dimless / (curv_dimless + c0)
 
         # Final clip so 1/curvature is well-behaved
@@ -530,7 +551,6 @@ def _epc_normals_curvature(points: NDArrayf, neighbours: int) -> tuple[NDArrayf,
     :return: normals (M,3) unit, curvature (M,) = smallest_eig / sum_eigs.
     """
     Y = np.asarray(points, dtype=float)
-    M = Y.shape[0]
     k = max(int(neighbours), 3)
 
     tree = cKDTree(Y)
@@ -777,7 +797,7 @@ def _nuth_kaab_iteration_step(
     dh_step = sub_rst((coords_y, coords_x)) - sub_pts
 
     # Using the median/mean vertical offset is necessary (the Z component of the NK algorithm is not well defined)
-    vshift = float(np.nanmean(dh_step))
+    vshift = float(np.nanmedian(dh_step))
     dh_step -= vshift
 
     # Evaluate auxiliary variables at the same shifted XY locations
@@ -836,11 +856,11 @@ def nuth_kaab(
     tba_transform: rio.transform.Affine,
     crs: rio.crs.CRS,
     area_or_point: Literal["Area", "Point"] | None,
-    tolerance_translation: float,
+    tolerance_translation: float | None,
     max_iterations: int,
     params_fit_or_bin: InFitOrBinDict,
     params_random: InRandomDict,
-    z_name: str,
+    z_name: str | None,
     weights: NDArrayf | None = None,
     **kwargs: Any,
 ) -> tuple[tuple[float, float, float], int, OutIterativeDict]:
@@ -923,7 +943,7 @@ def nuth_kaab(
 
     # Change sign of output if reference was the point dataset
     if ref == "pts":
-        final_offsets = (-off for off in final_offsets)
+        final_offsets = (-final_offsets[0], -final_offsets[1], -final_offsets[2])
 
     return final_offsets, subsample_final, output_iterative
 
@@ -999,10 +1019,11 @@ def dh_minimize(
     inlier_mask: NDArrayb,
     ref_transform: rio.transform.Affine,
     tba_transform: rio.transform.Affine,
+    crs: rio.crs.CRS,
     area_or_point: Literal["Area", "Point"] | None,
     params_random: InRandomDict,
     params_fit_or_bin: InFitOrBinDict,
-    z_name: str,
+    z_name: str | None,
     weights: NDArrayf | None = None,
     **kwargs: Any,
 ) -> tuple[tuple[float, float, float], int]:
@@ -1015,15 +1036,15 @@ def dh_minimize(
 
     logging.info("Running dh minimization coregistration.")
 
-    transform = ref_transform if ref_transform is not None else tba_transform
-
     # Perform preprocessing: subsampling and interpolation of inputs and auxiliary vars at same points
     dh_interpolator, _, subsample_final = _subsample_rst_pts_interpolator(
         params_random=params_random,
         ref_elev=ref_elev,
         tba_elev=tba_elev,
         inlier_mask=inlier_mask,
-        transform=transform,
+        ref_transform=ref_transform,
+        tba_transform=tba_transform,
+        crs=crs,
         area_or_point=area_or_point,
         z_name=z_name,
     )
@@ -1050,7 +1071,7 @@ def vertical_shift(
     area_or_point: Literal["Area", "Point"] | None,
     params_random: InRandomDict,
     vshift_reduc_func: Callable[[NDArrayf], np.floating[Any]],
-    z_name: str,
+    z_name: str | None,
     weights: NDArrayf | None = None,
     **kwargs: Any,
 ) -> tuple[float, int]:
@@ -1069,7 +1090,8 @@ def vertical_shift(
         inlier_mask=inlier_mask,
         ref_transform=ref_transform,
         tba_transform=tba_transform,
-        sampling_strategy="same_xy",  # This needs to be enforced for a vertical shift based on mean elevation differences
+        # Enforce identical X/Y samples so the elevation differences describe the same locations
+        sampling_strategy="same_xy",
         crs=crs,
         area_or_point=area_or_point,
         z_name=z_name,
@@ -1286,7 +1308,8 @@ def _icp_fit(
         # Keep data not trimmed
         ref = ref[:, ~ind]
         tba = tba[:, ~ind]
-        norms = norms[:, ~ind]
+        if norms is not None:
+            norms = norms[:, ~ind]
 
     # Group inputs into a single array
     inputs = (ref, tba, norms)
@@ -1444,7 +1467,7 @@ def icp(
     tba_transform: rio.transform.Affine,
     crs: rio.CRS,
     area_or_point: Literal["Area", "Point"] | None,
-    z_name: str,
+    z_name: str | None,
     max_iterations: int,
     tolerance_translation: float | None,
     tolerance_rotation: float | None,
@@ -1481,7 +1504,8 @@ def icp(
     )
     if not standardize:
         scale = 1
-    tolerance_translation /= scale
+    if tolerance_translation is not None:
+        tolerance_translation /= scale
 
     # Initial parameters and tolerances as dictionary
     init_matrix = np.eye(4)  # Initial matrix is the identity transform
@@ -1594,12 +1618,13 @@ def icp(
 
         # If we apply iterative sampling, we need to do additional things each loop
         if sampling_strategy == "iterative_same_xy":
-            # We update the to-be-aligned elevation (input before subsampling) here directly, so that X/Y sampling will be updated
+            # Update the to-be-aligned elevation before subsampling so each iteration uses the transformed X/Y positions
             if isinstance(tba_elev, np.ndarray):
                 tba_elev, tba_transform = _apply_matrix_rst(
                     tba_elev_orig, transform=tba_transform_orig, centroid=centroid, matrix=final_matrix
                 )
             else:
+                assert z_name is not None
                 tba_elev = _apply_matrix_pts(tba_elev_orig, matrix=final_matrix, centroid=centroid, z_name=z_name)
             # We update the iterative output with the outside loop iteration number
             it_stats = output_iterative["iteration_stats"]
@@ -1607,14 +1632,14 @@ def icp(
             list_iteration_stats.append(it_stats)
 
             # Check exit condition was reached in inside loop
-            if all(new_stats[k] < tolerances[k] if k is not None else True for k in tolerances.keys()):
+            if all(tolerances[k] is None or new_stats[k] < tolerances[k] for k in tolerances):
                 logging.debug("Exiting outside loop of iterative sampling as statistics have all reached tolerance.")
                 break
 
     # Over-write iterative output for iterative sampling
     if sampling_strategy == "iterative_same_xy":
         iteration_stats = pd.concat(list_iteration_stats)
-        output_iterative: OutAffineDict = {"last_iteration": i + 1, "iteration_stats": iteration_stats}
+        output_iterative = OutIterativeDict(last_iteration=i + 1, iteration_stats=iteration_stats)
 
     # Get subsample size
     # TODO: Support reporting different number of subsamples when independent?
@@ -1768,12 +1793,8 @@ def _cpd_precompute(
     # Precompute dot(x, n)
     X_normal = np.sum(X * Wn, axis=1)  # (N,)
 
-    # Precompute X_Y = ||x||^2 + ||y||^2 (N,M) (Matlab uses this structure)
-    X3 = X.T  # (3,N)
-    Y3 = Y.T  # (3,M)
+    # Precompute the squared weighted target coordinates used by the E-step
     X_X2 = np.sum((X * X) * w[None, :], axis=1)  # (N,)
-    Y_Y2 = np.sum(Y3 * Y3, axis=0)  # (M,)
-    X_Y = X_X2[:, None] + Y_Y2[None, :]  # (N,M)
 
     # pi(m) base (before sigma2-dependent scaling and outlier reweighting)
     f_X_base = np.ones(N, dtype=float) / N
@@ -1817,8 +1838,6 @@ def _lsg_update_sigma_dependent(cache_lsg: dict[str, Any], sigma2: float, weight
     This is called at every iteration, but it is cheap compared to recomputing normals/curvature/invSigma.
     """
     sigma2 = float(sigma2)
-    N = cache_lsg["N"]
-    M = cache_lsg["M"]
     V = cache_lsg["V"]
     a = cache_lsg["a"]
     f_X_scaled = cache_lsg["f_X_scaled"]
@@ -1939,7 +1958,6 @@ def _cpd_mstep_classic_fit_minimizer(
     M, _ = TY.shape
 
     P = estep["P"]  # (M,N) in your implementation
-    P1 = estep["P1"]  # (M,)
     Np = float(estep["Np"])
     PX = estep["PX"]  # (N,D) since PX = P @ X
 
@@ -1950,7 +1968,6 @@ def _cpd_mstep_classic_fit_minimizer(
     # Subtract centroid from each point cloud
     X_hat = X - np.tile(muX, (N, 1))
     Y_hat = TY - np.tile(muY, (M, 1))
-    YPY = float(np.dot(np.transpose(P1), np.sum(np.multiply(Y_hat, Y_hat), axis=1)))
 
     # Derive A as in Fig. 2 (kept so shrink step remains identical)
     A = np.dot(np.transpose(X_hat), np.transpose(P))
@@ -2107,7 +2124,6 @@ def _cpd_mstep_classic_fit_minimizer_fast(
     muY = np.divide(np.sum(np.dot(np.transpose(P), TY), axis=0), Np)
     X_hat = X - np.tile(muX, (N, 1))
     Y_hat = TY - np.tile(muY, (M, 1))
-    YPY = float(np.dot(np.transpose(P1), np.sum(np.multiply(Y_hat, Y_hat), axis=1)))
     A = np.dot(np.transpose(X_hat), np.transpose(P))
     A = np.dot(A, Y_hat)
 
@@ -2507,7 +2523,7 @@ def _cpd_fit(
     trans_tba_epc: NDArrayf,
     params_fit_or_bin: InFitOrBinDict,
     weight_cpd: float,
-    sigma2: float,
+    sigma2: float | None,
     sigma2_min: float,
     scale: bool = False,
     only_translation: bool = False,
@@ -2541,6 +2557,7 @@ def _cpd_fit(
         sigma2 = float(np.sum(diff2) / (D * N * M))
 
     # Get kNN tree if used to accelerate expectation step
+    assert cache is not None
     knn = None if cache is None else cache.get("knn", None)
     knn_tree = None if knn is None else knn["tree"]
     knn_k = None if knn is None else knn["k"]
@@ -2558,18 +2575,25 @@ def _cpd_fit(
         # 2/ Minimization step
         use_generic_mstep = False  # To check internally the consistency with old implementation
         if use_generic_mstep:
-            mstep_func = _cpd_mstep_classic_fit_minimizer
+            R, t, s = _cpd_mstep_classic_fit_minimizer(
+                X=X,
+                TY=TY,
+                estep=estep,
+                scale=scale,
+                w=w,
+                only_translation=only_translation,
+                params_fit_or_bin=params_fit_or_bin,
+            )
         else:
-            mstep_func = _cpd_mstep_classic_fit_minimizer_fast
-        R, t, s = mstep_func(
-            X=X,
-            TY=TY,
-            estep=estep,
-            scale=scale,
-            w=w,
-            only_translation=only_translation,
-            params_fit_or_bin=params_fit_or_bin,
-        )
+            R, t, s = _cpd_mstep_classic_fit_minimizer_fast(
+                X=X,
+                TY=TY,
+                estep=estep,
+                scale=scale,
+                w=w,
+                only_translation=only_translation,
+                params_fit_or_bin=params_fit_or_bin,
+            )
 
         # 3/ Update variance and objective function
         sigma2_new, q = _cpd_shrink_classic(
@@ -2688,7 +2712,7 @@ def cpd(
     tba_transform: rio.transform.Affine,
     crs: rio.crs.CRS,
     area_or_point: Literal["Area", "Point"] | None,
-    z_name: str,
+    z_name: str | None,
     weight_cpd: float,
     params_random: InRandomDict,
     params_fit_or_bin: InFitOrBinDict,
@@ -2719,7 +2743,8 @@ def cpd(
     centroid, scale = _get_centroid_scale(ref_elev=ref_elev, transform=ref_transform, z_name=z_name)
     if not standardize:
         scale = 1
-    tolerance_translation /= scale
+    if tolerance_translation is not None:
+        tolerance_translation /= scale
 
     # Initial values and tolerances as dictionary
     init_matrix = np.eye(4)  # Initial matrix is the identity transform
@@ -2806,8 +2831,8 @@ def cpd(
         # Run rigid CPD registration
         # Iterate through method until tolerance or max number of iterations is reached
         iterating_input = (init_matrix, new_sigma2, new_q)
-        sigma2_min = tolerance_translation / 10
-        # Pre-compute values re-used through iteration for efficiency
+        sigma2_min = tolerance_translation / 10 if tolerance_translation is not None else np.finfo(float).eps
+        # Pre-compute values reused through iteration for efficiency
         cpd_cache = _cpd_precompute(
             ref_epc=ref_epc,
             tba_epc=tba_epc,
@@ -2854,12 +2879,13 @@ def cpd(
 
         # If we apply iterative sampling, we need to do additional things each loop
         if sampling_strategy == "iterative_same_xy":
-            # We update the to-be-aligned elevation (input before subsampling) here directly, so that X/Y sampling will be updated
+            # Update the to-be-aligned elevation before subsampling so each iteration uses the transformed X/Y positions
             if isinstance(tba_elev, np.ndarray):
                 tba_elev, tba_transform = _apply_matrix_rst(
                     tba_elev_orig, transform=tba_transform_orig, centroid=centroid, matrix=final_matrix
                 )
             else:
+                assert z_name is not None
                 tba_elev = _apply_matrix_pts(tba_elev_orig, matrix=final_matrix, centroid=centroid, z_name=z_name)
             # We update the iterative output with the outside loop iteration number
             it_stats = output_iterative["iteration_stats"]
@@ -2867,14 +2893,14 @@ def cpd(
             list_iteration_stats.append(it_stats)
 
             # Check exit condition was reached in inside loop
-            if all(new_stats[k] < tolerances[k] if k is not None else True for k in tolerances.keys()):
+            if all(tolerances[k] is None or new_stats[k] < tolerances[k] for k in tolerances):
                 logging.debug("Exiting outside loop of iterative sampling as statistics have all reached tolerance.")
                 break
 
     # Over-write iterative output for iterative sampling
     if sampling_strategy == "iterative_same_xy":
         iteration_stats = pd.concat(list_iteration_stats)
-        output_iterative: OutAffineDict = {"last_iteration": i + 1, "iteration_stats": iteration_stats}
+        output_iterative = OutIterativeDict(last_iteration=i + 1, iteration_stats=iteration_stats)
 
     # Get subsample size
     # TODO: Support reporting different number of subsamples when independent?
@@ -2915,10 +2941,7 @@ def _lzd_aux_vars(
     elif isinstance(ref_elev, np.ndarray) and isinstance(tba_elev, np.ndarray):
 
         # Derive slope and aspect from the reference as default
-        if np.ma.isMaskedArray(ref_elev):
-            ref_arr = ref_elev.filled(np.nan)
-        else:
-            ref_arr = ref_elev
+        ref_arr = np.asarray(np.ma.filled(ref_elev, np.nan))
         gradient_y, gradient_x = np.gradient(ref_arr)
 
     # If inputs are one raster and one point cloud, derive terrain attribute from raster and get 1D dh interpolator
@@ -2928,10 +2951,8 @@ def _lzd_aux_vars(
             rst_elev = tba_elev
         else:
             rst_elev = ref_elev
-        if np.ma.isMaskedArray(rst_elev):
-            rst_arr = rst_elev.filled(np.nan)
-        else:
-            rst_arr = rst_elev
+        assert isinstance(rst_elev, np.ndarray)
+        rst_arr = np.asarray(np.ma.filled(rst_elev, np.nan))
         # Derive slope and aspect from the raster dataset
         gradient_y, gradient_x = np.gradient(rst_arr)
 
@@ -3063,7 +3084,15 @@ def _lzd_fit_nonlinear(
     else:
         beta = np.asarray(results.x, dtype=float)
 
-    return matrix_from_translations_rotations(*beta, use_degrees=False)
+    return matrix_from_translations_rotations(
+        t1=float(beta[0]),
+        t2=float(beta[1]),
+        t3=float(beta[2]),
+        alpha1=float(beta[3]),
+        alpha2=float(beta[4]),
+        alpha3=float(beta[5]),
+        use_degrees=False,
+    )
 
 
 def _lzd_fit_func(
@@ -3116,7 +3145,7 @@ def _lzd_fit_func(
     return res
 
 
-def _convert_lengthscale_gstools_gpytorch(correlation_range: float):
+def _convert_lengthscale_gstools_gpytorch(correlation_range: float) -> float:
 
     # Divide by 2 because I used rescale=2 in GSTools (to get effective range)
     gp_lengthscale = correlation_range / 2 / np.sqrt(2)
@@ -3130,12 +3159,12 @@ def _gls_lazy_gpytorch(
     X: NDArrayf,
     Y: NDArrayf,
     sig_Y: NDArrayf,
-    lengthscale=0.2,
-    outputscale=1.0,
-    cg_tol=1e-3,
-    max_preconditioner_size=100,
-    jitter=1e-3,
-):
+    lengthscale: float = 0.2,
+    outputscale: float = 1.0,
+    cg_tol: float = 1e-3,
+    max_preconditioner_size: int = 100,
+    jitter: float = 1e-3,
+) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
     """
     Perform generalized least squares (GLS) using GPyTorch lazy covariances based on kernels to scale efficiently
     with a large number of points.
@@ -3206,19 +3235,19 @@ def _gls_lazy_gpytorch(
 
 
 def _lzd_fit_error_propag(
-    x,
-    y,
-    z,
-    dh,
-    gx,
-    gy,
-    pixel_size,
-    sig_h_other,
-    corr_h_other,
-    sig_h_grid=None,
-    corr_h_grid=None,
+    x: NDArrayf,
+    y: NDArrayf,
+    z: NDArrayf,
+    dh: NDArrayf,
+    gx: NDArrayf,
+    gy: NDArrayf,
+    pixel_size: float,
+    sig_h_other: NDArrayf | None,
+    corr_h_other: _CorrelationModel | None,
+    sig_h_grid: NDArrayf | None = None,
+    corr_h_grid: _CorrelationModel | None = None,
     force_opti: Literal["gls", "tls"] | None = None,
-):
+) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
     """
     Error-aware LZD using either generalized least-squares (GLS) or total least-squares (TLS), depending on
     the error structure of the inputs.
@@ -3266,7 +3295,6 @@ def _lzd_fit_error_propag(
         if force_opti == "gls":
             logging.info("Forcing method optimization method 'gls' for LZD.")
         import statsmodels.api as sm
-        from scipy.spatial.distance import pdist, squareform
 
         logging.info("No error passed for gridded elevation, using GLS for LZD error propagation.")
 
@@ -3323,8 +3351,10 @@ def _lzd_fit_error_propag(
 
         if corr_h_other is not None:
             gp_ls = _convert_lengthscale_gstools_gpytorch(corr_h_other[1])
-        else:
+        elif corr_h_grid is not None:
             gp_ls = _convert_lengthscale_gstools_gpytorch(corr_h_grid[1])
+        else:
+            raise ValueError("GLS error propagation requires a correlation model for at least one elevation input.")
 
         # We pass sigma for Y = dh, which can depend on both inputs
         sig_h_o = sig_h_other if sig_h_other is not None else 0
@@ -3347,7 +3377,12 @@ def _lzd_fit_error_propag(
 
         # Transform sigma in variance to simplify writing below
         # If sig_h_grid is not defined, we simply apply a fraction of sig_h_other
-        var_h_grid = sig_h_grid**2 if sig_h_grid is not None else np.mean(sig_h_other**2) / 1000 * np.ones(len(x))
+        if sig_h_grid is not None:
+            var_h_grid = sig_h_grid**2
+        elif sig_h_other is not None:
+            var_h_grid = np.mean(sig_h_other**2) / 1000 * np.ones(len(x))
+        else:
+            raise ValueError("TLS error propagation requires elevation errors for at least one input.")
 
         # Get amplitude of gradient errors from elevation errors and their correlations
         corr_func = corr_h_grid[0] if corr_h_grid is not None else None
@@ -3394,15 +3429,31 @@ def _lzd_fit_error_propag(
 
         # For zeros
         zeros = np.zeros(len(z))
-        # Deactivate black formatting for readibility of the matrix
+        # Deactivate black formatting for readability of the matrix
         # fmt: off
         cov_XX = np.stack(
-            [[var_X[0],     zeros,       zeros,                        z * var_gx,                       -y * var_gx],
-             [zeros,        var_X[1],   -z * var_gy,                   zeros,                             x * var_gy],
-             [zeros,       -z * var_gy,  var_X[2],                     var_z * gx * gy, -z * x * var_gy + gx * var_y],
-             [z * var_gx,   zeros,       var_z * gx * gy,              var_X[3],        -z * y * var_gx + gy * var_x],
-             [-y * var_gx,  x * var_gy, -z * x * var_gy + gx * var_y, -z * y * var_gx + gy * var_x,         var_X[4]],
-        ])
+            [
+                [
+                    var_X[0], zeros, zeros, z * var_gx, -y * var_gx,
+                ],
+                [
+                    zeros, var_X[1], -z * var_gy, zeros, x * var_gy,
+                ],
+                [
+                    zeros, -z * var_gy, var_X[2], var_z * gx * gy, -z * x * var_gy + gx * var_y,
+                ],
+                [
+                    z * var_gx, zeros, var_z * gx * gy, var_X[3], -z * y * var_gx + gy * var_x,
+                ],
+                [
+                    -y * var_gx,
+                    x * var_gy,
+                    -z * x * var_gy + gx * var_y,
+                    -z * y * var_gx + gy * var_x,
+                    var_X[4],
+                ],
+            ]
+        )
         # Reactivate black formatting
         # fmt: on
 
@@ -3461,10 +3512,10 @@ def _lzd_fit_linearized(
     params_fit_or_bin: InFitOrBinDict,
     only_translation: bool,
     pixel_size: float,
-    errors: tuple[NDArrayf, Callable, NDArrayf, Callable] = None,
-    force_opti: Literal["ols", "gls", "tls"] = None,
+    errors: _LzdSampledErrors | None = None,
+    force_opti: Literal["ols", "gls", "tls"] | None = None,
     **kwargs: Any,
-) -> tuple[NDArrayf, NDArrayf]:
+) -> tuple[NDArrayf, NDArrayf | None]:
     """
     Optimization of fit function for Least Z-difference coregistration.
 
@@ -3553,6 +3604,7 @@ def _lzd_fit_linearized(
         beta = results.x
         err_beta = None
     else:
+        assert errors is not None
         beta, err_beta, _ = _lzd_fit_error_propag(
             x=x,
             y=y,
@@ -3585,15 +3637,7 @@ def _lzd_fit(
     sub_grady: Callable[[tuple[NDArrayf, NDArrayf]], NDArrayf],
     params_fit_or_bin: Any,  # InFitOrBinDict
     only_translation: bool,
-    sub_errors: (
-        tuple[
-            Callable[[tuple[NDArrayf, NDArrayf]], NDArrayf] | None,
-            Callable | None,
-            Callable[[tuple[NDArrayf, NDArrayf]], NDArrayf] | None,
-            Callable | None,
-        ]
-        | None
-    ),
+    sub_errors: _LzdErrorInterpolators | None,
     pixel_size: float,
     force_opti: Literal["ols", "gls", "tls"] | None = None,
     linearized: bool = True,
@@ -3677,8 +3721,8 @@ def _lzd_fit(
         if np.count_nonzero(valids) == 0:
             raise ValueError(
                 "The subsample contains no more valid values. This can happen if the affine transformation to "
-                "correct is larger than the data extent, or if the algorithm diverged. To ensure all possible points can "
-                "be used at any iteration step, use subsample=1."
+                "correct is larger than the data extent, or if the algorithm diverged. To ensure all possible points "
+                "can be used at any iteration step, use subsample=1."
             )
 
         x = x[valids]
@@ -3722,14 +3766,9 @@ def _lzd_iteration_step(
     params_fit_or_bin: InFitOrBinDict,
     only_translation: bool,
     linearized: bool,
-    sub_errors: tuple[
-        Callable[[tuple[NDArrayf, NDArrayf]], NDArrayf],
-        Callable,
-        Callable[[tuple[NDArrayf, NDArrayf]], NDArrayf],
-        Callable,
-    ],
+    sub_errors: _LzdErrorInterpolators | None,
     pixel_size: float,
-    force_opti: Literal["ols", "gls", "tls"] = None,
+    force_opti: Literal["ols", "gls", "tls"] | None = None,
 ) -> tuple[NDArrayf, dict[str, float], NDArrayf | None]:
     """
     Iteration step of Least Z-difference coregistration from Rosenholm and Torlegård (1988).
@@ -3798,7 +3837,7 @@ def lzd(
     tba_transform: rio.transform.Affine,
     crs: rio.crs.CRS,
     area_or_point: Literal["Area", "Point"] | None,
-    z_name: str,
+    z_name: str | None,
     max_iterations: int,
     tolerance_translation: float | None,
     tolerance_rotation: float | None,
@@ -3806,10 +3845,10 @@ def lzd(
     params_fit_or_bin: InFitOrBinDict,
     only_translation: bool,
     linearized: bool = True,
-    sig_ref: NDArrayf | gpd.GeoDataFrame = None,
-    sig_tba: NDArrayf | gpd.GeoDataFrame = None,
-    corr_ref: Callable[[NDArrayf, NDArrayf], NDArrayf] = None,
-    corr_tba: Callable[[NDArrayf, NDArrayf], NDArrayf] = None,
+    sig_ref: NDArrayf | gpd.GeoDataFrame | None = None,
+    sig_tba: NDArrayf | gpd.GeoDataFrame | None = None,
+    corr_ref: _CorrelationModel | None = None,
+    corr_tba: _CorrelationModel | None = None,
     force_opti: Literal["ols", "gls", "tls"] | None = None,
 ) -> tuple[NDArrayf, tuple[float, float, float], int, OutIterativeDict, NDArrayf | None]:
     """
@@ -3832,10 +3871,8 @@ def lzd(
     )[0]
 
     pixel_size = _res(transform)[0]
-    logging.info(
-        f"Using {"reference" if ref_transform is not None else "to-be-aligned"} "
-        f"as continuous grid for deriving gradients."
-    )
+    continuous_grid = "reference" if ref_transform is not None else "to-be-aligned"
+    logging.info(f"Using {continuous_grid} as continuous grid for deriving gradients.")
 
     # Check that DEM CRS is projected, otherwise slope is not correctly calculated
     if not crs.is_projected:
@@ -4174,7 +4211,9 @@ class AffineCoreg(Coreg):
             ref_elev=ref_elev,
             tba_elev=tba_elev,
             inlier_mask=inlier_mask,
-            transform=transform,
+            ref_transform=transform,
+            tba_transform=transform,
+            crs=crs,
             area_or_point=area_or_point,
             z_name=z_name,
             aux_vars=aux_vars,
@@ -4186,7 +4225,8 @@ class AffineCoreg(Coreg):
             tba_elev=tba_elev,
             aux_vars=aux_vars,
             sub_mask=sub_mask,
-            transform=transform,
+            ref_transform=transform,
+            tba_transform=transform,
             area_or_point=area_or_point,
             z_name=z_name,
         )
@@ -4425,7 +4465,7 @@ class ICP(AffineCoreg):
         if tolerance_rotation is None and tolerance_translation is None:
             raise ValueError("At least one tolerance must be defined.")
 
-        meta = {
+        meta: dict[str, Any] = {
             "icp_method": method,
             "icp_picky": picky,
             "linearized": linearized,
@@ -4540,7 +4580,7 @@ class CPD(AffineCoreg):
         standardize: bool = True,
         subsample: int | float = 5e3,
         initial_shift: tuple[Number, Number] | tuple[Number, Number, Number] | None = None,
-    ):
+    ) -> None:
         """
         Instantiate a CPD coregistration object.
 
@@ -4556,8 +4596,8 @@ class CPD(AffineCoreg):
             iterations (once other tolerances are also reached, if any).
         :param tolerance_rotation: Magnitude of iteration rotation (in degrees) at which to stop the iterations (once
             other tolerances are also reached, if any)
-        :param tolerance_objective_func: Magnitude of iteration objective function value (see Q in Myronenko and Song (2010))
-            at which to stop the iterations (once other tolerances are also reached, if any).
+        :param tolerance_objective_func: Magnitude of iteration objective function value (see Q in Myronenko and Song
+            (2010)) at which to stop the iterations (once other tolerances are also reached, if any).
         :param standardize: Whether to standardize input point clouds to the unit sphere for numerical convergence
             (tolerance is also standardized by the same factor).
         :param subsample: Subsample the input for speed-up. <1 is parsed as a fraction. >1 is a pixel count.
@@ -4699,7 +4739,7 @@ class NuthKaab(AffineCoreg):
         )
 
         # Define iterative parameters and vertical shift
-        meta_input_iterative = {
+        meta_input_iterative: dict[str, Any] = {
             "max_iterations": max_iterations,
             "tolerance_translation": tolerance_translation,
             "apply_vshift": vertical_shift,
@@ -4825,7 +4865,7 @@ class LZD(AffineCoreg):
         trim_spread_coverage: float = 3,
         trim_iterative: bool = False,
         initial_shift: tuple[Number, Number] | tuple[Number, Number, Number] | None = None,
-    ):
+    ) -> None:
         """
          Instantiate an LZD coregistration object.
 
@@ -4846,7 +4886,7 @@ class LZD(AffineCoreg):
         if tolerance_rotation is None and tolerance_translation is None:
             raise ValueError("At least one tolerance must be defined.")
 
-        meta = {
+        meta: dict[str, Any] = {
             "fit_minimizer": fit_minimizer,
             "fit_loss_func": fit_loss_func,
             "max_iterations": max_iterations,
@@ -4979,7 +5019,7 @@ class DhMinimize(AffineCoreg):
         weights: NDArrayf | None = None,
         bias_vars: dict[str, NDArrayf] | None = None,
         **kwargs: Any,
-    ):
+    ) -> None:
 
         # Get parameters stored in class
         params_random = self._meta["inputs"]["random"]
@@ -4992,6 +5032,7 @@ class DhMinimize(AffineCoreg):
             inlier_mask=inlier_mask,
             ref_transform=ref_transform,
             tba_transform=tba_transform,
+            crs=crs,
             area_or_point=area_or_point,
             z_name=z_name,
             weights=weights,

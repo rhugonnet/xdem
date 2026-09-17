@@ -381,7 +381,7 @@ def _preprocess_coreg_fit_raster_point(
         raise ValueError("'crs' must be given if both DEMs are array-like.")
 
     if z_name is None:
-        raise ValueError(f"'z_name' must be given if an elevation point cloud is used as elevation input.")
+        raise ValueError("'z_name' must be given if an elevation point cloud is used as elevation input.")
 
     if z_name not in point_elev.columns:
         raise ValueError(
@@ -416,7 +416,7 @@ def _preprocess_coreg_fit_point_point(
     """Pre-processing and checks of fit for point-point input."""
 
     if z_name is None:
-        raise ValueError(f"'z_name' must be given if an elevation point cloud is used as elevation input.")
+        raise ValueError("'z_name' must be given if an elevation point cloud is used as elevation input.")
 
     if z_name not in reference_elev.columns:
         raise ValueError(f"'z_name' {z_name} is not a column of the reference elevation point cloud geodataframe.")
@@ -2540,7 +2540,9 @@ class Coreg:
         #             UserWarning,
         #         )
         #         tba_elev_pts = (
-        #             gu.Raster.from_array(data=kwargs["tba_elev"], transform=kwargs["tba_transform"], crs=kwargs["crs"])
+        #             gu.Raster.from_array(
+        #                 data=kwargs["tba_elev"], transform=kwargs["tba_transform"], crs=kwargs["crs"]
+        #             )
         #             .to_pointcloud()
         #             .ds
         #         )
@@ -2950,7 +2952,9 @@ def _get_subsample_mask_pts_rst(
     ref_elev: NDArrayf | gpd.GeoDataFrame,
     tba_elev: NDArrayf | gpd.GeoDataFrame,
     inlier_mask: NDArrayb,
-    transform: Any,
+    ref_transform: Any,
+    tba_transform: Any,
+    crs: Any,
     z_name: str | None,
     area_or_point: Any,
     subsample: int | float = 1,
@@ -2960,7 +2964,6 @@ def _get_subsample_mask_pts_rst(
     """Select locations for iterative interpolators using GeoUtils common sampling."""
 
     # Match the finite point population used by the existing iterative interpolators
-    crs = None
     if isinstance(ref_elev, gpd.GeoDataFrame):
         ref_elev = ref_elev[np.isfinite(ref_elev[z_name])]
         crs = ref_elev.crs
@@ -2973,8 +2976,8 @@ def _get_subsample_mask_pts_rst(
         ref_elev,
         tba_elev,
         inlier_mask,
-        transform,
-        transform,
+        ref_transform,
+        tba_transform,
         crs,
         area_or_point,
         z_name,

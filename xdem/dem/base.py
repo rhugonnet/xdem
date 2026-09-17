@@ -482,6 +482,8 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
         }
         if precision_of_other not in {"finer", "same"}:
             raise ValueError("precision_of_other must be 'finer' or 'same'.")
+
+        # Keep the deprecated workflow close to its former 1,000-location variogram cost
         structure = estimate_error_structure(
             self,
             other_elev,
@@ -492,6 +494,7 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
             z_name=z_name,
             spread_estimator=spread_estimator,
             variogram_estimator=variogram_estimator,
+            n_pairs=100_000,
             random_state=random_state,
         )
         return structure.predict_magnitude(variables, like=self), lambda distance: np.asarray(
