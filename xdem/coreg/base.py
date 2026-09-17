@@ -909,15 +909,15 @@ def _bin_or_and_fit_nd(
             params_fit_or_bin["bin_statistic"].__name__,
         )
 
-        df = gu.stats.grouped_stats(
-            values={"bias": values},
+        df = gu.stats.stats(
+            {"bias": values},
+            (params_fit_or_bin["bin_statistic"], "count"),
             by=bias_vars,
             bins=(
                 dict.fromkeys(bias_vars, bin_sizes)
                 if isinstance(bin_sizes, (int, np.integer))
                 else dict(zip(bias_vars, bin_sizes))
             ),
-            statistics=(params_fit_or_bin["bin_statistic"], "count"),
             observed=False,
         )
         results = None
@@ -931,15 +931,15 @@ def _bin_or_and_fit_nd(
             params_fit_or_bin["fit_func"].__name__,
         )
 
-        df = gu.stats.grouped_stats(
-            values={"bias": values},
+        df = gu.stats.stats(
+            {"bias": values},
+            (params_fit_or_bin["bin_statistic"], "count"),
             by=bias_vars,
             bins=(
                 dict.fromkeys(bias_vars, bin_sizes)
                 if isinstance(bin_sizes, (int, np.integer))
                 else dict(zip(bias_vars, bin_sizes))
             ),
-            statistics=(params_fit_or_bin["bin_statistic"], "count"),
             observed=False,
         )
 

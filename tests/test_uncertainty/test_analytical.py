@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from affine import Affine
+from geoutils.stats.variography import VariogramModel
 from shapely.geometry import box
 
 import xdem
@@ -29,7 +30,7 @@ class TestEffectiveSampleSize:
 
         # Convert the model partial sill to an error magnitude while keeping unit correlation variance
         structure = xdem.ErrorStructure(
-            [xdem.ErrorComponent("error", np.sqrt(psill1), gu.VariogramModel(model1, range1, 1))]
+            [xdem.ErrorComponent("error", np.sqrt(psill1), VariogramModel(model1, range1, 1))]
         )
 
         # Evaluate the closed formula for the equivalent circular area
@@ -61,7 +62,7 @@ class TestEffectiveSampleSize:
         # Represent the three independent contributions as separate error components
         structure = xdem.ErrorStructure(
             [
-                xdem.ErrorComponent(f"range{i}", np.sqrt(sill), gu.VariogramModel(model, scale, 1))
+                xdem.ErrorComponent(f"range{i}", np.sqrt(sill), VariogramModel(model, scale, 1))
                 for i, (model, scale, sill) in enumerate(
                     zip([model1, model2, model3], [range1, range2, range3], [psill1, psill2, psill3])
                 )
@@ -96,8 +97,8 @@ class TestEffectiveSampleSize:
         # Combine short and long range errors with equal variance contributions
         structure = xdem.ErrorStructure(
             [
-                xdem.ErrorComponent("short", np.sqrt(0.5), gu.VariogramModel("spherical", 5, 1)),
-                xdem.ErrorComponent("long", np.sqrt(0.5), gu.VariogramModel("gaussian", 50, 1)),
+                xdem.ErrorComponent("short", np.sqrt(0.5), VariogramModel("spherical", 5, 1)),
+                xdem.ErrorComponent("long", np.sqrt(0.5), VariogramModel("gaussian", 50, 1)),
             ]
         )
 
@@ -170,10 +171,8 @@ class TestSpatialErrorPropagation:
         # Combine the variable component with constant correlated and independent contributions
         structure = xdem.ErrorStructure(
             [
-                xdem.ErrorComponent(
-                    "variable", xdem.ErrorMagnitude.grouped(table), gu.VariogramModel("gaussian", 30, 1)
-                ),
-                xdem.ErrorComponent("fixed", 0.7, gu.VariogramModel("spherical", 100, 1)),
+                xdem.ErrorComponent("variable", xdem.ErrorMagnitude.grouped(table), VariogramModel("gaussian", 30, 1)),
+                xdem.ErrorComponent("fixed", 0.7, VariogramModel("spherical", 100, 1)),
                 xdem.ErrorComponent("independent", 0.3),
             ]
         )

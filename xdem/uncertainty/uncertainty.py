@@ -92,6 +92,17 @@ def estimate_error_structure(
     :returns: Fitted component based error structure.
     """
 
+    # Convert eager accessors to native GeoUtils objects because cosample() requires one interface family
+    from xdem.coreg.base import _as_eager_elevation
+
+    source_elev = _as_eager_elevation(source_elev)
+    other_elev = _as_eager_elevation(other_elev)
+    stable_terrain = _as_eager_elevation(stable_terrain)
+    if isinstance(predictors, Mapping):
+        predictors = {name: _as_eager_elevation(value) for name, value in predictors.items()}
+    elif predictors is not None:
+        predictors = tuple(_as_eager_elevation(value) for value in predictors)
+
     # Normalize plain point dataframes to the shared GeoUtils spatial interface
     if isinstance(source_elev, gpd.GeoDataFrame):
         source_elev = PointCloud(source_elev, data_column=z_name)

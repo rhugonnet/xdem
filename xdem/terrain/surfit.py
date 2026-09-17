@@ -1107,7 +1107,7 @@ def _get_surface_attributes_scipy(
     coefs = convolution(
         imgs=dem.reshape((1, dem.shape[0], dem.shape[1])),
         filters=filters,
-        method="scipy",
+        engine="scipy",
     ).squeeze()
 
     # Convert coefficients to attributes

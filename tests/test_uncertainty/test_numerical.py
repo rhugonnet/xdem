@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from affine import Affine
 from geoutils import Raster, Vector
+from geoutils.stats.variography import VariogramModel
 
 import xdem
 from xdem import examples
@@ -62,7 +63,7 @@ class TestRandomFields:
         )
 
         # Use a unit variance Gaussian correlation and scale the resulting field by two
-        correlation = gu.VariogramModel("gaussian", effective_range=50, partial_sill=1)
+        correlation = VariogramModel("gaussian", effective_range=50, partial_sill=1)
         structure = xdem.ErrorStructure([xdem.ErrorComponent("spatial", 2, correlation)])
 
         # Generate the field through the public ErrorStructure method

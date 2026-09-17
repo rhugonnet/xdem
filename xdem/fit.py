@@ -505,7 +505,13 @@ def robust_norder_polynomial_fit(
 
     # Subsample data
     if subsample != 1:
-        subsamp = _subsample_numpy(x, subsample=subsample, return_indices=True, random_state=random_state)
+        subsamp = _subsample_numpy(
+            x,
+            subsample=subsample,
+            return_indices=True,
+            random_state=random_state,
+            strategy="sequential",
+        )
         x = x[subsamp]
         y = y[subsamp]
 
@@ -750,7 +756,7 @@ def interp_binning(
     Missing groups are filled inside the sampled domain and then by nearest neighbours. Predictions beyond the
     outer group centres are clamped to those centres. This supports both signed biases and error magnitudes.
 
-    :param table: Table returned by ``geoutils.stats.grouped_stats``, with named predictor index levels.
+    :param table: Table returned by ``geoutils.stats.stats``, with named predictor index levels.
     :param value_name: Value column to interpolate.
     :param statistic: Statistic name or callable identifying the statistic column.
     :param min_count: Minimum group count, or None to disable count filtering.
@@ -901,7 +907,7 @@ def get_perbin_binning(
 
     Values outside the declared intervals or categories remain NaN. Interval closure follows the grouped table.
 
-    :param table: Table returned by ``geoutils.stats.grouped_stats``.
+    :param table: Table returned by ``geoutils.stats.stats``.
     :param predictors: Named predictor arrays with broadcast compatible shapes.
     :param value_name: Value column to look up.
     :param statistic: Statistic name or callable identifying the statistic column.

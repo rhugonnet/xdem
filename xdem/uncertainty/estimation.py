@@ -32,6 +32,7 @@ from typing import Any, Literal, cast
 import geoutils as gu
 import numpy as np
 import pandas as pd
+from geoutils.stats.variography import Variogram, VariogramModel
 from numpy.typing import ArrayLike, NDArray
 from scipy.optimize import least_squares
 
@@ -250,11 +251,11 @@ def _estimate_total_magnitude(
         grouped_subsample = 1
 
     # Keep unobserved predictor combinations so the fitted magnitude grid can fill their gaps
-    table = gu.stats.grouped_stats(
+    table = gu.stats.stats(
         {"error": centered},
-        dict(predictors),
+        [spread_estimator],
+        by=dict(predictors),
         bins=grouped_bins,
-        statistics=[spread_estimator],
         mask=eligible,
         subsample=grouped_subsample,
         random_state=random_state,
@@ -355,7 +356,7 @@ def _normalize_component_configuration(
 def _initialize_components(
     configuration: list[dict[str, Any]],
     total_magnitude: ErrorMagnitude,
-    fitted_variogram: gu.Variogram,
+    fitted_variogram: Variogram,
 ) -> list[ErrorComponent]:
     """Convert standardized partial sills into component magnitude and correlation models."""
 
@@ -383,7 +384,7 @@ def _initialize_components(
     ordered_sills = np.array([float(model.partial_sill or 0.0) for model in structured_models])[fitted_order]
 
     # Associate ordered parameters with declared model forms and retain the fitted nugget separately
-    model_by_name: dict[str, gu.VariogramModel | None] = {}
+    model_by_name: dict[str, VariogramModel | None] = {}
     sill_by_name: dict[str, float] = {}
     model_position = 0
     for item in configuration:
@@ -481,7 +482,7 @@ def _refine_components_from_pairs(
     """
 
     # Draw one temporary pair sample and recover total magnitudes at both endpoints
-    pairs = error_proxy.sample_pairs(
+    pairs = error_proxy.pairsample(
         n_pairs=n_pairs,
         sampling=pair_sampling,
         min_distance=min_lag,
@@ -609,7 +610,7 @@ def _refine_components_from_pairs(
     correlated_indexes = [index for index, component in enumerate(components) if component.correlation is not None]
     initial_ranges_list: list[float] = []
     for index in correlated_indexes:
-        correlation = cast(gu.VariogramModel, components[index].correlation)
+        correlation = cast(VariogramModel, components[index].correlation)
         if correlation.effective_range is None:
             raise AssertionError("A fitted component correlation must define an effective range.")
         initial_ranges_list.append(correlation.effective_range)
@@ -796,9 +797,9 @@ def _refine_components_from_pairs(
 
 
 def _representative_variogram(
-    empirical: gu.Variogram,
+    empirical: Variogram,
     components: list[ErrorComponent],
-) -> gu.Variogram:
+) -> Variogram:
     """Attach the representative normalized component model to empirical bins."""
 
     # Normalize reference component variances so the combined model retains unit sill
@@ -806,7 +807,7 @@ def _representative_variogram(
         [cast(ErrorMagnitude, component.magnitude).reference_value ** 2 for component in components]
     )
     fractions = reference_variances / np.sum(reference_variances)
-    structured: list[gu.VariogramModel] = []
+    structured: list[VariogramModel] = []
     nugget = 0.0
 
     # Represent independent variance as a nugget and retain normalized structured contributions
@@ -820,9 +821,7 @@ def _representative_variogram(
 
     # Attach the combined model and its predictions at the original empirical lag centers
     model = (
-        replace(structured[0], nugget=nugget)
-        if len(structured) == 1
-        else gu.VariogramModel.sum(structured, nugget=nugget)
+        replace(structured[0], nugget=nugget) if len(structured) == 1 else VariogramModel.sum(structured, nugget=nugget)
     )
     return replace(empirical, model=model, fitted_semivariance=model.variogram(empirical.lags))
 
@@ -919,10 +918,15 @@ def _estimate_error_structure(
     if independent_count:
         fit_options.setdefault("use_nugget", True)
 
-    # Estimate the standardized variogram on the same selected error population
+    # Limit pair requests to the finite population so GeoUtils does not need to reduce them with a warning
     pair_options = dict(pair_sampling_kwargs or {})
+    finite_count = int(np.count_nonzero(eligible & np.isfinite(total_array) & (total_array > 0)))
+    available_pairs = finite_count * (finite_count - 1) // 2
+    effective_n_pairs = min(n_pairs, available_pairs)
+
+    # Estimate the standardized variogram on the same selected error population
     empirical = standardized_proxy.variogram(
-        n_pairs=n_pairs,
+        n_pairs=effective_n_pairs,
         sampling=pair_sampling,
         estimator=variogram_estimator,
         n_lags=n_lags,
@@ -946,7 +950,7 @@ def _estimate_error_structure(
             predictor_arrays,
             mask=mask,
             estimator=variogram_estimator,
-            n_pairs=n_pairs,
+            n_pairs=effective_n_pairs,
             pair_sampling=pair_sampling,
             n_lags=n_lags,
             min_lag=min_lag,

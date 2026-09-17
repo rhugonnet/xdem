@@ -238,10 +238,11 @@ Use {meth}`~xdem.ErrorStructure.estimate` when an elevation difference on stable
 For two elevation datasets, {func}`~xdem.uncertainty.estimate_error_structure` also prepares their common finite
 support through GeoUtils cosampling and applies the selected error attribution.
 
-Grouped magnitude estimation uses `geoutils.stats.grouped_stats`. Its tables have named predictor index levels and
+Grouped magnitude estimation uses `geoutils.stats.stats`. Its tables have named predictor index levels and
 `(value, statistic)` columns. {func}`~xdem.fit.interp_binning` interpolates these groups, with missing groups filled
 and predictions clamped to the outer group centres. {class}`~xdem.ErrorMagnitude` adds the error-specific scaling,
-variance subtraction and positivity constraints. Correlations are portable `geoutils.VariogramModel` objects.
+variance subtraction and positivity constraints. Correlations are portable
+`geoutils.stats.variography.VariogramModel` objects.
 
 ```python
 # Inspect the fitted components without keeping the sampled pairs

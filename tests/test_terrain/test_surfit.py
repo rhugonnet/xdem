@@ -541,28 +541,28 @@ class TestConvolution:
         # Horn coefficients
         kern3d = np.stack(self.coef_arrs_h, axis=0)
         coefs_h = gu.filters.convolution(
-            dem.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, method="scipy"
+            dem.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, engine="scipy"
         ).squeeze()[:, 2, 2]
         coefs_h_flat = gu.filters.convolution(
-            dem_flat.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, method="scipy"
+            dem_flat.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, engine="scipy"
         ).squeeze()[:, 2, 2]
 
         # Zevenberg and Thorne coefficients
         kern3d = np.stack(self.coef_arrs_zt, axis=0)
         coefs_zt = gu.filters.convolution(
-            dem.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, method="scipy"
+            dem.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, engine="scipy"
         ).squeeze()[:, 2, 2]
         coefs_zt_flat = gu.filters.convolution(
-            dem_flat.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, method="scipy"
+            dem_flat.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, engine="scipy"
         ).squeeze()[:, 2, 2]
 
         # Florinsky coefficients
         kern3d = np.stack(self.coef_arrs_fl, axis=0)
         coefs_fl = gu.filters.convolution(
-            dem.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, method="scipy"
+            dem.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, engine="scipy"
         ).squeeze()[:, 2, 2]
         coefs_fl_flat = gu.filters.convolution(
-            dem_flat.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, method="scipy"
+            dem_flat.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, engine="scipy"
         ).squeeze()[:, 2, 2]
 
         # 1/ Check coefficient for flat DEM are all zero (except last of ZT that is identity)
@@ -611,7 +611,7 @@ class TestConvolution:
 
         # With SciPy
         conv_scipy = gu.filters.convolution(
-            dem.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, method="scipy"
+            dem.reshape((1, dem.shape[0], dem.shape[1])), filters=kern3d, engine="scipy"
         ).squeeze()[:, 3, 3]
 
         # With Numba

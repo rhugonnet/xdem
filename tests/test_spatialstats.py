@@ -6,6 +6,7 @@ import geoutils as gu
 import numpy as np
 import pandas as pd
 import pytest
+from geoutils.stats.variography import VariogramModel
 
 import xdem
 
@@ -84,7 +85,7 @@ class TestSpatialstatsDeprecation:
             value = xdem.spatialstats.number_effective_samples(100, params)
 
         # Compare legacy effective samples with the same model expressed as an ErrorStructure
-        structure = xdem.ErrorStructure([xdem.ErrorComponent("error", 2, gu.VariogramModel("spherical", 20, 1))])
+        structure = xdem.ErrorStructure([xdem.ErrorComponent("error", 2, VariogramModel("spherical", 20, 1))])
         assert value == pytest.approx(xdem.uncertainty.number_effective_samples(100, structure))
         with pytest.warns(DeprecationWarning):
 

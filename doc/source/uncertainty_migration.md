@@ -2,7 +2,7 @@
 # Migrating uncertainty workflows
 
 The entire `xdem.spatialstats` module is deprecated. Its public functions retain their original implementations,
-arguments and return formats and emit a `DeprecationWarning` when called. Importing xDEM does not emit a warning.
+arguments and return formats and emit a `DeprecationWarning` when called. 
 `DEM.estimate_uncertainty()` is also deprecated. No module-wide removal version is assigned yet;
 `spatialstats.nmad()` retains its previously announced removal in version 0.4.
 
@@ -12,26 +12,26 @@ each component's covariance separately.
 
 ## Where functions now live
 
-| Former function or responsibility | Replacement |
-| --- | --- |
-| `spatialstats.nmad` | `geoutils.stats.nmad` |
-| `spatialstats.nd_binning` | `geoutils.stats.grouped_stats` or a spatial object's `.grouped_stats()` |
-| `spatialstats.interp_nd_binning` | `xdem.fit.interp_binning` |
-| `spatialstats.get_perbin_nd_binning` | `xdem.fit.get_perbin_binning` |
-| `spatialstats.two_step_standardization` | `xdem.uncertainty.estimation.two_step_standardization` |
-| Magnitude and correlation inference | `ErrorStructure.estimate` or `estimate_error_structure` |
-| `spatialstats.sample_empirical_variogram` | Raster or point cloud `.variogram()` |
-| `spatialstats.fit_sum_model_variogram` | `geoutils.Variogram.fit` |
-| Variogram, covariance and correlation functions | `geoutils.VariogramModel` methods |
+| Former function or responsibility | Replacement                                                              |
+| --- |--------------------------------------------------------------------------|
+| `spatialstats.nmad` | `geoutils.stats.nmad`                                                    |
+| `spatialstats.nd_binning` | Raster or point cloud `.stats()`                                         |
+| `spatialstats.interp_nd_binning` | `xdem.fit.interp_binning`                                                |
+| `spatialstats.get_perbin_nd_binning` | `xdem.fit.get_perbin_binning`                                            |
+| `spatialstats.two_step_standardization` | `xdem.uncertainty.estimation.two_step_standardization`                   |
+| Magnitude and correlation inference | `ErrorStructure.estimate` or `estimate_error_structure`                  |
+| `spatialstats.sample_empirical_variogram` | Raster or point cloud `.variogram()`                                     |
+| `spatialstats.fit_sum_model_variogram` | `geoutils.Variogram.fit`                                                 |
+| Variogram, covariance and correlation functions | `geoutils.stats.variography.VariogramModel` methods                      |
 | Effective sample size and area uncertainty | `xdem.uncertainty.number_effective_samples`, `spatial_error_propagation` |
-| Exact and approximate covariance sums, circular formulas | `xdem.uncertainty.analytical` |
-| Random fields, Monte Carlo and patches | `xdem.uncertainty.numerical` |
-| `spatialstats.patches_method` | `xdem.uncertainty.patches_method` |
-| `spatialstats.convolution`, `mean_filter_nan` | `geoutils.filters.convolution`, `mean_filter_nan` |
-| Binning and variogram plots | `geoutils.stats.plot_grouped_stats`, `geoutils.Variogram.plot` |
+| Exact and approximate covariance sums, circular formulas | `xdem.uncertainty.analytical`                                            |
+| Random fields, Monte Carlo and patches | `xdem.uncertainty.numerical`                                             |
+| `spatialstats.patches_method` | `xdem.uncertainty.patches_method`                                        |
+| `spatialstats.convolution`, `mean_filter_nan` | `geoutils.filters.convolution`, `mean_filter`                            |
+| Binning and variogram plots | `geoutils.stats.plot_grouped_stats`, `geoutils.Variogram.plot`           |
 
 `xdem.cosampling` and the private uncertainty variography and metric-space implementations existed only on the
-development branch. They have been removed. Use GeoUtils `.cosample()` and `.sample_pairs()` directly. A cosampling
+development branch. They have been removed. Use GeoUtils `.cosample()` and `.pairsample()` directly. A cosampling
 result is a raster or point cloud on the support selected by `at`; accessor calls return Xarray or GeoPandas.
 Raster bands or point columns contain `"self"`, `"other"`, then auxiliaries in mapping order. Use `.split_bands()`,
 `.data` or `.ds` for the usual spatial and array workflows.
@@ -70,9 +70,9 @@ GeoUtils returns named predictor index levels and `(value, statistic)` columns. 
 grouping; obtain marginal groupings with separate calls. `observed=False` retains the full grid needed for interpolation.
 
 ```python
-table = gu.stats.grouped_stats(
-    {"error": differences}, {"slope": slope, "curvature": curvature},
-    bins={"slope": 10, "curvature": 10}, statistics=[gu.stats.nmad], observed=False,
+table = gu.stats.stats(
+    {"error": differences}, [gu.stats.nmad], by={"slope": slope, "curvature": curvature},
+    bins={"slope": 10, "curvature": 10}, observed=False,
 )
 interpolator = xdem.fit.interp_binning(table, value_name="error", statistic="nmad", min_count=100)
 prediction = interpolator({"slope": slope, "curvature": curvature})

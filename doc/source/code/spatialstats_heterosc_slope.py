@@ -18,6 +18,6 @@ dh.load()
 dh.set_mask(mask)
 
 # Estimate the measurement error by bin of slope, using the NMAD as robust estimator
-df_ns = dh.grouped_stats({"slope": slope}, bins={"slope": 30}, statistics=[gu.stats.nmad], observed=False)
+df_ns = dh.stats([gu.stats.nmad], by={"slope": slope}, bins={"slope": 30}, observed=False)
 axes = gu.stats.plot_grouped_stats(df_ns, statistic="nmad")
 axes["statistic"].set(xlabel="Slope (degrees)", ylabel="Random elevation error (1 sigma, m)")

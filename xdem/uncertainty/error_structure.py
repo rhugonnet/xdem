@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 import geoutils as gu
 import numpy as np
 import pandas as pd
+from geoutils.stats.variography import Variogram, VariogramModel
 from numpy.typing import ArrayLike, NDArray
 from scipy.spatial.distance import cdist
 
@@ -57,7 +58,7 @@ __all__ = ["ErrorComponent", "ErrorMagnitude", "ErrorStructure"]
 class ErrorMagnitude:
     """Constant or predictor dependent magnitude of one error component.
 
-    A grouped model interpolates a statistic estimated by :func:`geoutils.stats.grouped_stats`. ``scale`` retains the
+    A grouped model interpolates a statistic estimated by :func:`geoutils.stats.stats`. ``scale`` retains the
     correction obtained by standardizing the complete error proxy. ``variance_offset`` removes variance assigned to
     fixed components while keeping the original grouped observations available for diagnostics.
 
@@ -178,7 +179,7 @@ class ErrorMagnitude:
     ) -> ErrorMagnitude:
         """Create a predictor dependent magnitude from grouped statistics.
 
-        :param statistics: Complete table returned by :func:`geoutils.stats.grouped_stats`.
+        :param statistics: Complete table returned by :func:`geoutils.stats.stats`.
         :param predictor_names: Ordered predictor names, defaulting to the table index names.
         :param value_name: Value level selected from the grouped statistics columns.
         :param statistic: Spread statistic selected from the grouped statistics columns.
@@ -257,7 +258,7 @@ class ErrorMagnitude:
 ############################
 
 
-def _normalize_correlation_model(model: gu.VariogramModel) -> gu.VariogramModel:
+def _normalize_correlation_model(model: VariogramModel) -> VariogramModel:
     """Remove amplitude from a variogram model while retaining its correlation shape."""
 
     # Reject nuggets because an independent component represents them without a spatial model
@@ -292,7 +293,7 @@ class ErrorComponent:
 
     name: str
     magnitude: ErrorMagnitude | float
-    correlation: gu.VariogramModel | gu.Variogram | None = None
+    correlation: VariogramModel | Variogram | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict, compare=False)
 
     def __post_init__(self) -> None:
@@ -308,14 +309,14 @@ class ErrorComponent:
 
         # Extract portable model metadata and normalize its sill to one
         correlation = self.correlation
-        if isinstance(correlation, gu.Variogram):
+        if isinstance(correlation, Variogram):
             if correlation.model is None:
                 raise ValueError("An error component requires a fitted variogram model.")
             correlation = correlation.model
 
         # Validate the extracted correlation model before removing its amplitude
         if correlation is not None:
-            if not isinstance(correlation, gu.VariogramModel):
+            if not isinstance(correlation, VariogramModel):
                 raise TypeError("Error component correlation must be a GeoUtils VariogramModel or Variogram.")
             correlation = _normalize_correlation_model(correlation)
 
@@ -375,7 +376,7 @@ class ErrorStructure(Mapping[str, ErrorComponent]):
         self,
         components: Mapping[str, ErrorComponent] | Sequence[ErrorComponent],
         *,
-        empirical_variogram: gu.Variogram | None = None,
+        empirical_variogram: Variogram | None = None,
         fit_diagnostics: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
@@ -480,7 +481,7 @@ class ErrorStructure(Mapping[str, ErrorComponent]):
         :param fit_method: Fitting backend, currently ``"variogram"``.
         :param refine: Whether to refine component contributions using conditional pair semivariances.
         :param fit_kwargs: Options passed to :meth:`geoutils.Variogram.fit`.
-        :param pair_sampling_kwargs: Advanced options passed to ``sample_pairs`` and ``variogram``.
+        :param pair_sampling_kwargs: Advanced options passed to ``pairsample`` and ``variogram``.
         :param random_state: Random generator or seed used throughout estimation.
         :returns: Fitted error structure with compact diagnostics.
         """
@@ -573,9 +574,10 @@ class ErrorStructure(Mapping[str, ErrorComponent]):
         # Preserve the target raster mask even when a constant magnitude fills its complete shape
         result_array = np.asarray(result)
         if hasattr(like, "ij2xy"):
+            _, invalid = like.get_nanarray(return_mask=True)
             result_array = np.ma.masked_array(
                 result_array,
-                mask=np.asarray(like.get_mask()).squeeze() | ~np.isfinite(result_array),
+                mask=np.asarray(invalid).squeeze() | ~np.isfinite(result_array),
             )
         return like.copy(new_array=result_array)
 

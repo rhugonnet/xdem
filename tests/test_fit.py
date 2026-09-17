@@ -350,11 +350,11 @@ class TestBinningFits:
         values = np.asarray(-2 + sum(predictors.values()))
 
         # Retain every bin and its membership mask for an independent lookup comparison
-        table, masks = gu.stats.grouped_stats(
+        table, masks = gu.stats.stats(
             {"bias": values},
-            predictors,
+            [np.nanmedian],
+            by=predictors,
             bins={name: [0, 1, 2] for name in predictors},
-            statistics=[np.nanmedian],
             observed=False,
             return_masks=True,
         )

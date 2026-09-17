@@ -190,7 +190,7 @@ class TestCoregPipeline:
     def test_pipeline_pts(self) -> None:
 
         pipeline = coreg.NuthKaab() + coreg.DhMinimize()
-        ref_points = self.ref.to_pointcloud(subsample=5000, random_state=42)
+        ref_points = self.ref.to_pointcloud(subsample=1, random_state=42)
 
         # Check that this runs without error
         pipeline.fit(reference_elev=ref_points, to_be_aligned_elev=self.tba)
@@ -291,13 +291,13 @@ class TestCoregPipeline:
         # Same for a pipeline
         pipe = coreg.VerticalShift(subsample=200) + coreg.Deramp()
         with pytest.warns(
-                UserWarning,
-                match=re.escape(
-                    "Subsample argument passed to fit() will override non-default "
-                    "subsample values defined for individual steps of the pipeline. "
-                    "To silence this warning: only define 'subsample' in either "
-                    "fit(subsample=...) or instantiation e.g., VerticalShift(subsample=...)."
-                ),
+            UserWarning,
+            match=re.escape(
+                "Subsample argument passed to fit() will override non-default "
+                "subsample values defined for individual steps of the pipeline. "
+                "To silence this warning: only define 'subsample' in either "
+                "fit(subsample=...) or instantiation e.g., VerticalShift(subsample=...)."
+            ),
         ):
             pipe.fit(**self.fit_params, subsample=1000)
 

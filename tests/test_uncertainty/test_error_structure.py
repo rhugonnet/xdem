@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from importlib.util import find_spec
 
-import geoutils as gu
 import numpy as np
 import pandas as pd
 import pytest
+from geoutils.stats.variography import VariogramModel
 
 import xdem
 
@@ -20,8 +20,8 @@ class TestErrorStructure:
         """Checks that component variances add correctly and their correlation models retain unit variance."""
 
         # Combine two correlated components and one independent component with known magnitudes
-        short = xdem.ErrorComponent("short", 2, gu.VariogramModel("gaussian", 10, 3))
-        long = xdem.ErrorComponent("long", 1, gu.VariogramModel("spherical", 100, 2))
+        short = xdem.ErrorComponent("short", 2, VariogramModel("gaussian", 10, 3))
+        long = xdem.ErrorComponent("long", 1, VariogramModel("spherical", 100, 2))
         independent = xdem.ErrorComponent("independent", 0.5)
         structure = xdem.ErrorStructure([short, long, independent])
 

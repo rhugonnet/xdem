@@ -35,7 +35,7 @@ import geoutils as gu
 import numpy as np
 import pandas as pd
 from geoutils import PointCloud, Raster
-from geoutils.filters import _create_circular_mask, mean_filter_nan
+from geoutils.filters import _create_circular_mask, mean_filter
 from geoutils.raster import RasterType
 from geoutils.vector.vector import Vector, VectorType
 from numpy.typing import NDArray
@@ -677,8 +677,13 @@ def _patches_convolution(
         raise ValueError('Kernel shape should be "square" or "circular".')
 
     logging.info("Computing the convolution on the entire array...")
-    mean_img, nb_valid_img, nb_pixel_per_kernel = mean_filter_nan(
-        img=values, kernel_size=kernel_size, kernel_shape=patch_shape, method=method
+    mean_img, nb_valid_img, nb_pixel_per_kernel = mean_filter(
+        array=values,
+        size=kernel_size,
+        kernel_shape=patch_shape,
+        engine=method,
+        preserve_nodata=False,
+        return_counts=True,
     )
 
     # Exclude mean values if number of valid pixels is less than a percentage of the kernel size

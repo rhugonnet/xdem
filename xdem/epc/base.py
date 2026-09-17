@@ -30,10 +30,17 @@ import numpy as np
 from geoutils import PointCloud
 from geoutils.multiproc import MultiprocConfig
 from geoutils.pointcloud.base import PointCloudBase
+from geoutils.vector.transformation import _get_reproject_crs
+from pyproj import CRS
 from pyproj.crs import VerticalCRS
 
 from xdem.coreg import Coreg
-from xdem.vcrs import _to_vcrs_1d, _VerticalReference
+from xdem.vcrs import (
+    _combine_crs_and_vcrs,
+    _to_vcrs_1d,
+    _vcrs_from_crs,
+    _VerticalReference,
+)
 
 
 class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
@@ -53,6 +60,33 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
 
             return EPC(output)
         return output
+
+    def reproject(
+        self,
+        ref: Any = None,
+        crs: CRS | str | int | None = None,
+        inplace: bool = False,
+        *,
+        mp_config: MultiprocConfig | None = None,
+    ) -> Any:
+        """
+        Reproject point coordinates and keep the source vertical reference when the target CRS is 2D.
+
+        :param ref: Raster or vector whose CRS should be matched; mutually exclusive with ``crs``.
+        :param crs: Target coordinate reference system; mutually exclusive with ``ref``.
+        :param inplace: Update this object for eager execution.
+        :param mp_config: Optional configuration for reprojecting point partitions in workers.
+        :returns: Reprojected EPC or GeoDataFrame matching the input interface, or None when updating in place.
+        """
+
+        # Resolve references before rebuilding a two-dimensional target with the source vertical component
+        target_crs = _get_reproject_crs(ref=ref, crs=crs)
+        source_vcrs = self.vcrs
+        if source_vcrs is not None and _vcrs_from_crs(target_crs) is None:
+            target_crs = _combine_crs_and_vcrs(target_crs, source_vcrs)
+
+        # Reproject through GeoUtils with the complete target CRS so every output interface receives the same metadata
+        return super().reproject(crs=target_crs, inplace=inplace, mp_config=mp_config)
 
     def to_vcrs(
         self,
