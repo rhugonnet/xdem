@@ -18,7 +18,7 @@ from xdem.uncertainty import analytical
 
 
 class TestEffectiveSampleSize:
-    """Exact and approximate integration of spatial correlation models."""
+    """Test module for exact and approximate integration of spatial correlation models."""
 
     @pytest.mark.parametrize("range1", [10**i for i in range(3)])
     @pytest.mark.parametrize("psill1", [0.1, 1, 10])
@@ -130,7 +130,7 @@ class TestEffectiveSampleSize:
 
 
 class TestSpatialErrorPropagation:
-    """Propagation of component covariances over masks and vector areas."""
+    """Test module for propagating component covariances over masks and vector areas."""
 
     def test_point_weights_with_duplicate_labels(self) -> None:
         """Checks that selected point weights stay aligned when user index labels are duplicated or unordered."""
@@ -212,10 +212,6 @@ class TestSpatialErrorPropagation:
             subsample=None,
         ) == pytest.approx((mean_sigma / expected) ** 2)
 
-        # A numeric area alone cannot locate a spatially variable magnitude predictor
-        with pytest.raises(ValueError, match="constant magnitudes"):
-            xdem.uncertainty.number_effective_samples(100, structure)
-
     def test_independent_area_and_point_support(self) -> None:
         """Checks that independent area errors decrease with the square root of the raster or point count."""
 
@@ -229,10 +225,6 @@ class TestSpatialErrorPropagation:
             assert xdem.uncertainty.spatial_error_propagation([None], structure, support=support) == pytest.approx(
                 [2 / np.sqrt(12)]
             )
-
-        # A numeric area without observation locations cannot define an independent sample count
-        with pytest.raises(ValueError, match="explicit observation support"):
-            xdem.uncertainty.number_effective_samples(100, structure)
 
     def test_vector_area_matches_mask_and_rasterization(self) -> None:
         """Checks that vector areas select the same observations as explicit masks for area propagation."""
@@ -265,6 +257,39 @@ class TestSpatialErrorPropagation:
         # Check that rasterization reproduces the uncertainty on the explicit grid
         assert rasterized == pytest.approx([expected])
 
-        # A plain mask must have a spatial dataset to provide its observation coordinates
+
+class TestSpatialErrorPropagationErrors:
+    """Test module for invalid areas without the observation support required for propagation."""
+
+    @pytest.mark.skipif(find_spec("skgstat") is None, reason="Requires scikit-gstat")
+    def test_number_effective_samples__error_variable_magnitude_without_support(self) -> None:
+        """Checks that a numeric area cannot locate observations for a spatially variable magnitude."""
+
+        # Define a magnitude that varies with a predictor unavailable from a numeric area
+        index = pd.Index([0.0, 1.0], name="quality")
+        columns = pd.MultiIndex.from_tuples([("error", "nmad"), ("error", "count")])
+        table = pd.DataFrame([[0.5, 100], [2, 100]], index=index, columns=columns)
+        structure = xdem.ErrorStructure(
+            [xdem.ErrorComponent("variable", xdem.ErrorMagnitude.grouped(table), VariogramModel("gaussian", 30, 1))]
+        )
+
+        # Reject propagation because the numeric area supplies no predictor locations
+        with pytest.raises(ValueError, match="constant magnitudes"):
+            xdem.uncertainty.number_effective_samples(100, structure)
+
+    def test_number_effective_samples__error_independent_component_without_support(self) -> None:
+        """Checks that an independent component needs explicit observations rather than only a numeric area."""
+
+        structure = xdem.ErrorStructure([xdem.ErrorComponent("measurement", 2)])
+
+        with pytest.raises(ValueError, match="explicit observation support"):
+            xdem.uncertainty.number_effective_samples(100, structure)
+
+    def test_number_effective_samples__error_mask_without_support(self) -> None:
+        """Checks that a plain mask needs spatial support to define its observation coordinates."""
+
+        mask = np.ones((6, 8), dtype=bool)
+        structure = xdem.ErrorStructure([xdem.ErrorComponent("measurement", 2)])
+
         with pytest.raises(ValueError, match="support"):
             xdem.uncertainty.number_effective_samples(mask, structure)

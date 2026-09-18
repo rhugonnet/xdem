@@ -13,7 +13,7 @@ import xdem
 
 
 class TestErrorStructure:
-    """Combination of component magnitudes and spatial correlations."""
+    """Test module for combining component magnitudes and spatial correlations."""
 
     @pytest.mark.skipif(find_spec("skgstat") is None, reason="Requires scikit-gstat")
     def test_error_components_separate_magnitude_and_correlation(self) -> None:

@@ -48,6 +48,9 @@ from xdem.vcrs import (
     _VerticalReference,
 )
 
+if TYPE_CHECKING:
+    from xdem.epc.base import EPCLike
+
 # Input/output is a RasterType (= Raster or RasterAccessor subclass)
 DEMType = TypeVar("DEMType", bound="DEMBase")
 # For inputs, we also accept a xr.DataArray
@@ -314,7 +317,7 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
     @profiler.profile("xdem.dem.coregister_3d", memprof=True)
     def coregister_3d(  # type: ignore
         self,
-        reference_elev: DEMLike | gpd.GeoDataFrame | xdem.EPC,
+        reference_elev: DEMLike | EPCLike,
         coreg_method: coreg.Coreg,
         inlier_mask: Raster | NDArrayb = None,
         bias_vars: dict[str, NDArrayf | MArrayf | RasterType] = None,
@@ -362,7 +365,7 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
 
     def estimate_error_structure(
         self,
-        other_elev: DEMLike | gpd.GeoDataFrame | xdem.EPC,
+        other_elev: DEMLike | EPCLike,
         *,
         stable_terrain: Raster | gu.Vector | NDArrayb | gpd.GeoDataFrame | None = None,
         predictors: Mapping[str, Any] | tuple[Any, ...] | None = None,

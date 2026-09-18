@@ -1,4 +1,4 @@
-"""Functions to test the coregistration base classes."""
+"""Tests for sequential coregistration pipelines."""
 
 from __future__ import annotations
 
@@ -46,7 +46,8 @@ def assert_coreg_meta_equal(input1: Any, input2: Any) -> bool:
         raise TypeError(f"Input type {type(input1)} not supported for this test function.")
 
 
-class TestCoregPipeline:
+class _CoregPipelineInputs:
+    """Provide shared example elevations, masks and points for pipeline tests."""
 
     ref, tba, outlines = load_examples()  # Load example reference, to-be-aligned and mask.
     inlier_mask = ~outlines.create_mask(ref)
@@ -62,8 +63,13 @@ class TestCoregPipeline:
         geometry=gpd.points_from_xy(x=points_arr[:, 0], y=points_arr[:, 1], crs=ref.crs), data={"z": points_arr[:, 2]}
     )
 
+
+class TestCoregPipeline(_CoregPipelineInputs):
+    """Test module for construction, fitting, application and composition of eager pipelines."""
+
     @pytest.mark.parametrize("coreg_class", [coreg.VerticalShift, coreg.ICP, coreg.NuthKaab])  # type: ignore
     def test_copy(self, coreg_class: Callable[[], Coreg]) -> None:
+        """Checks that copying a pipeline keeps subsequent metadata changes independent."""
 
         # Create a pipeline, add some .metadata, and copy it
         pipeline = coreg_class() + coreg_class()
@@ -78,6 +84,7 @@ class TestCoregPipeline:
         assert pipeline_copy.pipeline[0]._meta["outputs"]["affine"]["shift_z"]
 
     def test_pipeline(self) -> None:
+        """Checks that a fitted pipeline preserves the grid shape and combines affine shifts."""
 
         # Create a pipeline from two coreg methods.
         pipeline = coreg.CoregPipeline([coreg.VerticalShift(), coreg.NuthKaab()])
@@ -110,7 +117,7 @@ class TestCoregPipeline:
     @pytest.mark.parametrize("coreg1", all_coregs)  # type: ignore
     @pytest.mark.parametrize("coreg2", all_coregs)  # type: ignore
     def test_pipeline_combinations__nobiasvar(self, coreg1: Callable[[], Coreg], coreg2: Callable[[], Coreg]) -> None:
-        """Test pipelines with all combinations of coregistration subclasses (without bias variables)"""
+        """Checks that combinations without bias variables fit and preserve the raster shape."""
 
         # Create a pipeline from one affine and one biascorr methods.
         pipeline = coreg.CoregPipeline([coreg1(), coreg2()])
@@ -130,7 +137,7 @@ class TestCoregPipeline:
     def test_pipeline_combinations__biasvar(
         self, coreg1: Callable[[], Coreg], coreg2_init_kwargs: dict[str, str]
     ) -> None:
-        """Test pipelines with all combinations of coregistration subclasses with bias variables"""
+        """Checks that combinations using explicit bias variables fit and preserve the raster shape."""
 
         # Create a pipeline from one affine and one biascorr methods
         pipeline = coreg.CoregPipeline([coreg1(), coreg.BiasCorr(**coreg2_init_kwargs)])  # type: ignore
@@ -142,52 +149,8 @@ class TestCoregPipeline:
         )
         assert aligned_dem.shape == self.ref.data.squeeze().shape
 
-    def test_pipeline__errors(self) -> None:
-        """Test pipeline raises proper errors."""
-
-        pipeline = coreg.CoregPipeline([coreg.NuthKaab(), coreg.BiasCorr()])
-        with pytest.raises(
-            ValueError,
-            match=re.escape(
-                "No `bias_vars` passed to .fit() for bias correction step "
-                "<class 'xdem.coreg.biascorr.BiasCorr'> of the pipeline."
-            ),
-        ):
-            pipeline.fit(**self.fit_params)
-
-        pipeline2 = coreg.CoregPipeline([coreg.NuthKaab(), coreg.BiasCorr(), coreg.BiasCorr()])
-        with pytest.raises(
-            ValueError,
-            match=re.escape(
-                "No `bias_vars` passed to .fit() for bias correction step <class 'xdem.coreg.biascorr.BiasCorr'> "
-                "of the pipeline. As you are using several bias correction steps requiring"
-                " `bias_vars`, don't forget to explicitly define their `bias_var_names` "
-                "during instantiation, e.g. BiasCorr(bias_var_names=['slope'])."
-            ),
-        ):
-            pipeline2.fit(**self.fit_params)
-
-        with pytest.raises(
-            ValueError,
-            match=re.escape(
-                "When using several bias correction steps requiring `bias_vars` in a pipeline,"
-                "the `bias_var_names` need to be explicitly defined at each step's "
-                "instantiation, e.g. BiasCorr(bias_var_names=['slope'])."
-            ),
-        ):
-            pipeline2.fit(**self.fit_params, bias_vars={"slope": xdem.terrain.slope(self.ref)})
-
-        pipeline3 = coreg.CoregPipeline([coreg.NuthKaab(), coreg.BiasCorr(bias_var_names=["slope"])])
-        with pytest.raises(
-            ValueError,
-            match=re.escape(
-                "Not all keys of `bias_vars` in .fit() match the `bias_var_names` defined during "
-                "instantiation of the bias correction step <class 'xdem.coreg.biascorr.BiasCorr'>: ['slope']."
-            ),
-        ):
-            pipeline3.fit(**self.fit_params, bias_vars={"ncc": xdem.terrain.slope(self.ref)})
-
     def test_pipeline_pts(self) -> None:
+        """Checks that a pipeline fits a point reference and passes its aligned raster between steps."""
 
         pipeline = coreg.NuthKaab() + coreg.DhMinimize()
         ref_points = self.ref.to_pointcloud(subsample=3000, random_state=42)
@@ -204,6 +167,7 @@ class TestCoregPipeline:
         )
 
     def test_coreg_add(self) -> None:
+        """Checks that adding coregistration steps and pipelines combines their transformations in order."""
 
         # Test with a vertical shift of 4
         vshift = 4
@@ -219,10 +183,6 @@ class TestCoregPipeline:
         vshift3 = vshift1 + vshift2
         assert vshift3.to_matrix()[2, 3] == vshift * 2
 
-        # Make sure the correct exception is raised on incorrect additions
-        with pytest.raises(ValueError, match="Incompatible add type"):
-            vshift1 + 1  # type: ignore
-
         # Try to add a Coreg step to an already existing CoregPipeline
         vshift4 = vshift3 + vshift1
         assert vshift4.to_matrix()[2, 3] == vshift * 3
@@ -232,7 +192,7 @@ class TestCoregPipeline:
         assert vshift5.to_matrix()[2, 3] == vshift * 4
 
     def test_pipeline_consistency(self) -> None:
-        """Check that pipelines properties are respected: reflectivity, fusion of same coreg"""
+        """Checks that repeated steps converge and equivalent step orders give similar transformations."""
 
         # Test 1: Fusion of same coreg
         # Many vertical shifts
@@ -271,7 +231,7 @@ class TestCoregPipeline:
         assert np.allclose(nk_vshift_tr[3:], vshift_nk_tr[3:], atol=10e-6)
 
     def test_subsample_pipeline(self) -> None:
-        """Test that the subsample argument works as intended for pipelines"""
+        """Checks that pipeline and step subsample values are stored and propagated during fitting."""
 
         # Check definition during instantiation
         pipe = coreg.VerticalShift(subsample=200) + coreg.Deramp(subsample=5000)
@@ -286,24 +246,8 @@ class TestCoregPipeline:
         assert pipe.pipeline[0].meta["inputs"]["random"]["subsample"] == 1000
         assert pipe.pipeline[1].meta["inputs"]["random"]["subsample"] == 1000
 
-    def test_subsample_pipeline__exceptions(self) -> None:
-        """Test that the subsample exceptions work as intended for pipelines"""
-
-        # Same for a pipeline
-        pipe = coreg.VerticalShift(subsample=200) + coreg.Deramp()
-        with pytest.warns(
-            UserWarning,
-            match=re.escape(
-                "Subsample argument passed to fit() will override non-default "
-                "subsample values defined for individual steps of the pipeline. "
-                "To silence this warning: only define 'subsample' in either "
-                "fit(subsample=...) or instantiation e.g., VerticalShift(subsample=...)."
-            ),
-        ):
-            pipe.fit(**self.fit_params, subsample=1000)
-
     def test_fit_and_apply__pipeline(self) -> None:
-        """Check if it works for a pipeline"""
+        """Checks that fit_and_apply() matches separate fit() and apply() calls for a pipeline."""
 
         # Initiate two similar coregs
         coreg_fit_then_apply = coreg.NuthKaab() + coreg.Deramp()
@@ -331,3 +275,76 @@ class TestCoregPipeline:
             )
             for k in coreg_fit_and_apply.pipeline[1].meta.keys()
         )
+
+
+class TestCoregPipelineErrors(_CoregPipelineInputs):
+    """Test module for invalid bias variables, additions and conflicting pipeline sampling options."""
+
+    def test_fit__error_invalid_bias_variables(self) -> None:
+        """Checks that each bias correction step requires the bias variables declared for that step."""
+
+        # Reject an omitted bias variable for a single correction step
+        pipeline = coreg.CoregPipeline([coreg.NuthKaab(), coreg.BiasCorr()])
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "No `bias_vars` passed to .fit() for bias correction step "
+                "<class 'xdem.coreg.biascorr.BiasCorr'> of the pipeline."
+            ),
+        ):
+            pipeline.fit(**self.fit_params)
+
+        # Require explicit variable names when several correction steps need bias variables
+        pipeline2 = coreg.CoregPipeline([coreg.NuthKaab(), coreg.BiasCorr(), coreg.BiasCorr()])
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "No `bias_vars` passed to .fit() for bias correction step <class 'xdem.coreg.biascorr.BiasCorr'> "
+                "of the pipeline. As you are using several bias correction steps requiring"
+                " `bias_vars`, don't forget to explicitly define their `bias_var_names` "
+                "during instantiation, e.g. BiasCorr(bias_var_names=['slope'])."
+            ),
+        ):
+            pipeline2.fit(**self.fit_params)
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "When using several bias correction steps requiring `bias_vars` in a pipeline,"
+                "the `bias_var_names` need to be explicitly defined at each step's "
+                "instantiation, e.g. BiasCorr(bias_var_names=['slope'])."
+            ),
+        ):
+            pipeline2.fit(**self.fit_params, bias_vars={"slope": xdem.terrain.slope(self.ref)})
+
+        # Reject variables whose names do not match the step declaration
+        pipeline3 = coreg.CoregPipeline([coreg.NuthKaab(), coreg.BiasCorr(bias_var_names=["slope"])])
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "Not all keys of `bias_vars` in .fit() match the `bias_var_names` defined during "
+                "instantiation of the bias correction step <class 'xdem.coreg.biascorr.BiasCorr'>: ['slope']."
+            ),
+        ):
+            pipeline3.fit(**self.fit_params, bias_vars={"ncc": xdem.terrain.slope(self.ref)})
+
+    def test_add__error_invalid_type(self) -> None:
+        """Checks that adding an object other than a coregistration step or pipeline raises an error."""
+
+        with pytest.raises(ValueError, match="Incompatible add type"):
+            coreg.VerticalShift() + 1  # type: ignore
+
+    def test_fit__warning_subsample_override(self) -> None:
+        """Checks that a fit subsample warns when it overrides a non-default step subsample."""
+
+        pipe = coreg.VerticalShift(subsample=200) + coreg.Deramp()
+        with pytest.warns(
+            UserWarning,
+            match=re.escape(
+                "Subsample argument passed to fit() will override non-default "
+                "subsample values defined for individual steps of the pipeline. "
+                "To silence this warning: only define 'subsample' in either "
+                "fit(subsample=...) or instantiation e.g., VerticalShift(subsample=...)."
+            ),
+        ):
+            pipe.fit(**self.fit_params, subsample=1000)

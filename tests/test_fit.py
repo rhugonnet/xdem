@@ -199,7 +199,7 @@ class TestRobustFitting:
 
 
 class TestBinningFits:
-    """Interpolation and lookup of statistics grouped by explanatory variables."""
+    """Test module for interpolation and lookup of statistics grouped by explanatory variables."""
 
     def test_interp_binning_artificial_data(self) -> None:
         """Checks that interpolation preserves bin values and extrapolates consistently on synthetic grids."""
@@ -371,10 +371,8 @@ class TestBinningFits:
             point = {name: interval.mid for name, interval in zip(predictors, intervals)}
             assert interpolator(point) == pytest.approx(row[("bias", "nanmedian")])
 
-        # Check that predictions retain the input shape and require all named predictors
+        # Check that predictions retain the input shape
         assert interpolator(predictors).shape == values.shape
-        with pytest.raises(ValueError, match="Missing predictors"):
-            interpolator({})
 
     def test_interpolation_masks_counts_and_signed_values(self) -> None:
         """Checks that interpolation fills unreliable bins, retains signed values and preserves predictor masks."""
@@ -396,7 +394,31 @@ class TestBinningFits:
         # The center of the missing bin lies halfway between -4 and 2, giving -1
         assert fit({"quality": 1.5}) == pytest.approx(-1)
 
-        # Reject a count threshold that removes every available bin
+
+class TestBinningFitsErrors:
+    """Test module for missing predictors and unusable grouped statistics during interpolation."""
+
+    def test_interp_binning__error_missing_predictor(self) -> None:
+        """Checks that evaluating a grouped interpolator requires every predictor used to fit it."""
+
+        # Create a complete one-dimensional table with one statistic in each interval
+        index = pd.IntervalIndex.from_breaks([0, 1, 2], name="quality", closed="left")
+        columns = pd.MultiIndex.from_tuples([("bias", "nanmedian"), ("bias", "count")])
+        table = pd.DataFrame([[-2, 20], [2, 20]], index=index, columns=columns)
+        interpolator = xdem.fit.interp_binning(table, value_name="bias")
+
+        # Reject evaluation without the named quality predictor
+        with pytest.raises(ValueError, match="Missing predictors"):
+            interpolator({})
+
+    def test_interp_binning__error_no_reliable_groups(self) -> None:
+        """Checks that interpolation fails when the minimum count removes every finite group."""
+
+        # Give every group fewer observations than the requested minimum count
+        index = pd.IntervalIndex.from_breaks([0, 1, 2, 3], name="quality", closed="left")
+        columns = pd.MultiIndex.from_tuples([("bias", "nanmedian"), ("bias", "count")])
+        table = pd.DataFrame([[-4, 50], [99, 1], [2, 50]], index=index, columns=columns)
+
         with pytest.raises(ValueError, match="No finite"):
             xdem.fit.interp_binning(table, value_name="bias", min_count=100)
 

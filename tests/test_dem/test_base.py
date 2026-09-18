@@ -691,12 +691,11 @@ class TestClassVsAccessorConsistencyDEMBase:
 
 class TestDEMEagerAnalysis:
     """
-    Test coregistration and uncertainty through DEM and its Xarray accessor.
+    Test module for eager coregistration and uncertainty through DEM and its Xarray accessor.
 
     This class tests:
     - ``coregister_3d`` with raster and point references, masks and bias variables,
-    - ``estimate_uncertainty`` with raster and point references, masks and all approaches,
-    - Clear rejection of lazy analysis inputs without computing or replacing them.
+    - ``estimate_uncertainty`` with raster and point references, masks and all approaches.
     """
 
     def test_coregister_3d__bias_variables_and_mask(self, accessor_dem_path: Path) -> None:
@@ -868,9 +867,13 @@ class TestDEMEagerAnalysis:
         np.testing.assert_array_equal(expected_corr(distances), actual_corr(distances))
         np.testing.assert_array_equal(native.data, frame.height)
 
+
+class TestDEMAnalysisErrors:
+    """Test module for rejecting unsupported lazy DEM analysis without executing Dask graphs."""
+
     @pytest.mark.parametrize("operation", ["coregister_3d", "estimate_uncertainty"])
     @pytest.mark.parametrize("lazy_argument", ["reference", "mask", "variable"])
-    def test_methods__lazy_analysis_arguments_rejected(
+    def test_methods__error_lazy_analysis_arguments(
         self, accessor_dem_path: Path, operation: str, lazy_argument: str
     ) -> None:
         """Checks that lazy references, masks and bias variables are rejected without executing their graphs."""
@@ -905,7 +908,7 @@ class TestDEMEagerAnalysis:
         assert lazy.data is graph and not lazy._in_memory
 
     @pytest.mark.parametrize("operation", ["coregister_3d", "estimate_uncertainty"])
-    def test_methods__dask_analysis_is_explicitly_unsupported(self, accessor_dem_path: Path, operation: str) -> None:
+    def test_methods__error_dask_analysis_unsupported(self, accessor_dem_path: Path, operation: str) -> None:
         """Checks that deferred analysis features reject Dask inputs without computing or replacing them."""
 
         pytest.importorskip("dask.array")

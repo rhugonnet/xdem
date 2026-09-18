@@ -49,15 +49,16 @@ from xdem.coreg.base import (
 
 
 class CoregPipeline(Coreg):
-    """
-    A sequential set of co-registration processing steps.
-    """
+    """Apply coregistration steps in sequence, passing each aligned result to the next step."""
+
+    ###############################
+    # Construction and inspection
+    ###############################
 
     def __init__(self, pipeline: list[Coreg]) -> None:
-        """
-        Instantiate a new processing pipeline.
+        """Instantiate a processing pipeline and flatten any nested pipelines.
 
-        :param: Processing steps to run in the sequence they are given.
+        :param pipeline: Processing steps to run in the sequence they are given.
         """
 
         def put_coreg_in_series(pipeline: list[Coreg]) -> list[Coreg]:
@@ -87,6 +88,8 @@ class CoregPipeline(Coreg):
         super().__init__()
 
     def __repr__(self) -> str:
+        """Return the ordered coregistration steps in the pipeline."""
+
         return f"Pipeline: {self.pipeline}"
 
     @overload
@@ -178,6 +181,7 @@ class CoregPipeline(Coreg):
         random_state: int | np.random.Generator | None = None,
         **kwargs: Any,
     ) -> CoregType:
+        """Fit each step and pass intermediate aligned elevations to the following step."""
 
         # Check if subsample arguments are different from their default value for any of the coreg steps:
         # get default value in argument spec and "subsample" stored in meta, and compare both are consistent
@@ -295,6 +299,7 @@ class CoregPipeline(Coreg):
         | tuple[NDArrayf, rio.transform.Affine]
         | tuple[MArrayf, rio.transform.Affine]
     ):
+        """Apply every fitted coregistration step in sequence to an elevation object or array."""
 
         # First step and preprocessing
         if not self._fit_called and self._meta["outputs"]["affine"].get("matrix") is None:

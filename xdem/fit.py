@@ -16,11 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Normal, weighted and robust fitting shared by coregistration and uncertainty estimation.
-
-Residual losses and parametric fits are followed by interpolation and lookup of GeoUtils grouped statistics.
-"""
+"""Normal, weighted and robust fitting shared by coregistration and uncertainty estimation."""
 
 from __future__ import annotations
 

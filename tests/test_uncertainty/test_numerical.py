@@ -17,7 +17,7 @@ from xdem import examples
 
 
 class TestRandomFields:
-    """Generation of independent and spatially correlated error fields."""
+    """Test module for generating independent and spatially correlated error fields."""
 
     def test_random_fields_preserve_type_mask_and_random_state(self) -> None:
         """Checks that random fields preserve spatial types and masks and are reproducible for a fixed seed."""
@@ -90,31 +90,7 @@ def load_ref_and_diff() -> tuple[Raster, Raster, Any, Vector]:
 
 
 class TestPatchesMethod:
-    """Empirical spread between stable terrain patches at specified averaging areas."""
-
-    @pytest.mark.skipif(find_spec("numba") is not None, reason="Only runs if numba is missing.")
-    def test_patches_method_missing_numba(self) -> None:
-        """Checks that requesting Numba patch convolution reports a clear error when Numba is unavailable."""
-
-        # Use valid example data so the optional backend is the intended source of failure
-        diff, mask = load_ref_and_diff()[1:3]
-        gsd = diff.res[0]
-        area = 10000
-
-        # Request the Numba engine explicitly and check the dependency named by the error
-        with pytest.raises(ImportError, match="Optional dependency 'numba' required.*"):
-
-            df, df_full = xdem.uncertainty.patches_method(
-                diff,
-                unstable_mask=mask,
-                gsd=gsd,
-                areas=[area],
-                random_state=42,
-                n_patches=7,
-                vectorized=True,
-                return_in_patch_statistics=True,
-                convolution_method="numba",
-            )
+    """Test module for empirical spread between stable terrain patches at specified averaging areas."""
 
     def test_patches_method_loop_quadrant(self) -> None:
         """Checks that quadrant sampling returns reproducible patch statistics and the requested integration area."""
@@ -179,9 +155,61 @@ class TestPatchesMethod:
         assert all(df.columns == ["nmad", "nb_indep_patches", "exact_areas", "areas"])
         assert df["exact_areas"][0] == pytest.approx(df["areas"][0], rel=0.2)
 
+    def test_patches_method_array_masks_match_raster(self) -> None:
+        """Checks that array masks select the same patch population for raster and plain array values."""
+
+        # Create a deterministic grid with an inner stable region and a smaller unstable exclusion
+        values = np.random.default_rng(3).normal(size=(20, 20))
+        stable = np.zeros(values.shape, dtype=bool)
+        stable[2:-2, 2:-2] = True
+        unstable = np.zeros(values.shape, dtype=bool)
+        unstable[8:12, 8:12] = True
+        raster = Raster.from_array(values, Affine(1, 0, 0, 0, -1, 20), 32632, nodata=-9999)
+
+        # Estimate identical square patches through the spatial and plain array input paths
+        options: dict[str, Any] = {
+            "areas": [16, 36],
+            "stable_mask": stable,
+            "unstable_mask": unstable,
+            "patch_shape": "square",
+        }
+        raster_result = xdem.uncertainty.patches_method(raster, **options)
+        array_result = xdem.uncertainty.patches_method(values, gsd=1, **options)
+
+        # Check that cosampling and direct Boolean selection produce the same complete summary table
+        assert list(raster_result) == list(array_result)
+        np.testing.assert_allclose(raster_result.to_numpy(), array_result.to_numpy())
+
+
+class TestPatchesMethodErrors:
+    """Test module for unavailable optional patch convolution engines."""
+
+    @pytest.mark.skipif(find_spec("numba") is not None, reason="Only runs if numba is missing.")
+    def test_patches_method__error_missing_numba(self) -> None:
+        """Checks that requesting Numba patch convolution reports a clear error when Numba is unavailable."""
+
+        # Use valid example data so the optional backend is the intended source of failure
+        diff, mask = load_ref_and_diff()[1:3]
+        gsd = diff.res[0]
+        area = 10000
+
+        # Request the Numba engine explicitly and check the dependency named by the error
+        with pytest.raises(ImportError, match="Optional dependency 'numba' required.*"):
+            xdem.uncertainty.patches_method(
+                diff,
+                unstable_mask=mask,
+                gsd=gsd,
+                areas=[area],
+                random_state=42,
+                n_patches=7,
+                vectorized=True,
+                return_in_patch_statistics=True,
+                convolution_method="numba",
+            )
+
 
 class TestNumericalPropagation:
-    """Shared simulation summaries for spatial, terrain and callable operations."""
+    """Test module for simulation summaries of spatial, terrain and callable operations."""
 
     def test_numerical_area_matches_analytical_and_callable(self) -> None:
         """Checks that numerical area uncertainty agrees with analytical propagation and an equivalent callable."""
@@ -292,7 +320,11 @@ class TestNumericalPropagation:
         assert result.n_valid.tolist() == [2, 1]
         assert np.isnan(result.std[1])
 
-    def test_simulation_failure_diagnostics(self) -> None:
+
+class TestNumericalPropagationErrors:
+    """Test module for failed or insufficient numerical propagation simulations."""
+
+    def test_propagate_uncertainty__error_simulation_failure(self) -> None:
         """Checks that skipped simulations are recorded and an insufficient successful ensemble raises an error."""
 
         # Provide a valid small raster with independent measurement errors

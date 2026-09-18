@@ -16,11 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Numerical propagation of elevation errors and empirical uncertainty from patches.
-
-Random field generation and a shared Monte Carlo workflow precede adapters for spatial averages, terrain attributes
-and coregistration. Empirical patch methods retain the original convolution and quadrant algorithms.
-"""
+"""Numerical propagation of elevation errors and empirical uncertainty sampling from spatial patches."""
 
 from __future__ import annotations
 
@@ -28,21 +24,27 @@ import logging
 import warnings
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import geopandas as gpd
 import geoutils as gu
 import numpy as np
 import pandas as pd
 from geoutils import PointCloud, Raster
+from geoutils._dispatch import _is_pointcloud, _is_raster
 from geoutils.filters import _create_circular_mask, mean_filter
 from geoutils.raster import RasterType
-from geoutils.vector.vector import Vector, VectorType
+from geoutils.vector.vector import VectorType
 from numpy.typing import NDArray
 
 from xdem._misc import import_optional
 from xdem._typing import NDArrayf
 from xdem.uncertainty.error_structure import ErrorStructure
+
+if TYPE_CHECKING:
+    from geoutils.pointcloud.base import PointCloudBase
+    from geoutils.pointcloud.pointcloud import PointCloudLike
+    from geoutils.raster.base import RasterBase, RasterLike
 
 ##########################
 # 1/ RANDOM ERROR FIELDS
@@ -50,17 +52,17 @@ from xdem.uncertainty.error_structure import ErrorStructure
 
 
 def generate_random_field(
-    like: Any,
+    like: RasterBase | PointCloudBase,
     error_structure: ErrorStructure,
     *,
     predictors: Mapping[str, Any] | None = None,
     n_fields: int = 1,
     random_state: int | np.random.Generator | None = None,
-) -> Any | list[Any]:
+) -> RasterLike | PointCloudLike | list[RasterLike | PointCloudLike]:
     """Generate independent error realizations on raster or point cloud support.
 
-    :param error_structure: Components defining magnitudes and spatial correlations.
     :param like: Raster or point cloud defining output coordinates and type.
+    :param error_structure: Components defining magnitudes and spatial correlations.
     :param predictors: Named values required by grouped component magnitudes on ``like``.
     :param n_fields: Number of independent realizations.
     :param random_state: Random generator or seed used for reproducible fields.
@@ -68,8 +70,8 @@ def generate_random_field(
     """
 
     # Validate supported spatial interfaces before importing an optional simulation backend
-    is_raster = hasattr(like, "ij2xy")
-    is_pointcloud = hasattr(like, "georeferenced_coords_equal") and hasattr(like, "data_column")
+    is_raster = _is_raster(like)
+    is_pointcloud = _is_pointcloud(like)
     if not is_raster and not is_pointcloud:
         raise TypeError("like must be a GeoUtils raster or point cloud.")
 
@@ -511,142 +513,6 @@ def _postproc_coreg_metadata(c: Any) -> pd.DataFrame:
 ################################
 
 
-@overload
-def _preprocess_values_with_mask_to_array(  # type: ignore
-    values: list[NDArrayf | RasterType],
-    include_mask: NDArrayf | Raster | VectorType | gpd.GeoDataFrame = None,
-    exclude_mask: NDArrayf | Raster | VectorType | gpd.GeoDataFrame = None,
-    gsd: float | None = None,
-    preserve_shape: bool = True,
-) -> tuple[list[NDArrayf], float]: ...
-
-
-@overload
-def _preprocess_values_with_mask_to_array(
-    values: NDArrayf | RasterType,
-    include_mask: NDArrayf | Raster | VectorType | gpd.GeoDataFrame = None,
-    exclude_mask: NDArrayf | Raster | VectorType | gpd.GeoDataFrame = None,
-    gsd: float | None = None,
-    preserve_shape: bool = True,
-) -> tuple[NDArrayf, float]: ...
-
-
-def _preprocess_values_with_mask_to_array(
-    values: list[NDArrayf | RasterType] | NDArrayf | RasterType,
-    include_mask: NDArrayf | Raster | VectorType | gpd.GeoDataFrame = None,
-    exclude_mask: NDArrayf | Raster | VectorType | gpd.GeoDataFrame = None,
-    gsd: float | None = None,
-    preserve_shape: bool = True,
-) -> tuple[list[NDArrayf] | NDArrayf, float]:
-    """
-    Extract raster values and select stable terrain for empirical patch calculations.
-
-    Combine optional stable and unstable masks, preserving the original raster grid. Return both the selected
-    values and their ground sampling distance so the patch methods can convert requested areas to pixel sizes.
-    """
-
-    # Check inputs: needs to be Raster, array or a list of those
-    if not isinstance(values, (Raster, np.ndarray, list)) or (
-        isinstance(values, list) and not all(isinstance(val, (Raster, np.ndarray)) for val in values)
-    ):
-        raise ValueError("The values must be a Raster or NumPy array, or a list of those.")
-    # Mask needs to be an array, Vector or GeoPandas dataframe
-    if include_mask is not None and not isinstance(include_mask, (np.ndarray, Vector, Raster, gpd.GeoDataFrame)):
-        raise ValueError("The stable mask must be a Vector, Raster, GeoDataFrame or NumPy array.")
-    if exclude_mask is not None and not isinstance(exclude_mask, (np.ndarray, Vector, Raster, gpd.GeoDataFrame)):
-        raise ValueError("The unstable mask must be a Vector, Raster, GeoDataFrame or NumPy array.")
-
-    # Check that input stable mask can only be a georeferenced vector if the proxy values are a Raster to project onto
-    if isinstance(values, list):
-        any_raster = any(isinstance(val, Raster) for val in values)
-    else:
-        any_raster = isinstance(values, Raster)
-    if not any_raster and isinstance(include_mask, (Vector, gpd.GeoDataFrame)):
-        raise ValueError(
-            "The stable mask can only passed as a Vector or GeoDataFrame if the input values contain a Raster."
-        )
-
-    # If there is only one array or Raster, put alone in a list
-    if not isinstance(values, list):
-        return_unlist = True
-        values = [values]
-    else:
-        return_unlist = False
-
-    # Get the arrays
-    values_arr = [
-        np.ma.asarray(val.data if isinstance(val, Raster) else val, dtype=float).filled(np.nan) for val in values
-    ]
-
-    # Get the ground sampling distance from the first Raster if there is one
-    if gsd is None and any_raster:
-        for i in range(len(values)):
-            if isinstance(values[i], Raster):
-                first_raster = values[i]
-                break
-        # Looks like mypy cannot trace the isinstance here... ignoring
-        gsd = first_raster.res[0]  # type: ignore
-    elif gsd is not None:
-        gsd = gsd
-    else:
-        raise ValueError("The ground sampling distance must be provided if no Raster object is passed.")
-
-    # If the stable mask is not an array, create it
-    if include_mask is None:
-        include_mask_arr = np.ones(np.shape(values_arr[0]), dtype=bool)
-    elif isinstance(include_mask, (Vector, gpd.GeoDataFrame)):
-        # If the stable mask is a geopandas dataframe, wrap it in a Vector object
-        if isinstance(include_mask, gpd.GeoDataFrame):
-            stable_vector = Vector(include_mask)
-        else:
-            stable_vector = include_mask
-
-        # Create the mask
-        include_mask_arr = stable_vector.create_mask(first_raster, as_array=True)
-    # If the mask is a Raster
-    elif isinstance(include_mask, Raster):
-        include_mask_arr = include_mask.data.filled(False)
-    # If the mask is already an array, just pass it
-    else:
-        include_mask_arr = include_mask
-
-    # If the unstable mask is not an array, create it
-    if exclude_mask is None:
-        exclude_mask_arr = np.zeros(np.shape(values_arr[0]), dtype=bool)
-    elif isinstance(exclude_mask, (Vector, gpd.GeoDataFrame)):
-        # If the unstable mask is a geopandas dataframe, wrap it in a Vector object
-        if isinstance(exclude_mask, gpd.GeoDataFrame):
-            unstable_vector = Vector(exclude_mask)
-        else:
-            unstable_vector = exclude_mask
-
-        # Create the mask
-        exclude_mask_arr = unstable_vector.create_mask(first_raster, as_array=True)
-    # If the mask is already an array, just pass it
-    # If the mask is a Raster
-    elif isinstance(exclude_mask, Raster):
-        exclude_mask_arr = exclude_mask.data.filled(False)
-    else:
-        exclude_mask_arr = exclude_mask
-
-    include_mask_arr = np.logical_and(include_mask_arr, ~exclude_mask_arr).squeeze()
-
-    if preserve_shape:
-        # Need to preserve the shape, so setting as NaNs all points not on stable terrain
-        values_stable_arr = []
-        for val in values_arr:
-            val_stable = val.copy()
-            val_stable[~include_mask_arr] = np.nan
-            values_stable_arr.append(val_stable)
-    else:
-        values_stable_arr = [val_arr[include_mask_arr] for val_arr in values_arr]
-
-    # If input was a list, give a list. If it was a single array, give a single array.
-    if return_unlist:
-        values_stable_arr = values_stable_arr[0]  # type: ignore
-    return values_stable_arr, gsd
-
-
 def _patches_convolution(
     values: NDArrayf,
     gsd: float,
@@ -948,10 +814,66 @@ def patches_method(
         (Optional) Dataframe of per-patch statistics
     """
 
-    # Get values with NaNs on unstable terrain, preserving the shape by default
-    values_arr, gsd = _preprocess_values_with_mask_to_array(
-        values=values, include_mask=stable_mask, exclude_mask=unstable_mask, gsd=gsd
-    )
+    if isinstance(values, Raster):
+        # Boolean raster and array masks use True for eligible cells, so invert an unstable selection explicitly
+        unstable_selection: Any = unstable_mask
+        unstable_mode = "outside"
+        if isinstance(unstable_mask, Raster):
+            unstable_values = np.ma.asarray(unstable_mask.data).filled(False).astype(bool)
+            unstable_selection = unstable_mask.copy(new_array=~unstable_values)
+            unstable_mode = "inside"
+        elif isinstance(unstable_mask, np.ndarray):
+            unstable_selection = ~np.ma.asarray(unstable_mask).filled(False).astype(bool)
+            unstable_mode = "inside"
+
+        # Select finite stable raster cells through the shared spatial sampling interface
+        selected_mask = stable_mask if stable_mask is not None else unstable_selection
+        mask_mode = "inside" if stable_mask is not None else unstable_mode
+        sampled = values.cosample(values, mask=selected_mask, mask_mode=mask_mode)
+
+        # Apply an additional exclusion when stable and unstable masks were both supplied
+        if stable_mask is not None and unstable_mask is not None:
+            sampled = sampled.cosample(
+                sampled,
+                band=1,
+                other_band=1,
+                mask=unstable_selection,
+                mask_mode=unstable_mode,
+            )
+        values_arr = np.ma.asarray(sampled.data[0], dtype=float).filled(np.nan)
+        if gsd is None:
+            gsd = values.res[0]
+    elif isinstance(values, np.ndarray):
+        # Plain arrays have no spatial support for cosample(), so accept only aligned array or raster masks
+        if gsd is None:
+            raise ValueError("The ground sampling distance must be provided if no Raster object is passed.")
+        values_arr = np.ma.asarray(values, dtype=float).filled(np.nan)
+        if values_arr.ndim != 2:
+            raise ValueError("Patch values must be a two dimensional array.")
+
+        # Combine the optional inclusion and exclusion masks on the unchanged array grid
+        selected = np.ones(values_arr.shape, dtype=bool)
+        for name, supplied_mask, keep_inside in (
+            ("stable", stable_mask, True),
+            ("unstable", unstable_mask, False),
+        ):
+            if supplied_mask is None:
+                continue
+            if isinstance(supplied_mask, Raster):
+                mask_values = supplied_mask.data
+            elif isinstance(supplied_mask, np.ndarray):
+                mask_values = supplied_mask
+            else:
+                raise ValueError(f"The {name} mask must be a Raster or NumPy array when values is an array.")
+
+            # Require masks to identify the same cells before applying their Boolean selection
+            mask_array = np.ma.asarray(mask_values).filled(False).squeeze()
+            if mask_array.shape != values_arr.shape:
+                raise ValueError(f"The {name} mask must match the values shape.")
+            selected &= mask_array.astype(bool) if keep_inside else ~mask_array.astype(bool)
+        values_arr[~selected] = np.nan
+    else:
+        raise ValueError("The values must be a Raster or NumPy array.")
 
     # Initialize list of dataframe for the statistic on all patches
     list_stats = []

@@ -15,23 +15,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Estimate error component magnitudes and correlations from one spatial proxy.
-
-The workflow first prepares aligned values and estimates their total magnitude. It then fits a nested variogram to
-standardized errors, converts its variance fractions to named components and optionally refines those contributions
-against conditional pair semivariances. Only grouped summaries, variogram bins and small optimizer diagnostics survive.
-"""
+"""Estimate error component magnitudes and correlations from one spatial proxy."""
 
 from __future__ import annotations
 
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import geoutils as gu
 import numpy as np
 import pandas as pd
+from geoutils._dispatch import _is_pointcloud, _is_raster
 from geoutils.stats.variography import Variogram, VariogramModel
 from numpy.typing import ArrayLike, NDArray
 from scipy.optimize import least_squares
@@ -44,159 +40,84 @@ from xdem.uncertainty.error_structure import (
     ErrorStructure,
 )
 
+if TYPE_CHECKING:
+    from geoutils.pointcloud.base import PointCloudBase
+    from geoutils.raster.base import RasterBase
+
 ############################
 # 1/ INPUT AND MASK ALIGNMENT
 ############################
 
 
 def _prepare_proxy_inputs(
-    error_proxy: Any,
+    error_proxy: RasterBase | PointCloudBase,
     predictors: Mapping[str, Any],
     mask: Any | None,
-) -> tuple[NDArray[np.floating[Any]], dict[str, NDArray[np.floating[Any]]], NDArray[np.bool_]]:
-    """Read an error proxy, aligned predictors and one common eligible mask."""
+) -> tuple[
+    RasterBase | PointCloudBase,
+    NDArray[np.floating[Any]],
+    dict[str, NDArray[np.floating[Any]]],
+    NDArray[np.bool_],
+]:
+    """Cosample an error proxy and predictors on their common finite support."""
 
-    # Identify public raster and point cloud interfaces without constraining xDEM subclasses
-    is_raster = hasattr(error_proxy, "ij2xy")
-    is_pointcloud = hasattr(error_proxy, "georeferenced_coords_equal") and hasattr(error_proxy, "data_column")
-    if not is_raster and not is_pointcloud:
+    # Require the GeoUtils interface that aligns raster and point values on one support
+    is_raster = _is_raster(error_proxy)
+    is_pointcloud = _is_pointcloud(error_proxy)
+    if not (is_raster or is_pointcloud):
         raise TypeError("error_proxy must be a GeoUtils raster or point cloud.")
 
-    if is_raster:
-        # Select one raster band and replace masked cells by NaN for shared finite checks
-        values = error_proxy.data
-        if hasattr(values, "data") and not isinstance(values, np.ndarray) and not np.ma.isMaskedArray(values):
-            values = values.data
-        if hasattr(values, "compute"):
-            values = values.compute()
-        if np.ma.isMaskedArray(values):
-            values = np.ma.asarray(values, dtype=float).filled(np.nan)
-
-        # Require one elevation value per raster cell after resolving the input array
-        values = np.asarray(values, dtype=float).squeeze()
-        if values.ndim != 2:
-            raise ValueError("Error proxy rasters must contain one two dimensional band.")
-
-        # Align every predictor explicitly so grouped and pairwise calculations share cell positions
-        predictor_arrays: dict[str, NDArray[np.floating[Any]]] = {}
-        for name, predictor in predictors.items():
-            predictor_raster = predictor if hasattr(predictor, "ij2xy") else getattr(predictor, "rst", None)
-            if predictor_raster is not None:
-                if not error_proxy.georeferenced_grid_equal(predictor_raster):
-                    raise ValueError(f"Magnitude predictor {name!r} must share the error proxy grid.")
-                predictor = predictor_raster.data
-            elif isinstance(predictor, str):
+    # Give predictors private output names so user names cannot conflict with cosample() columns
+    auxiliary: dict[str, Any] = {}
+    auxiliary_at: dict[str, Literal["self"]] = {}
+    output_names: dict[str, str] = {}
+    for index, (name, predictor) in enumerate(predictors.items()):
+        output_name = f"predictor_{index}"
+        output_names[name] = output_name
+        if isinstance(predictor, str):
+            if not is_pointcloud:
                 raise TypeError("Raster magnitude predictors cannot be column names.")
-            elif hasattr(predictor, "data") and not isinstance(predictor, np.ndarray):
-                predictor = predictor.data
-
-            # Materialize the aligned raster predictor and retain its invalid cells for the common mask
-            if hasattr(predictor, "compute"):
-                predictor = predictor.compute()
-            if np.ma.isMaskedArray(predictor):
-                predictor = np.ma.asarray(predictor, dtype=float).filled(np.nan)
-            predictor_array = np.asarray(predictor, dtype=float).squeeze()
-            if predictor_array.shape != values.shape:
-                raise ValueError(f"Magnitude predictor {name!r} must match the error proxy shape.")
-            predictor_arrays[name] = predictor_array
-
-        # Convert spatial and array masks to the same raster grid
-        if mask is None:
-            eligible = np.ones(values.shape, dtype=bool)
-        elif hasattr(mask, "create_mask"):
-            eligible = np.asarray(mask.create_mask(ref=error_proxy, as_array=True), dtype=bool).squeeze()
+            auxiliary[output_name] = (error_proxy, predictor)
         else:
-            mask_raster = mask if hasattr(mask, "ij2xy") else getattr(mask, "rst", None)
-            if mask_raster is not None:
-                if not error_proxy.georeferenced_grid_equal(mask_raster):
-                    raise ValueError("A raster mask must share the error proxy grid.")
-                mask_values = mask_raster.data
-                if hasattr(mask_values, "compute"):
-                    mask_values = mask_values.compute()
-                if np.ma.isMaskedArray(mask_values):
-                    mask_values = np.ma.asarray(mask_values).filled(False)
-                eligible = np.isfinite(np.asarray(mask_values).squeeze()) & np.asarray(mask_values).squeeze().astype(
-                    bool
-                )
+            predictor_is_spatial = _is_raster(predictor) or _is_pointcloud(predictor)
+            if predictor_is_spatial:
+                auxiliary[output_name] = predictor
             else:
-                eligible = np.asarray(mask).squeeze()
+                auxiliary[output_name] = predictor.to_numpy() if hasattr(predictor, "to_numpy") else predictor
+                auxiliary_at[output_name] = "self"
 
-        # Reject masks whose shape or dtype could select a different raster population
-        if eligible.shape != values.shape or not np.issubdtype(eligible.dtype, np.bool_):
-            raise ValueError("mask must be Boolean and match the error proxy shape.")
+    # Align predictors and masks once, retaining only locations that are finite in every input
+    sampled = error_proxy.cosample(
+        error_proxy,
+        auxiliary=auxiliary or None,
+        auxiliary_at=auxiliary_at or None,
+        at="self",
+        mask=mask,
+    )
+
+    if is_raster:
+        # Read the first band as the proxy and the remaining named bands as aligned predictors
+        sampled_values = np.ma.asarray(sampled.data, dtype=float).filled(np.nan)
+        values = np.asarray(sampled_values[0], dtype=float)
+        predictor_arrays = {
+            name: np.asarray(sampled_values[index + 2], dtype=float) for index, name in enumerate(output_names)
+        }
+        eligible = np.isfinite(values)
+        prepared_proxy = error_proxy.copy(new_array=np.ma.masked_invalid(values))
     else:
-        # Materialize one point table because pair indexes refer to its original row order
-        dataframe = error_proxy.ds.compute() if hasattr(error_proxy.ds, "compute") else error_proxy.ds
-        source_values = (
-            dataframe[error_proxy.data_column].to_numpy()
-            if error_proxy.data_column is not None
-            else dataframe.geometry.z.to_numpy()
-        )
-        values = np.asarray(source_values, dtype=float).squeeze()
-        predictor_arrays = {}
+        # Point cosampling removes invalid rows while preserving their order for later pair indexes
+        dataframe = sampled.ds.compute() if hasattr(sampled.ds, "compute") else sampled.ds
+        values = dataframe["self"].to_numpy(dtype=float)
+        predictor_arrays = {
+            name: dataframe[output_name].to_numpy(dtype=float) for name, output_name in output_names.items()
+        }
+        eligible = np.ones(len(values), dtype=bool)
+        prepared_proxy = sampled.copy(new_array=values)
 
-        # Retain native point coordinates for interpolation of raster predictors and masks
-        points = (dataframe.geometry.x.to_numpy(), dataframe.geometry.y.to_numpy())
-
-        # Read native columns and aligned point arrays, or interpolate raster predictors at points
-        for name, predictor in predictors.items():
-            predictor_raster = predictor if hasattr(predictor, "ij2xy") else getattr(predictor, "rst", None)
-            predictor_pointcloud = (
-                predictor
-                if hasattr(predictor, "georeferenced_coords_equal") and hasattr(predictor, "data_column")
-                else getattr(predictor, "pc", None)
-            )
-
-            # Resolve each point predictor from a named column, a raster or an aligned point cloud
-            if isinstance(predictor, str):
-                if predictor not in dataframe:
-                    raise ValueError(f"Point cloud has no magnitude predictor column {predictor!r}.")
-                predictor_values = dataframe[predictor].to_numpy()
-            elif predictor_raster is not None:
-                predictor_values = predictor_raster.interp_points(points=points, as_array=True)
-            elif predictor_pointcloud is not None:
-                if not error_proxy.georeferenced_coords_equal(predictor_pointcloud):
-                    raise ValueError(f"Point predictor {name!r} must share ordered coordinates with error_proxy.")
-                predictor_values = predictor_pointcloud.data
-            else:
-                predictor_values = predictor.to_numpy() if hasattr(predictor, "to_numpy") else predictor
-
-            # Convert sampled point predictors to one finite-checkable value per observation
-            if hasattr(predictor_values, "compute"):
-                predictor_values = predictor_values.compute()
-            if np.ma.isMaskedArray(predictor_values):
-                predictor_values = np.ma.asarray(predictor_values, dtype=float).filled(np.nan)
-            predictor_array = np.asarray(predictor_values, dtype=float).squeeze()
-            if predictor_array.ndim != 1 or len(predictor_array) != len(values):
-                raise ValueError(f"Magnitude predictor {name!r} must contain one value per point.")
-            predictor_arrays[name] = predictor_array
-
-        # Evaluate vector and raster masks at points before accepting plain Boolean arrays
-        if mask is None:
-            eligible = np.ones(len(values), dtype=bool)
-        elif hasattr(mask, "create_mask"):
-            eligible = np.asarray(mask.create_mask(ref=error_proxy, as_array=True), dtype=bool).squeeze()
-        else:
-            mask_raster = mask if hasattr(mask, "ij2xy") else getattr(mask, "rst", None)
-            if mask_raster is not None:
-                mask_values = mask_raster.interp_points(points=points, method="nearest", as_array=True)
-                eligible = np.isfinite(np.asarray(mask_values).squeeze()) & np.asarray(mask_values).squeeze().astype(
-                    bool
-                )
-            else:
-                eligible = np.asarray(mask).squeeze()
-
-        # Reject point masks that cannot select the original row order exactly
-        if eligible.ndim != 1 or len(eligible) != len(values) or not np.issubdtype(eligible.dtype, np.bool_):
-            raise ValueError("mask must be Boolean with one value per error proxy point.")
-
-    # Exclude missing errors and predictors once so every fitted step uses a common population
-    eligible = eligible & np.isfinite(values)
-    for predictor_array in predictor_arrays.values():
-        eligible &= np.isfinite(predictor_array)
+    # Require enough common observations for a spread estimate or a spatial pair
     if np.count_nonzero(eligible) < 2:
         raise ValueError("At least two finite error proxy observations are required.")
-    return values, predictor_arrays, eligible
+    return prepared_proxy, values, predictor_arrays, eligible
 
 
 ################################
@@ -457,7 +378,7 @@ def _initialize_components(
 
 
 def _refine_components_from_pairs(
-    error_proxy: Any,
+    error_proxy: RasterBase | PointCloudBase,
     components: list[ErrorComponent],
     total_magnitude: ErrorMagnitude,
     predictor_arrays: Mapping[str, NDArray[np.floating[Any]]],
@@ -827,7 +748,7 @@ def _representative_variogram(
 
 
 def _estimate_error_structure(
-    error_proxy: Any,
+    error_proxy: RasterBase | PointCloudBase,
     *,
     predictors: Mapping[str, Any] | None,
     components: Mapping[str, Mapping[str, Any]] | None,
@@ -857,7 +778,7 @@ def _estimate_error_structure(
         raise NotImplementedError("Only fit_method='variogram' is currently implemented.")
     predictor_mapping = {} if predictors is None else dict(predictors)
     configuration = _normalize_component_configuration(components, has_predictors=bool(predictor_mapping))
-    values, predictor_arrays, eligible = _prepare_proxy_inputs(error_proxy, predictor_mapping, mask)
+    prepared_proxy, values, predictor_arrays, eligible = _prepare_proxy_inputs(error_proxy, predictor_mapping, mask)
 
     # Draw separate seeds so magnitude estimation, variography and refinement are reproducible stages
     rng = random_state if isinstance(random_state, np.random.Generator) else np.random.default_rng(random_state)
@@ -910,7 +831,7 @@ def _estimate_error_structure(
         out=standardized_values,
         where=np.isfinite(total_array) & (total_array > 0),
     )
-    standardized_proxy = error_proxy.copy(new_array=standardized_values)
+    standardized_proxy = prepared_proxy.copy(new_array=standardized_values)
 
     # Fit the requested nested models through GeoUtils lightweight variography
     fit_options = dict(fit_kwargs or {})
@@ -936,7 +857,7 @@ def _estimate_error_structure(
         model=correlated_models,
         fit_kwargs=fit_options,
         random_state=variogram_seed,
-        mask=mask,
+        mask=None,
         **pair_options,
     )
     initialized = _initialize_components(configuration, total_magnitude, empirical)
@@ -944,11 +865,11 @@ def _estimate_error_structure(
     # Refine range and magnitude separation against conditional raw error pairs
     if refine:
         fitted_components, refinement_diagnostics = _refine_components_from_pairs(
-            error_proxy,
+            prepared_proxy,
             initialized,
             total_magnitude,
             predictor_arrays,
-            mask=mask,
+            mask=None,
             estimator=variogram_estimator,
             n_pairs=effective_n_pairs,
             pair_sampling=pair_sampling,

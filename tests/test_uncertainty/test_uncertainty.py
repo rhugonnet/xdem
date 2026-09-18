@@ -16,7 +16,7 @@ import xdem
 
 
 class TestElevationErrorEstimation:
-    """Public estimation methods on DEMs and elevation point clouds."""
+    """Test module for public estimation methods on DEMs and elevation point clouds."""
 
     def test_elevation_methods_apply_error_attribution_on_common_support(self) -> None:
         """Checks that DEM and EPC estimation apply the requested error attribution and preserve spatial types."""
@@ -68,8 +68,12 @@ class TestElevationErrorEstimation:
         assert magnitude.georeferenced_grid_equal(source)
         assert correlation(0) == pytest.approx(1)
 
+
+class TestElevationErrorEstimationErrors:
+    """Test module for unavailable dependencies required by elevation error estimation."""
+
     @pytest.mark.skipif(find_spec("skgstat") is not None, reason="Only runs if scikit-gstat is missing.")
-    def test_estimate_error_structure_missing_variography_dependency(self) -> None:
+    def test_estimate_error_structure__error_missing_variography_dependency(self) -> None:
         """Checks that correlated estimation reports a clear import error when scikit-gstat is unavailable."""
 
         # Load a valid DEM pair so the missing backend is the only intended failure
@@ -82,7 +86,7 @@ class TestElevationErrorEstimation:
 
 
 class TestCoregistrationPropagation:
-    """Simulation of fitted coregistration parameters and failure handling."""
+    """Test module for simulating fitted coregistration parameters."""
 
     def test_error_structure_propagates_through_coregistration(self) -> None:
         """Checks that an ErrorStructure produces translation and rotation summaries through coregistration."""
@@ -167,7 +171,11 @@ class TestCoregistrationPropagation:
         np.testing.assert_array_equal(reference.data, original_reference)
         np.testing.assert_array_equal(source.data, original_source)
 
-    def test_coreg_propagation_counts_failed_fits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+
+class TestCoregistrationPropagationErrors:
+    """Test module for failed coregistration fits during uncertainty propagation."""
+
+    def test_propagate_uncertainty_coreg__error_failed_fit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Checks that a failed coregistration is omitted from the successful count and parameter summaries."""
 
         # Use a constant reference so the successful fits have only a vertical translation

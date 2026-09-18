@@ -346,12 +346,11 @@ class TestEPCVerticalTransform:
 
 class TestEPCCoregistration:
     """
-    Test eager coregistration through EPC and its Pandas accessor.
+    Test module for eager coregistration through EPC and its Pandas accessor.
 
     This class tests:
     - ``coregister_3d`` with elevations in a column or in 3D point geometry,
-    - Raster references supplied as DEM objects or Xarray accessors,
-    - Clear rejection of Dask inputs without running or changing the lazy input.
+    - Raster references supplied as DEM objects or Xarray accessors.
     """
 
     @pytest.mark.parametrize("use_z", [False, True])
@@ -393,7 +392,11 @@ class TestEPCCoregistration:
         np.testing.assert_array_equal(actual.index, frame.index)
         np.testing.assert_array_equal(frame.epc.data, shifted.data)
 
-    def test_coregister_3d__dask_rejected(self, epc_frame: gpd.GeoDataFrame) -> None:
+
+class TestEPCCoregistrationErrors:
+    """Test module for rejecting unsupported Dask EPC coregistration without executing its graph."""
+
+    def test_coregister_3d__error_dask_unsupported(self, epc_frame: gpd.GeoDataFrame) -> None:
         """Checks that Dask EPC coregistration fails explicitly without executing the point graph."""
 
         dgpd = pytest.importorskip("dask_geopandas")

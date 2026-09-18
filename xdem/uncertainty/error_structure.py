@@ -15,15 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Error magnitudes, spatial correlation components and their combined structure.
-
-An error structure is represented as a sum of named independent components. Each component combines an error
-magnitude with a correlation model whose variance is one, which keeps the amplitude and spatial scale unambiguous.
-
-The module defines magnitude models first, followed by individual components and their combined structure. Prediction,
-covariance conversion, plotting and random field generation are exposed on these compact public objects, while fitting
-from an error proxy is implemented separately in :mod:`xdem.uncertainty.estimation`.
-"""
+"""Error magnitudes, spatial correlation components and their combined structure."""
 
 from __future__ import annotations
 
@@ -36,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 import geoutils as gu
 import numpy as np
 import pandas as pd
+from geoutils._dispatch import _is_pointcloud, _is_raster
 from geoutils.stats.variography import Variogram, VariogramModel
 from numpy.typing import ArrayLike, NDArray
 from scipy.spatial.distance import cdist
@@ -43,6 +36,9 @@ from scipy.spatial.distance import cdist
 from xdem.fit import interp_binning
 
 if TYPE_CHECKING:
+    from geoutils.pointcloud.base import PointCloudBase
+    from geoutils.pointcloud.pointcloud import PointCloudLike
+    from geoutils.raster.base import RasterBase, RasterLike
     from matplotlib.axes import Axes
 
 
@@ -433,7 +429,7 @@ class ErrorStructure(Mapping[str, ErrorComponent]):
     @classmethod
     def estimate(
         cls,
-        error_proxy: Any,
+        error_proxy: RasterBase | PointCloudBase,
         *,
         predictors: Mapping[str, Any] | None = None,
         components: Mapping[str, Mapping[str, Any]] | None = None,
@@ -544,7 +540,7 @@ class ErrorStructure(Mapping[str, ErrorComponent]):
         predictors: Mapping[str, Any] | None = None,
         *,
         component: str | None = None,
-        like: Any | None = None,
+        like: RasterBase | PointCloudBase | None = None,
     ) -> Any:
         """Evaluate one component magnitude or their combined error magnitude.
 
@@ -567,13 +563,16 @@ class ErrorStructure(Mapping[str, ErrorComponent]):
         # Preserve scalar results unless a target spatial support was requested
         if like is None:
             return float(result) if np.ndim(result) == 0 else result
+        like_is_raster = _is_raster(like)
+        if not like_is_raster and not _is_pointcloud(like):
+            raise TypeError("like must be a GeoUtils raster or point cloud.")
         if np.ndim(result) == 0:
-            support_shape = like.shape if hasattr(like, "ij2xy") else (like.point_count,)
+            support_shape = like.shape if like_is_raster else (like.point_count,)
             result = np.full(support_shape, float(result), dtype=float)
 
         # Preserve the target raster mask even when a constant magnitude fills its complete shape
         result_array = np.asarray(result)
-        if hasattr(like, "ij2xy"):
+        if like_is_raster:
             _, invalid = like.get_nanarray(return_mask=True)
             result_array = np.ma.masked_array(
                 result_array,
@@ -696,31 +695,31 @@ class ErrorStructure(Mapping[str, ErrorComponent]):
     @overload
     def generate_random_field(
         self,
-        like: Any,
+        like: RasterBase | PointCloudBase,
         *,
         predictors: Mapping[str, Any] | None = None,
         n_fields: Literal[1] = 1,
         random_state: int | np.random.Generator | None = None,
-    ) -> Any: ...
+    ) -> RasterLike | PointCloudLike: ...
 
     @overload
     def generate_random_field(
         self,
-        like: Any,
+        like: RasterBase | PointCloudBase,
         *,
         predictors: Mapping[str, Any] | None = None,
         n_fields: int,
         random_state: int | np.random.Generator | None = None,
-    ) -> list[Any]: ...
+    ) -> list[RasterLike | PointCloudLike]: ...
 
     def generate_random_field(
         self,
-        like: Any,
+        like: RasterBase | PointCloudBase,
         *,
         predictors: Mapping[str, Any] | None = None,
         n_fields: int = 1,
         random_state: int | np.random.Generator | None = None,
-    ) -> Any | list[Any]:
+    ) -> RasterLike | PointCloudLike | list[RasterLike | PointCloudLike]:
         """Generate independent error realizations on raster or point cloud support.
 
         :param like: Raster or point cloud defining output coordinates and type.

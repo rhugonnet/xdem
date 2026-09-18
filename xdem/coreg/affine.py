@@ -440,8 +440,9 @@ def _standardize_epc(
     return ref_epc, tba_epc
 
 
-# Helper for computing normals
-##############################
+################################
+# Helpers for computing normals
+################################
 
 
 class DemGeometryDict(TypedDict, total=False):
@@ -620,9 +621,9 @@ def _axis_weights_from_epc(
     return w.astype(float)
 
 
-################################
-# Affine coregistrations methods
-# ##############################
+##################################
+# Affine coregistration methods
+##################################
 
 ##################
 # 1/ Nuth and Kääb

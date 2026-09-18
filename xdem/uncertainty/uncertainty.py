@@ -16,20 +16,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public workflows for estimating and propagating elevation uncertainty.
-
-Spatial input preparation is followed by estimation and numerical propagation entry points. Error models, fitting
-and analytical or numerical algorithms live in their corresponding uncertainty modules.
-"""
+"""Module with parent functions for estimating and propagating elevation uncertainty."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import geopandas as gpd
 import numpy as np
-from geoutils import PointCloud, Raster, Vector
+from geoutils import PointCloud, Raster
+from geoutils._dispatch import _is_pointcloud, _is_raster
 
 from xdem import terrain
 from xdem._typing import NDArrayb
@@ -47,6 +44,13 @@ from xdem.uncertainty.numerical import (
     patches_method,
 )
 
+if TYPE_CHECKING:
+    from geoutils.raster.base import RasterLike
+    from geoutils.vector.base import VectorLike
+
+    from xdem.dem.base import DEMLike
+    from xdem.epc.base import EPCLike
+
 __all__ = [
     "estimate_error_structure",
     "propagate_uncertainty",
@@ -63,10 +67,10 @@ __all__ = [
 
 
 def estimate_error_structure(
-    source_elev: Raster | PointCloud | gpd.GeoDataFrame,
-    other_elev: Raster | PointCloud | gpd.GeoDataFrame,
+    source_elev: DEMLike | EPCLike,
+    other_elev: DEMLike | EPCLike,
     *,
-    stable_terrain: Raster | Vector | NDArrayb | gpd.GeoDataFrame | None = None,
+    stable_terrain: RasterLike | VectorLike | NDArrayb | None = None,
     predictors: Mapping[str, Any] | tuple[Any, ...] | None = None,
     components: Mapping[str, Mapping[str, Any]] | None = None,
     other_error: Literal["negligible", "same"] = "negligible",
@@ -110,8 +114,8 @@ def estimate_error_structure(
         other_elev = PointCloud(other_elev, data_column=z_name)
 
     # Require the shared spatial sampling interface before choosing comparison locations
-    is_source_spatial = hasattr(source_elev, "cosample")
-    is_other_spatial = hasattr(other_elev, "cosample")
+    is_source_spatial = _is_raster(source_elev) or _is_pointcloud(source_elev)
+    is_other_spatial = _is_raster(other_elev) or _is_pointcloud(other_elev)
     if not is_source_spatial or not is_other_spatial:
         raise TypeError("source_elev and other_elev must be raster or point cloud objects.")
 
@@ -120,8 +124,8 @@ def estimate_error_structure(
         raise ValueError("other_error must be 'negligible' or 'same'.")
 
     # Prefer source terrain for derived variables and otherwise use the comparison raster
-    source_raster = source_elev if hasattr(source_elev, "ij2xy") else None
-    other_raster = other_elev if hasattr(other_elev, "ij2xy") else None
+    source_raster = source_elev if _is_raster(source_elev) else None
+    other_raster = other_elev if _is_raster(other_elev) else None
     terrain_source = source_raster if source_raster is not None else other_raster
 
     # Name ordered predictor shorthand and use terrain defaults only when a raster can provide them
@@ -154,7 +158,7 @@ def estimate_error_structure(
             raise ValueError(f"Cannot resolve magnitude predictor {specification!r} from the elevation inputs.")
         else:
             resolved_predictors[name] = specification
-            if not hasattr(specification, "ij2xy") and not hasattr(specification, "georeferenced_coords_equal"):
+            if not _is_raster(specification) and not _is_pointcloud(specification):
                 auxiliary_at[name] = "self"
 
     # Wrap raster shaped masks so mixed point comparisons can evaluate them spatially
@@ -181,7 +185,7 @@ def estimate_error_structure(
     scale = 1 / np.sqrt(2) if other_error == "same" else 1.0
 
     # Read the common raster bands or point columns as an error proxy on their native support
-    if isinstance(sample, Raster):
+    if _is_raster(sample):
         proxy_values = scale * (sample.data[0] - sample.data[1])
         error_proxy = source_elev.copy(new_array=proxy_values)
         fitted_predictors: Mapping[str, Any] = {

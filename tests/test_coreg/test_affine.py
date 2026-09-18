@@ -554,7 +554,7 @@ class TestAffineCoreg:
 
     @pytest.mark.parametrize("coreg_method", [coreg.ICP, coreg.CPD])  # type: ignore
     def test_coreg_rigid__sampling_strategy(self, coreg_method: Callable[..., AffineCoreg]) -> None:
-        """Test sampling strategies are properly applied, relevant only for point-point methods like ICP and CPD."""
+        """Checks that point-to-point methods apply independent and same-location sampling strategies."""
 
         # Get reference elevation
         ref = self.ref
@@ -607,7 +607,7 @@ class TestAffineCoreg:
         trim_spread_coverage: float,
         trim_iterative: bool,
     ) -> None:
-        """Test trimming schemes."""
+        """Checks that rigid methods fit translated data with every supported trimming scheme."""
 
         # Get reference elevation
         ref = self.ref
@@ -700,7 +700,7 @@ class TestAffineCoreg:
     )
     def test_coreg__symmetry(self, coreg_method: coreg.Coreg) -> None:
         """
-        Check that coregistrations are symmetric between point cloud-raster inputs (if both hold the same data points),
+        Checks that coregistration is symmetric between point cloud-raster inputs holding the same data points,
         and with ref/tba input (only if the method is symmetric; i.e. not use a gradient preferentialy derived on the
         gridded input).
 
@@ -791,6 +791,8 @@ class TestAffineCoreg:
                 assert np.allclose(baseline[3:6], np.asarray(tr)[3:6], atol=atol_rot)
 
     def test_nuthkaab__no_vertical_shift(self) -> None:
+        """Checks that disabling the Nuth and Kääb vertical shift preserves its fitted horizontal shifts."""
+
         ref, tba = load_examples()[0:2]
 
         # Compare Nuth and Kaab method with and without applying vertical shift

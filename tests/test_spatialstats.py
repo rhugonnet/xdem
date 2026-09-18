@@ -12,7 +12,7 @@ import xdem
 
 
 class TestSpatialstatsDeprecation:
-    """Compatibility and migration guidance for the deprecated public module."""
+    """Test module for compatibility and migration guidance of the deprecated public module."""
 
     def test_every_spatialstats_function_is_deprecated(self) -> None:
         """Checks that every legacy function warns and retains its documented call signature."""

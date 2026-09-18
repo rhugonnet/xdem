@@ -129,7 +129,7 @@ dict_key_to_str = {
 }
 
 
-#####################################
+###########################################
 # Generic functions for preprocessing
 ###########################################
 
@@ -2774,7 +2774,7 @@ class Coreg:
 
 
 ########################################
-# SAMPLING POLICY FOR COREGISTRATION
+# Sampling policy for coregistration
 ########################################
 
 

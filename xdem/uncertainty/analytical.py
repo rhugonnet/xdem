@@ -16,12 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Analytical propagation of component covariances to spatial averages.
-
-Circular approximations retain the original radial integration formulas. Discrete propagation sums the full
-covariance of each ErrorStructure component, including its magnitudes at both endpoints. The module presents
-support preparation, covariance sums, circular approximations and public area workflows in that order.
-"""
+"""Analytical propagation of component covariances to spatial averages."""
 
 from __future__ import annotations
 

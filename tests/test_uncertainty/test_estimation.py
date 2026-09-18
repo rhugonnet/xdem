@@ -18,7 +18,7 @@ from xdem._typing import NDArrayf
 
 
 class TestErrorStructureEstimation:
-    """Estimation of independent and correlated error components."""
+    """Test module for estimating independent and correlated error components."""
 
     def test_estimate_independent_variable_component_without_variography(self) -> None:
         """Checks that an independent component recovers increasing magnitudes without fitting a variogram."""
@@ -50,6 +50,35 @@ class TestErrorStructureEstimation:
         # Check that independent estimation has no variogram or pair refinement diagnostics
         assert structure.empirical_variogram is None
         assert structure.fit_diagnostics["refinement"]["success"] is None
+
+    def test_estimate_point_predictor_on_masked_common_support(self) -> None:
+        """Checks that point predictor columns and a Boolean mask use the same finite observations."""
+
+        # Create point errors whose spread increases with a named predictor column
+        rng = np.random.default_rng(11)
+        positions = np.arange(240, dtype=float)
+        quality = np.linspace(0, 1, len(positions))
+        values = (0.5 + quality) * rng.normal(size=len(positions))
+        proxy = gu.PointCloud.from_xyz(positions, np.zeros_like(positions), values, crs=32632)
+        proxy.ds["quality"] = quality
+
+        # Exclude the first forty points and one missing predictor through the common cosample selection
+        selected = np.ones(len(positions), dtype=bool)
+        selected[:40] = False
+        proxy.ds.loc[100, "quality"] = np.nan
+        structure = xdem.ErrorStructure.estimate(
+            proxy,
+            predictors={"quality": "quality"},
+            components={"measurement": {"magnitude": "heteroscedastic", "correlation": None}},
+            mask=selected,
+            bins=4,
+            min_count=30,
+            random_state=5,
+        )
+
+        # Check that the fitted magnitude follows the increasing spread on the selected finite rows
+        predicted = structure.predict_magnitude({"quality": np.array([0.25, 0.9])})
+        assert predicted[1] > predicted[0]
 
     @pytest.mark.skipif(find_spec("skgstat") is None, reason="Requires scikit-gstat")
     def test_estimate_separates_variable_short_and_fixed_long_components(self) -> None:
@@ -138,7 +167,7 @@ class TestErrorStructureEstimation:
 
 
 class TestStandardization:
-    """Calibration of magnitudes and rejection of standardized outliers."""
+    """Test module for calibrating magnitudes and rejecting standardized outliers."""
 
     def test_two_step_standardization(self) -> None:
         """Checks that two-step standardization removes an outlier and rescales the remaining errors to unit spread."""

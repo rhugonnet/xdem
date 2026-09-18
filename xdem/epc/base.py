@@ -23,7 +23,7 @@ from __future__ import annotations
 import pathlib
 import warnings
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Union, overload
 
 import geopandas as gpd
 import numpy as np
@@ -34,6 +34,7 @@ from geoutils.vector.transformation import _get_reproject_crs
 from pyproj import CRS
 from pyproj.crs import VerticalCRS
 
+from xdem._typing import NDArrayb
 from xdem.coreg import Coreg
 from xdem.vcrs import (
     _combine_crs_and_vcrs,
@@ -41,6 +42,17 @@ from xdem.vcrs import (
     _vcrs_from_crs,
     _VerticalReference,
 )
+
+if TYPE_CHECKING:
+    from geoutils.raster.base import RasterLike
+    from geoutils.vector.base import VectorLike
+
+    from xdem.dem.base import DEMLike
+    from xdem.uncertainty.error_structure import ErrorStructure
+
+
+# For inputs, we also accept a GeoDataFrame
+EPCLike = Union["EPCBase", gpd.GeoDataFrame]
 
 
 class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
@@ -51,7 +63,7 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
     while the inherited ``crs`` property contains the complete 3D CRS.
     """
 
-    def _cast_pointcloud_output(self, pointcloud: Any) -> Any:
+    def _cast_pointcloud_output(self, pointcloud: Any) -> EPCLike:
         """Return EPC for native outputs and dataframes for accessor outputs."""
 
         output = super()._cast_pointcloud_output(pointcloud)
@@ -61,14 +73,44 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
             return EPC(output)
         return output
 
+    @overload
     def reproject(
         self,
-        ref: Any = None,
+        ref: RasterLike | VectorLike | None = None,
+        crs: CRS | str | int | None = None,
+        *,
+        inplace: Literal[False] = False,
+        mp_config: MultiprocConfig | None = None,
+    ) -> EPCLike: ...
+
+    @overload
+    def reproject(
+        self,
+        ref: RasterLike | VectorLike | None = None,
+        crs: CRS | str | int | None = None,
+        *,
+        inplace: Literal[True],
+        mp_config: MultiprocConfig | None = None,
+    ) -> None: ...
+
+    @overload
+    def reproject(
+        self,
+        ref: RasterLike | VectorLike | None = None,
+        crs: CRS | str | int | None = None,
+        *,
+        inplace: bool = False,
+        mp_config: MultiprocConfig | None = None,
+    ) -> EPCLike | None: ...
+
+    def reproject(
+        self,
+        ref: RasterLike | VectorLike | None = None,
         crs: CRS | str | int | None = None,
         inplace: bool = False,
         *,
         mp_config: MultiprocConfig | None = None,
-    ) -> Any:
+    ) -> EPCLike | None:
         """
         Reproject point coordinates and keep the source vertical reference when the target CRS is 2D.
 
@@ -88,6 +130,31 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
         # Reproject through GeoUtils with the complete target CRS so every output interface receives the same metadata
         return super().reproject(crs=target_crs, inplace=inplace, mp_config=mp_config)
 
+    @overload
+    def to_vcrs(
+        self,
+        vcrs: Literal["Ellipsoid", "EGM08", "EGM96"] | str | pathlib.Path | VerticalCRS | int,
+        force_source_vcrs: (
+            Literal["Ellipsoid", "EGM08", "EGM96"] | str | pathlib.Path | VerticalCRS | int | None
+        ) = None,
+        mp_config: MultiprocConfig | None = None,
+        *,
+        inplace: Literal[False] = False,
+    ) -> EPCLike: ...
+
+    @overload
+    def to_vcrs(
+        self,
+        vcrs: Literal["Ellipsoid", "EGM08", "EGM96"] | str | pathlib.Path | VerticalCRS | int,
+        force_source_vcrs: (
+            Literal["Ellipsoid", "EGM08", "EGM96"] | str | pathlib.Path | VerticalCRS | int | None
+        ) = None,
+        mp_config: MultiprocConfig | None = None,
+        *,
+        inplace: Literal[True],
+    ) -> None: ...
+
+    @overload
     def to_vcrs(
         self,
         vcrs: Literal["Ellipsoid", "EGM08", "EGM96"] | str | pathlib.Path | VerticalCRS | int,
@@ -97,7 +164,18 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
         mp_config: MultiprocConfig | None = None,
         *,
         inplace: bool = False,
-    ) -> Any:
+    ) -> EPCLike | None: ...
+
+    def to_vcrs(
+        self,
+        vcrs: Literal["Ellipsoid", "EGM08", "EGM96"] | str | pathlib.Path | VerticalCRS | int,
+        force_source_vcrs: (
+            Literal["Ellipsoid", "EGM08", "EGM96"] | str | pathlib.Path | VerticalCRS | int | None
+        ) = None,
+        mp_config: MultiprocConfig | None = None,
+        *,
+        inplace: bool = False,
+    ) -> EPCLike | None:
         """
         Convert point elevations to another vertical coordinate reference system.
 
@@ -128,13 +206,13 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
 
     def coregister_3d(
         self,
-        reference_elev: Any,
+        reference_elev: DEMLike | EPCLike,
         coreg_method: Coreg,
         inlier_mask: Any = None,
         bias_vars: dict[str, Any] | None = None,
         random_state: int | np.random.Generator | None = None,
         **kwargs: Any,
-    ) -> Any:
+    ) -> EPCLike:
         """
         Align an elevation point cloud to reference elevation data in three dimensions.
 
@@ -179,16 +257,16 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
 
     def estimate_error_structure(
         self,
-        other_elev: Any,
+        other_elev: DEMLike | EPCLike,
         *,
-        stable_terrain: Any | None = None,
+        stable_terrain: RasterLike | VectorLike | NDArrayb | None = None,
         predictors: Mapping[str, Any] | tuple[Any, ...] | None = None,
         components: Mapping[str, Mapping[str, Any]] | None = None,
         other_error: Literal["negligible", "same"] = "negligible",
         z_name: str = "z",
         random_state: int | np.random.Generator | None = None,
         **kwargs: Any,
-    ) -> Any:
+    ) -> ErrorStructure:
         """Estimate named error components from another elevation dataset on stable terrain.
 
         Point attributes can be passed by column name. When the comparison is a DEM, terrain attributes such as slope
