@@ -3841,6 +3841,33 @@ class TestCPD:
         # Check the variance floor
         assert variance == 1e-8
 
+    @pytest.mark.parametrize("only_translation", [True, False])
+    def test_cpd_mstep_lsg__zero_probability(self, only_translation: bool) -> None:
+        """Checks edge case that points with zero correspondence probability contribute no residual to the LSG fit."""
+
+        # Create a translated tetrahedron and an outlier with zero correspondence probability
+        moving = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [100, -200, 300]], dtype=float)
+        expected_translation = np.array([0.2, -0.3, 0.5])
+        targets = moving + expected_translation
+        precision = np.tile(np.eye(3), (len(moving), 1, 1))
+        precision[-1] = 0
+        first_moment = np.einsum("mij,mj->mi", precision, targets)
+        options = cast(InFitOrBinDict, {"fit_minimizer": scipy.optimize.least_squares, "fit_loss_func": "linear"})
+
+        # Build residual factors and fit with both matched points and the outlier
+        factors, means = _lsg_build_whitened_terms(precision, first_moment)
+        rotation, translation = _cpd_mstep_lsg_least_squares(
+            moving, {"M0": precision, "M1": first_moment}, only_translation, options
+        )
+
+        # Check zero outlier residuals and the transformation constrained by the tetrahedron
+        np.testing.assert_array_equal(factors[-1], 0)
+        np.testing.assert_array_equal(means[-1], 0)
+        assert np.all(np.isfinite(factors))
+        assert np.all(np.isfinite(means))
+        np.testing.assert_allclose(translation, expected_translation, rtol=0, atol=1e-7)
+        np.testing.assert_allclose(rotation, np.eye(3), rtol=0, atol=1e-7)
+
 
 class TestDhMinimizeDeprecation:
     """Test module for the DhMinimize deprecation notice."""

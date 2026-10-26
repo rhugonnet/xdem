@@ -3745,12 +3745,16 @@ def _lsg_build_whitened_terms(
     :return: (Ls, mus) with Ls shape (M,3,3) and mus shape (M,3).
     """
     M = M0.shape[0]
-    Ls = np.empty((M, 3, 3), dtype=float)
-    mus = np.empty((M, 3), dtype=float)
+    Ls = np.zeros((M, 3, 3), dtype=float)
+    mus = np.zeros((M, 3), dtype=float)
 
     for m in range(M):
         A = M0[m]
         b = M1[m]
+
+        # Points assigned entirely to the outlier distribution contribute no residual
+        if not np.any(A):
+            continue
 
         # Scale jitter per axis to preserve unequal weights
         jitter = 1e-12 * np.maximum(np.diag(A), np.finfo(float).tiny)
