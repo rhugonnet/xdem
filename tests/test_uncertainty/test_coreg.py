@@ -53,7 +53,7 @@ def _compare_simulated_uncertainty(
         **options,
     )
 
-    # We use a chi-square interval to quantitatively constrain the allowed variation from number of simulations,
+    # We use a chi-square interval to quantitatively constrain the allowed variation due to small number of simulations,
     # with an additional 0.1% error across parameters
     count = 3 if only_translation else 6
     probability = 0.001 / (2 * count)
@@ -74,16 +74,16 @@ def _compare_simulated_uncertainty(
     return analytical
 
 
-class TestCoregistrationSummary:
-    """Test module for plots of translation and rotation uncertainty."""
+class TestCoregistrationPropagationSummary:
+    """Test module for the PropagationSummary subclass adapted to coreg."""
 
     @pytest.mark.parametrize("supplied_axes", [False, True])
-    def test_plot__parameters(self, supplied_axes: bool) -> None:
-        """Checks that parameter plots show simulated means, standard deviations and the original estimate."""
+    def test_plot(self, supplied_axes: bool) -> None:
+        """Checks that plot show the right data."""
 
         import matplotlib.pyplot as plt
 
-        # Create known translations and rotations with nonzero uncertainty in every parameter
+        # We create a synthetic propagation summary
         labels = pd.Index(["tx", "ty", "tz", "rx", "ry", "rz"])
         estimate = pd.Series([1, 2, 3, 0.1, 0.2, 0.3], index=labels)
         expected_mean = estimate + pd.Series([0.1, -0.2, 0.3, -0.01, 0.02, -0.03], index=labels)
@@ -99,13 +99,13 @@ class TestCoregistrationSummary:
             output={"translation_units": "metre"},
         )
 
-        # Create or reuse plot axes
+        # THen create or reuse plot axes
         axes = tuple(plt.subplots(1, 2)[1]) if supplied_axes else None
         plotted_axes = summary.plot(axes=axes)
         if axes is not None:
             assert plotted_axes == axes
 
-        # Check means, error bars and the original fit
+        # Check means, error bars and the original fit are all displayed properly
         for axis, names, label in zip(
             plotted_axes, (("tx", "ty", "tz"), ("rx", "ry", "rz")), ("Translation (metre)", "Rotation (radian)")
         ):
@@ -119,8 +119,8 @@ class TestCoregistrationSummary:
         plt.close(plotted_axes[0].figure)
 
 
-class TestCoregistrationPropagation:
-    """Test module for simulated parameters, saved fits and analytical propagation summaries."""
+class TestPropagateUncertaintyCoreg:
+    """Test module for the propagate_uncertainty_coreg() function."""
 
     @pytest.mark.parametrize(
         "return_coregs, return_samples, at",
@@ -135,10 +135,10 @@ class TestCoregistrationPropagation:
     def test_propagate_uncertainty_coreg__saved_coregs(
         self, return_coregs: bool, return_samples: bool, at: list[str] | None
     ) -> None:
-        """Checks that saved Coregs match the parameter summaries and store each fit's metadata."""
+        """Checks that saved Coregs match the parameter summaries and store each fit metadata."""
 
         # 1/ Simulate vertical shifts
-        # Create a vertical offset
+        # Create DEM with a vertical offset, and an error structure
         reference = gu.Raster.from_array(np.arange(48, dtype=float).reshape(6, 8), Affine(2, 0, 0, 0, -2, 12), 32632)
         source = reference + 5
         method = xdem.coreg.VerticalShift(vshift_reduc_func=np.mean)
@@ -158,7 +158,7 @@ class TestCoregistrationPropagation:
         )
 
         # 2/ Check saved fits and summaries
-        # Check six parameter summaries and selected samples
+        # Check the 6-param summary
         labels = ["tx", "ty", "tz", "rx", "ry", "rz"]
         assert type(summary) is xdem.uncertainty.PropagationSummary
         for quantity in (summary.estimate, summary.mean, summary.std, summary.n_valid):
@@ -213,7 +213,7 @@ class TestCoregistrationPropagation:
             pytest.param(xdem.coreg.ICP, "gls", False, np.random.default_rng(12), id="icp-generator"),
         ],
     )
-    def test_propagate_uncertainty_coreg__stored_fit(
+    def test_propagate_uncertainty_coreg__refit(
         self,
         icp_dem: gu.Raster,
         only_translation: bool,
@@ -222,7 +222,10 @@ class TestCoregistrationPropagation:
         legacy: bool,
         seed: int | np.random.Generator | None,
     ) -> None:
-        """Checks that analytical propagation refits supplied inputs and errors when the method is already fitted."""
+        """Checks that analytical propagation refits (when the method is already fitted)."""
+
+        if legacy and optimizer == "gls":
+            pytest.importorskip("linear_operator")
 
         # 1/ Fit curved terrain using native models or the legacy LZD error arguments
         reference = icp_dem
@@ -388,8 +391,8 @@ class TestCoregistrationPropagation:
         assert summary.estimate["tz"] == pytest.approx(-5)
 
 
-class TestCoregistrationSimulation:
-    """Test module for analytical uncertainty compared with numerical coregistration simulations."""
+class TestCoregUncertaintyAnalyticalVsNumerical:
+    """Test module for analytical uncertainty compared with numerical uncertainty from simulations for coreg."""
 
     @pytest.mark.parametrize("gls_method", ["approximate", "exact", "inducing"])
     @pytest.mark.parametrize("correlated", [False, True])
@@ -403,6 +406,9 @@ class TestCoregistrationSimulation:
     ) -> None:
         """Checks that analytical GLS standard errors agree with repeated fits under the same elevation errors."""
 
+        if correlated:
+            pytest.importorskip("skgstat")
+
         pytest.importorskip("torch")
         pytest.importorskip("gpytorch")
 
@@ -414,7 +420,7 @@ class TestCoregistrationSimulation:
             _gls_lazy_gpytorch,
         )
 
-        # Force blockwise solves even for this small DEM
+        # Force GPyTorch block size solves even for this small DEM
         if gls_method == "exact":
             monkeypatch.setattr(
                 "xdem.coreg.affine._gls_lazy_gpytorch",
@@ -472,6 +478,8 @@ class TestCoregistrationSimulation:
         point_input: str | None,
     ) -> None:
         """Checks that both input models predict simulated translation and rotation errors."""
+
+        pytest.importorskip("skgstat")
 
         pytest.importorskip("torch")
         pytest.importorskip("gpytorch")
@@ -538,6 +546,9 @@ class TestCoregistrationSimulation:
     ) -> None:
         """Checks that analytical ICP translation and rotation errors agree with exact native Gaussian simulations."""
 
+        if correlated:
+            pytest.importorskip("skgstat")
+
         pytest.importorskip("torch")
         pytest.importorskip("gpytorch")
 
@@ -576,7 +587,7 @@ class TestCoregistrationSimulation:
         _compare_simulated_uncertainty(reference, moving, method, options, only_translation, check_mean=True)
 
 
-class TestCoregistrationPropagationErrors:
+class TestPropagateUncertaintyCoregErrors:
     """Test module for unsupported coregistration uncertainty inputs, stored fits and failed simulations."""
 
     def test_propagate_uncertainty_coreg__error_analytical_coregs(self) -> None:

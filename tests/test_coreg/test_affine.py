@@ -1721,6 +1721,8 @@ class TestAffineCoreg:
     def test_fit__tls_methods(self, small_dem: Raster, method: Callable[..., AffineCoreg]) -> None:
         """Checks that TLS methods fit the same transformation and report different spatial uncertainty."""
 
+        pytest.importorskip("skgstat")
+
         # Create correlated errors in the DEM used to derive gradients
         correlation = VariogramModel("gaussian", effective_range=6, partial_sill=1)
         errors = {"ref": geoutils.ErrorStructure([geoutils.ErrorComponent("measurement", 0.01, correlation)])}
@@ -1746,6 +1748,8 @@ class TestAffineCoreg:
         self, small_dem: Raster, method: Callable[..., AffineCoreg], active_dims: tuple[int, ...] | None, backend: str
     ) -> None:
         """Checks that every GLS backend sums the separate spatial components from both inputs."""
+
+        pytest.importorskip("skgstat")
 
         pytest.importorskip("linear_operator")
         if backend == "inducing":
@@ -2000,6 +2004,8 @@ class TestSampledParameterCovariance:
 
     def test_sampled_parameter_covariance__components(self) -> None:
         """Checks that native covariance products match explicit heteroscedastic and correlated component matrices."""
+
+        pytest.importorskip("skgstat")
 
         from xdem.coreg.affine import _propagate_sampled_covariance
 
@@ -2689,6 +2695,9 @@ class TestICP:
         where we compare to numerical simulations.
         """
 
+        if correlated:
+            pytest.importorskip("skgstat")
+
         if error_options.get("gls_method") in ("approximate", "exact"):
             pytest.importorskip("linear_operator")
         elif error_options.get("gls_method") == "inducing":
@@ -2964,6 +2973,8 @@ class TestLZD:
     def test_lzd__error_aware_parameters(self, error_options: dict[str, Any], only_translation: bool) -> None:
         """Checks that GLS and TLS recover known LZD parameters and return uncertainties for each fitted parameter."""
 
+        pytest.importorskip("skgstat")
+
         if error_options.get("gls_method") in ("approximate", "exact"):
             pytest.importorskip("linear_operator")
         elif error_options.get("gls_method") == "inducing":
@@ -3106,6 +3117,8 @@ class TestLZD:
     ) -> None:
         """Checks that TLS gradient variances use each pixel spacing and the correlation's active dimensions."""
 
+        pytest.importorskip("skgstat")
+
         # Create a grid error field that may be constant along one coordinate
         case = _tls_observation_case(only_translation, spatial=False)
         inputs: tuple[NDArrayf, NDArrayf, NDArrayf, NDArrayf, NDArrayf, NDArrayf] = case["covariance_inputs"]["inputs"]
@@ -3155,6 +3168,8 @@ class TestLZD:
         pixel_size: float | tuple[float, float],
     ) -> None:
         """Checks that sampled height and gradient sensitivities match actual TLS refits."""
+
+        pytest.importorskip("skgstat")
 
         import scipy.odr
 
@@ -3212,6 +3227,9 @@ class TestLZD:
         self, only_translation: bool, source: str, spatial: bool
     ) -> None:
         """Checks that sampled TLS covariance matches simulations of either or both error models."""
+
+        if spatial:
+            pytest.importorskip("skgstat")
 
         # 1/ Create small errors for first-order propagation
         case = _tls_observation_case(only_translation, spatial)
