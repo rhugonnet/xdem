@@ -640,6 +640,9 @@ def _get_vertical_transform_crss(
     if crs is None:
         raise ValueError("A horizontal CRS is required before transforming a vertical CRS.")
 
+    # Normalize Rasterio and other CRS inputs before using PyProj methods
+    crs = CRS.from_user_input(crs)
+
     # Get source VCRS from current CRS
     src_vcrs = _vcrs_from_crs(crs)
 
