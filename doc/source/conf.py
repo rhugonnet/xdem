@@ -114,6 +114,7 @@ autodoc_type_aliases = {
     "PointCloudBase": "geoutils.pointcloud.base.PointCloudBase",
     "DEMBase": "xdem.dem.base.DEMBase",
     "EPCBase": "xdem.epc.base.EPCBase",
+    "ErrorStructure": "geoutils.ErrorStructure",
 }
 
 extlinks = {

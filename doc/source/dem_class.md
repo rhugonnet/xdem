@@ -140,11 +140,11 @@ For the full list of terrain attributes, see the {ref}`terrain-attributes` page.
 
 ## Statistics
 
-The {func}`~xdem.DEM.get_stats` method allows to extract statistical information from a DEM in a dictionary.
+The {func}`~xdem.DEM.stats` method allows to extract statistical information from a DEM in a dictionary.
 
 - Get all statistics in a dict:
 ```{code-cell} ipython3
-dem.get_stats()
+dem.stats()
 ```
 
 The DEM statistics functionalities in xDEM are based on those in GeoUtils.

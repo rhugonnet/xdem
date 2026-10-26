@@ -257,9 +257,11 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
 
     def estimate_error_structure(
         self,
-        other: DEMLike | EPCLike | NDArrayf,
+        other: DEMLike | EPCLike | NDArrayf | None = None,
         *,
         predictors: Mapping[str, Any] | tuple[str, ...] | None = None,
+        precoreg: bool = True,
+        coreg_method: Coreg | None = None,
         **kwargs: Any,
     ) -> ErrorStructure:
         """
@@ -267,10 +269,14 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
 
         Point column names are passed to GeoUtils. When other is a raster, slope and maximum curvature are
         derived from its grid by default.
-        Pass predictors={} for constant magnitudes.
+        Pass predictors={} for constant magnitudes. With other=None, this dataset is an error proxy
+        and uses constant magnitudes unless predictor values are supplied.
 
         :param other: Comparison elevation dataset, or an array on this dataset's locations.
+            None treats this dataset as an error proxy.
         :param predictors: Named predictors or a tuple of terrain attribute names.
+        :param precoreg: Align paired elevations before estimating errors. Defaults to True.
+        :param coreg_method: Optional Coreg method or pipeline. None uses LZD.
         :param kwargs: Options for xdem.uncertainty.estimate_error_structure(), including mask, other_precision,
             at, align, components, mp_config and random_state.
         :returns: The fitted GeoUtils error structure.
@@ -278,4 +284,6 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
 
         from xdem.uncertainty import estimate_error_structure
 
-        return estimate_error_structure(self, other, predictors=predictors, **kwargs)
+        return estimate_error_structure(
+            self, other, predictors=predictors, precoreg=precoreg, coreg_method=coreg_method, **kwargs
+        )

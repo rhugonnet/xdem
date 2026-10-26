@@ -530,8 +530,9 @@ class TestDEM:
         dem_ref = DEM(fn_ref)
         dem_tba = DEM(fn_tba)
 
+        # Use Matheron to reach correlation fitting without the optional t-digest dependency
         with pytest.raises(ImportError, match="Optional dependency 'scikit-gstat' required.*"):
-            dem_tba.estimate_uncertainty(dem_ref)
+            dem_tba.estimate_uncertainty(dem_ref, variogram_estimator="matheron")
 
     def test_to_pointcloud__type_override(self) -> None:
 

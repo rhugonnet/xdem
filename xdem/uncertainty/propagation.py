@@ -45,7 +45,7 @@ from geoutils.uncertainty.propagation import (
 
 from xdem import terrain
 from xdem._typing import NDArrayb, NDArrayf
-from xdem.coreg.base import _as_eager_elevation
+from xdem.coreg.base import Coreg, _as_eager_elevation
 from xdem.uncertainty.error_structure import ErrorStructure
 
 if TYPE_CHECKING:
@@ -84,7 +84,13 @@ def _estimation_input_family(values: Sequence[Any]) -> list[Any]:
         if interface is None or interface._is_xr or getattr(interface, "_is_pd", False):
             result.append(value)
         elif _is_raster(interface):
-            result.append(interface.to_xarray())
+            # Rasterio stores Boolean rasters as bytes
+            if interface.dtype == np.dtype(bool):
+                array = interface.astype("uint8").to_xarray()
+                array = array.fillna(0).astype(bool)
+            else:
+                array = interface.to_xarray()
+            result.append(array)
         else:
             frame = interface.gdf.copy()
             frame.attrs["data_name"] = interface.data_name
@@ -93,11 +99,13 @@ def _estimation_input_family(values: Sequence[Any]) -> list[Any]:
 
 
 def estimate_error_structure(
-    source_elev: DEMLike | EPCLike,
-    other: DEMLike | EPCLike | NDArrayf,
+    source: DEMLike | EPCLike,
+    other: DEMLike | EPCLike | NDArrayf | None = None,
     *,
     predictors: Mapping[str, Any] | tuple[str, ...] | None = None,
     mask: RasterLike | VectorLike | NDArrayb | None = None,
+    precoreg: bool = True,
+    coreg_method: Coreg | None = None,
     other_precision: Literal["negligible", "same"] = "negligible",
     at: Literal["self", "other"] | None = None,
     align: Literal["raise", "reproject"] = "reproject",
@@ -107,39 +115,40 @@ def estimate_error_structure(
     """
     Estimate elevation error magnitudes and spatial correlation using terrain predictors.
 
-    Slope and maximum curvature are used as predictors from an input DEM by default.
+    With two elevation inputs, slope and maximum curvature are used as predictors by default.
     Pass predictors={} for constant magnitudes.
 
-    :param source_elev: Elevation dataset whose error structure is estimated.
+    With ``other=None``, source is considered an error proxy, used without precoregistration or precision scaling.
+    With two inputs, we align ``source`` to ``other`` with LZD by default before estimating errors from their
+    residual differences. Pass ``precoreg=False`` for data that are already aligned.
+
+    Pass predictor values explicitly for variable magnitudes.
+
+    :param source: Raster or point cloud containing elevations, or an error proxy when other is None.
     :param other: Comparison elevation dataset, or an array matching the source pixels or point order.
-    :param predictors: Named predictors or a tuple of terrain attribute names. None uses terrain defaults when
-        possible.
+        None uses source as an error proxy.
+    :param predictors: Named predictor values or, for paired inputs, a tuple of terrain attribute names.
+        None uses terrain defaults for paired elevations and constant magnitudes for a proxy.
     :param mask: Spatial or Boolean mask selecting stable terrain where differences represent error.
+    :param precoreg: Align the source when other is supplied. Coregistration requires eager inputs.
+    :param coreg_method: Optional Coreg method or pipeline, copied before fitting. None uses LZD.
+        Ignored when precoreg=False or other is None.
     :param other_precision: "negligible" assigns difference errors to the source. "same" assumes independent errors
-        with the same magnitude and correlation in both datasets; GeoUtils divides differences by the square root of
-        two.
+        with the same magnitude and correlation in both datasets, dividing differences by the square root of
+        two. Only used when other is supplied.
     :param at: Comparison locations: "self", "other", or None to prefer point locations when present.
     :param align: "raise" reports mismatched grids or coordinate systems; "reproject" aligns them for comparison.
     :param mp_config: Worker and tile settings for multiprocessing estimation.
     :param kwargs: Additional options for GeoUtils ErrorStructure.estimate(), such as components, bins and
         random_state.
-    :returns: The fitted GeoUtils error structure, with magnitudes in elevation units.
+
+    :returns: Error structure, with magnitudes in elevation units.
     """
 
-    # Choose the DEM for slope/curv
-    source_raster = _get_raster_interface(source_elev)
+    # 1/ Prepare the mask and align elevations
+    source_raster = _get_raster_interface(source)
     other_raster = _get_raster_interface(other)
-    terrain_source = source_raster if source_raster is not None else other_raster
-    if predictors is None:
-        predictors = ("slope", "max_curvature") if terrain_source is not None else ()
-    predictor_specs = dict(predictors) if isinstance(predictors, Mapping) else {name: name for name in predictors}
-    terrain_names = []
-    for value in predictor_specs.values():
-        if isinstance(value, str) and terrain_source is not None and value in terrain.available_attributes:
-            if value not in terrain_names:
-                terrain_names.append(value)
 
-    # Preserve grid coordinates for boolean raster masks
     if isinstance(mask, np.ndarray) and mask.ndim > 1:
         for raster in (source_raster, other_raster):
             if raster is not None and mask.squeeze().shape == raster.shape:
@@ -148,6 +157,44 @@ def estimate_error_structure(
                 )
                 break
 
+    # Default to LZD for precoreg
+    if other is not None and precoreg:
+        from xdem.coreg import LZD
+
+        if coreg_method is None:
+            coreg_method = LZD()
+        if not isinstance(coreg_method, Coreg):
+            raise TypeError("coreg_method must be a Coreg instance or None.")
+
+        # Give a bare reference array the source coordinates
+        if isinstance(other, np.ndarray):
+            other = _as_eager_elevation(source).copy(new_array=other)
+
+        # Copy the method so estimating errors leaves a supplied fit unchanged
+        fitted = coreg_method.copy().fit(
+            other, source, inlier_mask=_as_eager_elevation(mask), random_state=kwargs.get("random_state")
+        )
+        source = fitted.apply(_as_eager_elevation(source), resample=True)
+
+    # 2/ Prepare terrain predictors
+    # Choose the DEM for slope/curv
+    source_raster = _get_raster_interface(source)
+    other_raster = _get_raster_interface(other)
+    terrain_source = None
+    if other is not None:
+        terrain_source = source_raster if source_raster is not None else other_raster
+    if predictors is None:
+        predictors = ("slope", "max_curvature") if terrain_source is not None else ()
+    predictor_specs = dict(predictors) if isinstance(predictors, Mapping) else {name: name for name in predictors}
+    terrain_names = []
+    for value in predictor_specs.values():
+        if other is None and source_raster is not None and isinstance(value, str):
+            raise ValueError("Terrain predictors for an error proxy must be supplied as arrays or rasters.")
+        if isinstance(value, str) and terrain_source is not None and value in terrain.available_attributes:
+            if value not in terrain_names:
+                terrain_names.append(value)
+
+    # 3/ Estimate the error structure
     # Leave multiprocessing files available until fitting finishes
     with ExitStack() as temporary_files:
         if terrain_names:
@@ -160,11 +207,11 @@ def estimate_error_structure(
                 for name, value in predictor_specs.items()
             }
 
-        source_elev, other, mask, *predictor_values = _estimation_input_family(
-            [source_elev, other, mask, *predictor_specs.values()]
+        source, other, mask, *predictor_values = _estimation_input_family(
+            [source, other, mask, *predictor_specs.values()]
         )
         return ErrorStructure.estimate(
-            source_elev,
+            source,
             other=other,
             other_precision=other_precision,
             at=at,
@@ -223,6 +270,7 @@ def _simulate(
     *,
     error_structure: gu.ErrorStructure,
     predictors: Mapping[str, Any] | None = None,
+    random_field_options: Mapping[str, Any] | None = None,
     n_samples: int = 100,
     random_state: int | np.random.Generator | None = None,
     at: Literal["all"] | Sequence[Hashable] | None = None,
@@ -245,10 +293,14 @@ def _simulate(
     if (return_samples or quantiles) and selection.empty:
         raise ValueError("Select outputs with at when requesting samples or quantiles.")
 
+    field_options = dict(random_field_options or {})
+
     def draw_error(generator: np.random.Generator) -> Any:
         """Draw one error field on the unchanged elevation support."""
 
-        return error_structure.generate_random_field(like=source, predictors=predictors, random_state=generator)
+        return error_structure.generate_random_field(
+            like=source, predictors=predictors, random_state=generator, **field_options
+        )
 
     def calculate(error: Any) -> Any:
         """Add one error field to a copy of the original elevations and repeat the operation."""
@@ -280,8 +332,9 @@ def propagate_uncertainty(
     data: Any = None,
     operation: Literal["terrain", "spatial", "coreg"] | Callable[..., Any] | None = None,
     *,
-    error_structure: gu.ErrorStructure,
+    error_structure: gu.ErrorStructure | Mapping[str, gu.ErrorStructure],
     predictors: Mapping[str, Any] | None = None,
+    error_predictors: Mapping[str, Mapping[str, Any]] | None = None,
     inputs: Mapping[str, Mapping[str, Any]] | None = None,
     operation_options: Mapping[str, Any] | None = None,
     method: Literal["analytical", "numerical"] = "numerical",
@@ -304,7 +357,8 @@ def propagate_uncertainty(
     :param data: Original raster, point cloud or supported elevation accessor.
     :param operation: "terrain", "spatial", "coreg", a callable, or None to summarize the source errors.
         A callable receives the perturbed elevation object and the supplied operation arguments.
-    :param error_structure: GeoUtils error model for the uncertain elevations.
+    :param error_structure: GeoUtils error model, or models keyed by "ref" and "tba" for coregistration.
+    :param error_predictors: Coregistration magnitude predictors keyed by "ref" and "tba".
     :param predictors: Source magnitude predictors, including terrain attribute names for raster inputs.
     :param inputs: Fixed inputs under the operation name (or "custom" for a callable). Terrain accepts its usual
         arguments; spatial accepts an areas mapping and optional weights; coreg requires reference_elev.
@@ -313,6 +367,8 @@ def propagate_uncertainty(
     :param method: "numerical" for repeated calculations or "analytical" for existing propagation formulas.
     :param kwargs: GeoUtils propagation/simulation options, including n_samples, random_state, at,
         return_samples, quantiles, max_sample_bytes and on_error. Spatial outputs require at to save draws.
+        random_field_options passes options to generate_random_field(), which approximates correlated fields by
+        default. Pass {"gpytorch_inducing_points": None} for exact in-memory draws.
     :returns: GeoUtils PropagationSummary with the original result, propagated mean and standard deviation,
         and any requested selected draws or quantiles.
     """
@@ -322,6 +378,26 @@ def propagate_uncertainty(
         raise ValueError("method must be 'analytical' or 'numerical'.")
     if method == "analytical" and kwargs.get("return_samples", False):
         raise ValueError("Analytical propagation cannot return simulation samples.")
+    if operation == "coreg":
+        from xdem.uncertainty.coreg import propagate_uncertainty_coreg
+
+        options = {**dict(operation_options or {}), **dict((inputs or {}).get("coreg", {}))}
+        reference = options.pop("reference_elev")
+        coreg_method = options.pop("coreg_method")
+        if predictors is not None:
+            raise TypeError("Coregistration uses error_predictors keyed by 'ref' and 'tba'.")
+        return propagate_uncertainty_coreg(
+            reference,
+            data,
+            coreg_method,
+            error_structure=error_structure,
+            error_predictors=error_predictors,
+            method=method,
+            **options,
+            **kwargs,
+        )
+    if error_predictors is not None:
+        raise TypeError("error_predictors is only used for coregistration. Use predictors for other operations.")
     if not isinstance(error_structure, gu.ErrorStructure):
         raise TypeError("error_structure must be an ErrorStructure.")
 
@@ -370,23 +446,6 @@ def propagate_uncertainty(
             resolved[key] = terrain.get_terrain_attribute(source, value)
 
     # 4/ Run propagation workflow
-
-    # For coreg
-    if operation == "coreg":
-        from xdem.uncertainty.coreg import propagate_uncertainty_coreg
-
-        reference = options.pop("reference_elev")
-        coreg_method = options.pop("coreg_method")
-        return propagate_uncertainty_coreg(
-            reference,
-            source,
-            coreg_method,
-            error_structure=error_structure,
-            predictors=resolved,
-            method=method,
-            **options,
-            **kwargs,
-        )
 
     # For terrain
     if operation == "terrain":

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import warnings
-from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Literal
 
@@ -11,7 +10,6 @@ import geoutils as gu
 import numpy as np
 import pandas as pd
 import pytest
-import xarray as xr
 from affine import Affine
 from geoutils.multiproc import MultiprocConfig
 
@@ -19,53 +17,155 @@ import xdem
 
 
 class TestElevationErrorEstimation:
-    """Test module for error estimation methods on DEMs and elevation point clouds."""
+    """Test module for error estimation methods on DEMs and EPCs."""
 
     @pytest.mark.parametrize("kind", ["raster", "point"])
     @pytest.mark.parametrize("entrypoint", ["function", "method", "accessor"])
     @pytest.mark.parametrize("other_precision", [None, "negligible", "same"])
-    def test_estimate_error_structure__array_comparison(
-        self, kind: str, entrypoint: str, other_precision: str | None
+    @pytest.mark.parametrize("comparison", [False, True], ids=["proxy", "comparison"])
+    def test_estimate_error_structure__masked_inputs(
+        self, kind: str, entrypoint: str, other_precision: str | None, comparison: bool
     ) -> None:
-        """Checks that masked array comparisons give the expected magnitude for each precision assumption."""
+        """Checks that error structure estimation works the same through every API entry point."""
 
-        # 1/ Prepare inputs
-        # Create errors and exclude the last row
-        values = np.arange(36, dtype=float).reshape(6, 6)
+        # 1/ Create error proxy, or differences source/other from a zero array
+        # Exclude the last row with a mask, and one NaN
+        values = np.arange(-18.0, 18.0).reshape(6, 6)
+        if not comparison:
+            values[2, 3] = np.nan
         mask = np.indices(values.shape)[0] < 5
         if kind == "raster":
-            source = xdem.DEM.from_array(values, Affine(10, 0, 0, 0, -10, 60), 32632, nodata=-9999)
+            source = xdem.DEM.from_array(values, Affine(2, 0, 0, 0, -2, 12), 32632, nodata=-9999)
         else:
-            x, y = np.meshgrid(np.arange(6), np.arange(6))
+            rows, columns = np.indices(values.shape)
             values, mask = values.ravel(), mask.ravel()
-            source = xdem.EPC(gu.PointCloud.from_xyz(x.ravel(), y.ravel(), values, crs=32632))
+            source = xdem.EPC(gu.PointCloud.from_xyz(columns.ravel(), rows.ravel(), values, crs=32632))
 
-        # Set comparison and precision options
+        # We set precision options only when passed by user, preserving the defaults for a proxy
         options: dict[str, Any] = {
-            "other": np.zeros_like(values),
-            "predictors": {},
             "mask": mask,
             "components": {"measurement": {"magnitude": "constant", "correlation": None}},
             "spread_estimator": np.std,
         }
+        if comparison:
+            options.update(other=np.zeros_like(values), predictors={}, precoreg=False)
         if other_precision is not None:
             options["other_precision"] = other_precision
 
-        # 2/ Estimate and compare magnitudes
-        # Run the function, method or accessor
+        # 2/ Estimate through the function, method or accessor
         if entrypoint == "function":
-            result = xdem.uncertainty.estimate_error_structure(source, **options)
+            result = xdem.uncertainty.estimate_error_structure(source=source, **options)
         elif entrypoint == "method":
             result = source.estimate_error_structure(**options)
         else:
             accessor = source.to_xarray().dem if kind == "raster" else source.gdf.epc
             result = accessor.estimate_error_structure(**options)
 
-        # Equal independent errors increase difference variance by a factor of two
-        scale = np.sqrt(2) if other_precision == "same" else 1.0
+        # 3/ Check equality
+        # Equal independent errors increase variance by factor of 2
+        # A proxy already describes errors, so a precision assumption must not rescale it
+        valid = mask & np.isfinite(values)
+        scale = np.sqrt(2) if comparison and other_precision == "same" else 1.0
         assert type(result) is gu.ErrorStructure
-        assert result.predict_magnitude() == pytest.approx(np.std(values[mask]) / scale)
-        assert result.fit_diagnostics["magnitude"]["valid_count"] == np.count_nonzero(mask)
+        assert result.predict_magnitude() == pytest.approx(np.std(values[valid]) / scale)
+        assert result.components["measurement"].magnitude.kind == "constant"
+        assert result.fit_diagnostics["magnitude"]["valid_count"] == np.count_nonzero(valid)
+
+    @pytest.mark.parametrize("kind", ["raster", "point"])
+    @pytest.mark.parametrize("entrypoint", ["function", "method", "accessor"])
+    def test_estimate_error_structure__proxy_predictors(self, kind: str, entrypoint: str) -> None:
+        """Checks that a proxy and explicit terrain predictors match GeoUtils grouped statistics."""
+
+        # 1/ Create a proxy and terrain predictors
+        # Derive slope from elevations
+        rows, columns = np.mgrid[:18, :20]
+        grid = Affine(2, 0, 0, 0, -2, 36)
+        elevations = xdem.DEM.from_array(rows + columns + 0.1 * rows * columns, grid, 32632, nodata=-9999)
+        slope = elevations.slope().data
+        errors = (1 + slope / 10) * np.random.default_rng(42).normal(size=rows.shape)
+        proxy = elevations.copy(new_array=errors)
+        source = proxy if kind == "raster" else proxy.to_pointcloud()
+        # Match predictor rows to the finite pixels exported as points
+        valid_pixels = np.isfinite(proxy.data.filled(np.nan)).ravel()
+        predictors = {"slope": slope if kind == "raster" else slope.ravel()[valid_pixels]}
+        options: dict[str, Any] = {
+            "predictors": predictors,
+            "components": {"measurement": {"magnitude": "heteroscedastic", "correlation": None}},
+            "spread_estimator": np.std,
+            "bins": 3,
+            "min_count": 10,
+            "random_state": 4,
+        }
+
+        # 2/ Estimate and compare grouped statistics
+        expected = gu.ErrorStructure.estimate(source, **options)
+        if entrypoint == "function":
+            actual = xdem.uncertainty.estimate_error_structure(source=source, **options)
+        elif entrypoint == "method":
+            actual = source.estimate_error_structure(**options)
+        else:
+            accessor = source.to_xarray().dem if kind == "raster" else source.gdf.epc
+            actual = accessor.estimate_error_structure(**options)
+
+        # Check equality
+        expected_magnitude = expected.components["measurement"].magnitude
+        actual_magnitude = actual.components["measurement"].magnitude
+        assert actual_magnitude.predictor_names == ("slope",)
+        pd.testing.assert_frame_equal(actual_magnitude.grouped_statistics, expected_magnitude.grouped_statistics)
+
+    @pytest.mark.parametrize("kind", ["raster", "point"])
+    def test_estimate_error_structure__variable_precision(self, kind: str) -> None:
+        """Checks that equal precision divides variable magnitudes by sqrt(2) without changing correlation."""
+
+        pytest.importorskip("skgstat")
+
+        # 1/ Create variable errors
+        # Increase error magnitude across 4 groups
+        rows, columns = np.mgrid[:24, :28]
+        quality = np.broadcast_to(np.arange(28) // 7, rows.shape).astype(float)
+        residual = (1 + quality) * (
+            np.sin(columns / 3) + np.cos(rows / 4) + np.random.default_rng(42).normal(0, 0.2, rows.shape)
+        )
+        grid = Affine(2, 0, 0, 0, -2, 48)
+        reference = xdem.DEM.from_array(100 + rows + columns, grid, 32632, nodata=-9999)
+        measured = reference.copy(new_array=reference.data + residual)
+
+        # Select raster or point observations with the same predictor values
+        source = measured if kind == "raster" else measured.to_pointcloud()
+        other = reference if kind == "raster" else reference.to_pointcloud()
+        predictors = {"quality": quality if kind == "raster" else quality.ravel()}
+        options: dict[str, Any] = {
+            "predictors": predictors,
+            "components": {"measurement": {"magnitude": "heteroscedastic", "correlation": "spherical"}},
+            "bins": 4,
+            "min_count": 10,
+            "spread_estimator": np.std,
+            "n_pairs": 600,
+            "n_lags": 8,
+            "pair_sampling": "random_xy",
+            "random_state": 42,
+        }
+
+        # 2/ Estimate both precision assumptions
+        negligible = xdem.uncertainty.estimate_error_structure(
+            source, other=other, other_precision="negligible", precoreg=False, **options
+        )
+        same = xdem.uncertainty.estimate_error_structure(
+            source, other=other, other_precision="same", precoreg=False, **options
+        )
+
+        # Equal precision splits difference variance between the two inputs
+        magnitude = negligible.predict_magnitude(predictors)
+        assert np.ptp(magnitude) > 0
+        np.testing.assert_allclose(same.predict_magnitude(predictors), magnitude / np.sqrt(2))
+
+        # Normalizing by magnitude should give the same empirical variogram and fitted correlation
+        assert negligible.empirical_variogram is not None
+        assert same.empirical_variogram is not None
+        np.testing.assert_array_equal(same.empirical_variogram.counts, negligible.empirical_variogram.counts)
+        np.testing.assert_allclose(same.empirical_variogram.semivariance, negligible.empirical_variogram.semivariance)
+        distances = np.array([0.0, 5.0, 10.0, 30.0])
+        np.testing.assert_allclose(same.predict_correlation(distances), negligible.predict_correlation(distances))
 
     @pytest.mark.parametrize("other_precision", ["negligible", "same"])
     @pytest.mark.parametrize(
@@ -113,10 +213,10 @@ class TestElevationErrorEstimation:
             **options,
         )
         actual = xdem.uncertainty.estimate_error_structure(
-            source, reference, predictors=("slope",), other_precision=other_precision, **options
+            source, reference, predictors=("slope",), other_precision=other_precision, precoreg=False, **options
         )
 
-        # Check grouped statistics
+        # 3/ Check equality of grouped statistics
         assert type(actual) is gu.ErrorStructure
         expected_magnitude = expected.components["measurement"].magnitude
         actual_magnitude = actual.components["measurement"].magnitude
@@ -164,7 +264,7 @@ class TestElevationErrorEstimation:
 
         # Compare a raster mask in GeoUtils with an array mask in xDEM
         expected = gu.ErrorStructure.estimate(source, other=reference, mask=source.copy(new_array=mask), **options)
-        actual = source.estimate_error_structure(other=reference, mask=mask, **options)
+        actual = source.estimate_error_structure(other=reference, mask=mask, precoreg=False, **options)
 
         # Check magnitude and selected observations
         assert actual.predict_magnitude() == pytest.approx(expected.predict_magnitude())
@@ -194,7 +294,7 @@ class TestElevationErrorEstimation:
 
         # Run xDEM and GeoUtils
         expected = gu.ErrorStructure.estimate(frame, **options)
-        actual = xdem.uncertainty.estimate_error_structure(frame, **options)
+        actual = xdem.uncertainty.estimate_error_structure(frame, precoreg=False, **options)
 
         # Check grouped height statistics
         expected_magnitude = expected.components["measurement"].magnitude
@@ -204,208 +304,185 @@ class TestElevationErrorEstimation:
         pd.testing.assert_frame_equal(actual_magnitude.grouped_statistics, expected_magnitude.grouped_statistics)
 
 
-class TestCoregistrationSummary:
-    """Test module for optional simulated Coregs and plots of translation and rotation uncertainty."""
+class TestElevationErrorEstimationPrecoreg:
+    """Test module for optional alignment before estimating elevation errors."""
 
-    @pytest.mark.parametrize("return_coregs", [False, True])
-    @pytest.mark.parametrize("return_samples", [False, True])
-    def test_propagate_uncertainty_coreg__saved_coregs(self, return_coregs: bool, return_samples: bool) -> None:
-        """Checks that saved Coregs match the parameter summaries and store each fit's metadata."""
+    @pytest.mark.parametrize("precoreg", [False, True])
+    def test_estimate_error_structure__proxy_coreg(self, coreg_method: xdem.coreg.AffineCoreg, precoreg: bool) -> None:
+        """Checks that a proxy bypasses every coregistration method, including with prealignment enabled."""
 
-        # 1/ Simulate vertical shifts
-        # Create a vertical offset
-        reference = gu.Raster.from_array(np.arange(48, dtype=float).reshape(6, 8), Affine(2, 0, 0, 0, -2, 12), 32632)
-        source = reference + 5
-        method = xdem.coreg.VerticalShift(vshift_reduc_func=np.mean)
-        errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.2)])
+        # Create errors with a known spread
+        values = np.arange(12.0).reshape(3, 4)
+        proxy = xdem.DEM.from_array(values, Affine(2, 0, 0, 0, -2, 6), 32632, nodata=-9999)
 
-        # Select Coreg and sample outputs independently
-        summary = xdem.uncertainty.propagate_uncertainty_coreg(
-            reference,
-            source,
-            method,
-            error_structure=errors,
-            n_samples=4,
-            random_state=2,
-            return_coregs=return_coregs,
-            return_samples=return_samples,
-            at=["tz"],
+        # Supply a method without a reference dataset
+        result = proxy.estimate_error_structure(
+            coreg_method=coreg_method,
+            precoreg=precoreg,
+            components={"measurement": {"magnitude": "constant", "correlation": None}},
+            spread_estimator=np.std,
         )
 
-        # 2/ Check saved fits and summaries
-        # Check optional outputs and the unchanged method
-        assert (summary.samples is not None) == return_samples
-        assert not method._fit_called
-        if not return_coregs:
-            assert summary.coregs is None
-            return
+        # Check the unscaled proxy spread and unchanged method
+        assert result.predict_magnitude() == pytest.approx(np.std(values))
+        assert not coreg_method._fit_called
 
-        # Check separate Coregs and their vertical shifts
-        assert summary.coregs is not None
-        assert list(summary.coregs) == [1, 2, 3, 4]
-        assert len({id(fitted) for fitted in summary.coregs.values()}) == 4
-        parameters = pd.DataFrame(0.0, index=list(summary.coregs), columns=summary.estimate.index)
-        for number, fitted in summary.coregs.items():
-            assert fitted is not method
-            assert fitted._fit_called
-            shift = fitted.meta["outputs"]["affine"]["shift_z"]
-            assert fitted.to_matrix()[2, 3] == shift
-            parameters.loc[number, "tz"] = shift
+    def test_estimate_error_structure__default_coreg(self, curved_dem: xdem.DEM) -> None:
+        """Checks that prealignment defaults to LZD."""
 
-        # Compare means, uncertainties and samples with saved fits
-        np.testing.assert_allclose(parameters.mean(), summary.mean)
-        np.testing.assert_allclose(parameters.std(), summary.std)
-        if summary.samples is not None:
-            np.testing.assert_array_equal(parameters.loc[:, summary.samples.columns], summary.samples)
-
-    @pytest.mark.parametrize("supplied_axes", [False, True])
-    def test_plot__parameters(self, supplied_axes: bool) -> None:
-        """Checks that parameter plots show simulated means, standard deviations and the original estimate."""
-
-        import matplotlib.pyplot as plt
-
-        # 1/ Simulate vertical shifts
-        # Create a vertical offset
-        reference = gu.Raster.from_array(np.arange(48, dtype=float).reshape(6, 8), Affine(2, 0, 0, 0, -2, 12), 32632)
-        source = reference + 5
-        method = xdem.coreg.VerticalShift(vshift_reduc_func=np.mean)
-        errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.2)])
-
-        # Save parameter samples
-        summary = xdem.uncertainty.propagate_uncertainty_coreg(
-            reference,
-            source,
-            method,
-            error_structure=errors,
-            n_samples=4,
-            random_state=2,
-            return_samples=True,
-        )
-
-        # Check summaries and the unchanged method
-        assert isinstance(summary, gu.PropagationSummary)
-        assert isinstance(summary, xdem.uncertainty.PropagationSummary)
-        assert summary.coregs is None
-        assert summary.estimate["tz"] == pytest.approx(-5)
-        assert summary.output["crs"] == reference.crs
-        assert not method._fit_called
-        assert summary.samples is not None
-        np.testing.assert_allclose(summary.std, summary.samples.std())
-
-        # 2/ Plot and check parameters
-        # Create or reuse plot axes
-        axes = tuple(plt.subplots(1, 2)[1]) if supplied_axes else None
-        plotted_axes = summary.plot(axes=axes)
-        if axes is not None:
-            assert plotted_axes == axes
-
-        # Check means, error bars and the original fit
-        for axis, names, label in zip(
-            plotted_axes, (("tx", "ty", "tz"), ("rx", "ry", "rz")), ("Translation (metre)", "Rotation (radian)")
-        ):
-            mean = summary.mean.loc[list(names)].to_numpy()
-            std = summary.std.loc[list(names)].to_numpy()
-            endpoints = np.asarray(axis.collections[0].get_segments())[:, :, 1]
-            np.testing.assert_allclose(axis.lines[0].get_ydata(orig=False), mean)
-            np.testing.assert_allclose(endpoints, np.column_stack((mean - std, mean + std)))
-            np.testing.assert_allclose(axis.lines[-1].get_ydata(orig=False), summary.estimate.loc[list(names)])
-            assert axis.get_ylabel() == label
-        plt.close(plotted_axes[0].figure)
-
-
-class TestCoregistrationAnalyticalPropagation:
-    """Test module for analytical summaries of GLS/TLS fit uncertainties."""
-
-    @pytest.mark.parametrize("optimizer", ["gls", "tls"])
-    @pytest.mark.parametrize("only_translation", [True, False])
-    def test_propagate_uncertainty_coreg__lzd(self, optimizer: str, only_translation: bool) -> None:
-        """Checks that analytical summaries return LZD fit uncertainties unchanged."""
-
-        if optimizer == "gls" and find_spec("gpytorch") is None:
-            pytest.skip("GLS requires optional GPyTorch.")
-
-        # 1/ Prepare the fit
-        # Create curved terrain to constrain translations and rotations
-        rows, columns = np.indices((15, 17))
-        values = 5 * np.sin(columns / 3) + 3 * np.cos(rows / 4) + 2 * np.sin((columns + rows) / 5)
-        reference = gu.Raster.from_array(values, Affine(2, 0, 0, 0, -2, 30), 32632)
-        aligned = reference + 1
-        sigma = np.full(reference.shape, 0.1)
-        correlation = (lambda distance: np.exp(-((distance / 2) ** 2)), 2)
-        errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.1)])
-        fit_options: dict[str, Any] = {
-            "sig_tba": sigma,
-            "corr_tba": correlation,
-            "force_opti": optimizer,
+        # Create curved terrain with a vertical offset and small measurement errors
+        reference = curved_dem
+        elevations = reference.data.copy()
+        source = reference.copy(new_array=elevations + 1 + np.random.default_rng(42).normal(0, 0.01, reference.shape))
+        options: dict[str, Any] = {
+            "predictors": {},
+            "components": {"measurement": {"magnitude": "constant", "correlation": None}},
+            "spread_estimator": np.std,
+            "random_state": 4,
         }
-        if optimizer == "tls":
-            fit_options.update(sig_ref=sigma, corr_ref=correlation)
 
-        # 2/ Compare analytical summaries with fit uncertainties
-        # Fit LZD and summarize its uncertainties
-        fitted = xdem.coreg.LZD(only_translation=only_translation, subsample=100).fit(
-            reference, aligned, random_state=2, **fit_options
+        # Compare the default with an explicit LZD method
+        actual = source.estimate_error_structure(reference, **options)
+        expected = source.estimate_error_structure(reference, coreg_method=xdem.coreg.LZD(), **options)
+        assert actual.predict_magnitude() == expected.predict_magnitude()
+        assert actual.fit_diagnostics == expected.fit_diagnostics
+
+    @pytest.mark.parametrize("point_input", [None, "ref", "tba"])
+    def test_estimate_error_structure__precoreg(
+        self,
+        curved_dem: xdem.DEM,
+        precoreg_case: tuple[xdem.coreg.AffineCoreg, str, bool],
+        point_input: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Checks that optional prealignment matches manual residual estimation."""
+
+        # 1/ Create inputs
+        # Add a vertical offset and noise to curved terrain
+        coreg_method, entrypoint, precoreg = precoreg_case
+        reference: Any = curved_dem
+        source: Any = reference.copy(
+            new_array=reference.data + 1 + np.random.default_rng(42).normal(0, 0.01, reference.shape)
         )
-        summary = xdem.uncertainty.propagate_uncertainty_coreg(
-            reference, aligned, fitted, error_structure=errors, method="analytical"
-        )
+        mask = reference.copy(new_array=np.indices(reference.shape)[0] < 14)
+        if point_input == "ref":
+            reference = reference.to_pointcloud()
+        elif point_input == "tba":
+            source = source.to_pointcloud()
+        original_source, original_reference = source.copy(), reference.copy()
 
-        # Check fitted uncertainties and zero uncertainty for inactive rotations
-        count = 3 if only_translation else 6
-        np.testing.assert_array_equal(summary.std.iloc[:count], fitted.meta["outputs"]["fitorbin"]["fit_perr"])
-        np.testing.assert_array_equal(summary.std.iloc[count:], 0)
-        np.testing.assert_allclose(summary.estimate.iloc[:3], fitted.to_translations())
-        assert summary.output["centroid"] == fitted.centroid()
-        assert type(summary) is xdem.uncertainty.PropagationSummary
-        assert summary.coregs is None
+        # 2/ Compare automatic and manual alignment
+        # Estimate constant independent errors from the selected residuals
+        options: dict[str, Any] = {
+            "predictors": {},
+            "mask": mask,
+            "components": {"measurement": {"magnitude": "constant", "correlation": None}},
+            "spread_estimator": np.std,
+            "random_state": 4,
+        }
+        aligned = source
+        if precoreg:
+            fitted = coreg_method.copy().fit(reference, source, inlier_mask=mask, random_state=4)
+            aligned = fitted.apply(source, resample=True)
+        else:
 
+            def fail_fit(*args: Any, **kwargs: Any) -> None:
+                """Fail if disabled prealignment attempts a fit."""
 
-class TestCoregistrationPropagation:
-    """Test module for simulating fitted coregistration parameters."""
+                pytest.fail("Disabled prealignment must not call fit().")
 
-    def test_propagate_uncertainty_coreg__parameters(self) -> None:
-        """Checks that coregistration propagation returns six parameter summaries and saved samples."""
+            monkeypatch.setattr(type(coreg_method), "fit", fail_fit)
+        expected = gu.ErrorStructure.estimate(aligned, other=reference, other_precision="negligible", **options)
 
-        # Load example DEMs and define independent errors
-        reference = xdem.DEM(xdem.examples.get_path_test("longyearbyen_ref_dem"))
-        source = xdem.DEM(xdem.examples.get_path_test("longyearbyen_tba_dem"))
-        structure = xdem.ErrorStructure([xdem.ErrorComponent("measurement", 0.5)])
-
-        # Run two simulations to estimate parameter uncertainty
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            summary = xdem.uncertainty.propagate_uncertainty_coreg(
-                reference,
-                source,
-                xdem.coreg.LZD(),
-                n_samples=2,
-                error_structure=structure,
-                random_state=5,
-                return_samples=True,
+        # Run the function, method or accessor with the same alignment options
+        if entrypoint == "function":
+            actual = xdem.uncertainty.estimate_error_structure(
+                source, reference, precoreg=precoreg, coreg_method=coreg_method, **options
             )
+        else:
+            target = source
+            if entrypoint == "accessor":
+                target = source.gdf.epc if point_input == "tba" else source.to_xarray().dem
+            actual = target.estimate_error_structure(reference, precoreg=precoreg, coreg_method=coreg_method, **options)
 
-        # Check six parameters and two sample rows
-        assert isinstance(summary.estimate, pd.Series)
-        assert isinstance(summary.mean, pd.Series)
-        assert isinstance(summary.std, pd.Series)
-        assert summary.estimate.shape == summary.mean.shape == summary.std.shape == (6,)
-        assert summary.samples is not None
-        assert summary.samples.shape == (2, 6)
-        assert "centroid" in summary.output
+        # 3/ Check estimates and unchanged inputs
+        assert actual.predict_magnitude() == pytest.approx(expected.predict_magnitude())
+        assert actual.fit_diagnostics == expected.fit_diagnostics
+        assert not coreg_method._fit_called
+        np.testing.assert_array_equal(source.data, original_source.data)
+        np.testing.assert_array_equal(reference.data, original_reference.data)
+        for elevation, original in ((source, original_source), (reference, original_reference)):
+            if isinstance(elevation, gu.Raster):
+                assert elevation.georeferenced_grid_equal(original)
+            else:
+                assert elevation.georeferenced_coords_equal(original)
+
+    @pytest.mark.parametrize("case", ["array", "terrain_predictors"])
+    def test_estimate_error_structure__precoreg_inputs(
+        self, curved_dem: xdem.DEM, coreg_method: xdem.coreg.AffineCoreg, case: str
+    ) -> None:
+        """Checks that array references and terrain predictors match manual alignment."""
+
+        # 1/ Prepare inputs and fitting options
+        # Create curved terrain with a vertical offset and measurement noise
+        reference = curved_dem
+        elevations = reference.data.copy()
+        source: Any = reference.copy(
+            new_array=elevations + 1 + np.random.default_rng(42).normal(0, 0.01, reference.shape)
+        )
+        other = reference.data if case == "array" else reference
+
+        # Use constant magnitudes except when checking terrain predictors after alignment
+        variable = case == "terrain_predictors"
+        options: dict[str, Any] = {
+            "components": {
+                "measurement": {"magnitude": "heteroscedastic" if variable else "constant", "correlation": None}
+            },
+            "spread_estimator": np.std,
+            "bins": 3,
+            "min_count": 10,
+            "random_state": 4,
+        }
+
+        # 2/ Compare automatic and manual estimation
+        # Derive the expected slope from the aligned DEM
+        fitted = coreg_method.copy().fit(reference, source, random_state=4)
+        aligned = fitted.apply(source, resample=True)
+        expected_predictors = {"slope": xdem.terrain.slope(aligned)} if variable else {}
+        expected = gu.ErrorStructure.estimate(
+            aligned, other=reference, other_precision="negligible", predictors=expected_predictors, **options
+        )
+        actual = xdem.uncertainty.estimate_error_structure(
+            source, other, coreg_method=coreg_method, predictors=("slope",) if variable else {}, **options
+        )
+
+        # Check the residual spread or grouped terrain statistics
+        if variable:
+            expected_magnitude = expected.components["measurement"].magnitude
+            actual_magnitude = actual.components["measurement"].magnitude
+            pd.testing.assert_frame_equal(actual_magnitude.grouped_statistics, expected_magnitude.grouped_statistics)
+        else:
+            assert actual.predict_magnitude() == pytest.approx(expected.predict_magnitude())
+        assert actual.fit_diagnostics == expected.fit_diagnostics
+
+
+class TestPropagation:
+    """Test module for coregistration dispatch and workflows in propagate_uncertainty()."""
 
     @pytest.mark.parametrize("point_input", [None, "ref", "tba"])
     @pytest.mark.parametrize("error_applied_to", ["ref", "tba"])
-    @pytest.mark.parametrize("precoreg", [False, True])
     def test_propagate_uncertainty_coreg__reproducibility(
-        self, point_input: str | None, error_applied_to: Literal["ref", "tba"], precoreg: bool
+        self,
+        curved_dem: xdem.DEM,
+        coreg_method: xdem.coreg.AffineCoreg,
+        point_input: str | None,
+        error_applied_to: Literal["ref", "tba"],
     ) -> None:
-        """Checks that repeated coregistration simulations match across input types and initial alignments."""
+        """Checks that repeated coregistration simulations match across raster and point inputs."""
 
         # 1/ Prepare inputs
         # Create a vertical offset with raster or point inputs
-        elevations = np.arange(48.0).reshape(6, 8)
-        transform = Affine(10, 0, 0, 0, -10, 60)
-        reference: Any = xdem.DEM(gu.Raster.from_array(elevations, transform, 32632))
+        reference: Any = curved_dem
         source: Any = reference + 5
         if point_input == "ref":
             reference = reference.to_pointcloud()
@@ -415,39 +492,26 @@ class TestCoregistrationPropagation:
         # Copy inputs to check for changes after fitting
         original_reference = reference.data.copy()
         original_source = source.data.copy()
-        method = xdem.coreg.VerticalShift(vshift_reduc_func=np.mean)
-        structure = xdem.ErrorStructure([xdem.ErrorComponent("measurement", 0.2)])
+        method = coreg_method
+        # Small errors let repeated rigid fits converge within the local linear approximation
+        structure = xdem.ErrorStructure([xdem.ErrorComponent("measurement", 0.001)])
 
         # 2/ Run twice with the same seed
-        result = xdem.uncertainty.propagate_uncertainty(
-            source,
-            "coreg",
-            error_structure=structure,
-            n_samples=3,
-            random_state=4,
-            return_samples=True,
-            return_coregs=True,
-            inputs={"coreg": {"reference_elev": reference}},
-            operation_options={
-                "coreg_method": method,
-                "error_applied_to": error_applied_to,
-                "precoreg": precoreg,
-            },
-        )
-        repeated = xdem.uncertainty.propagate_uncertainty(
-            source,
-            "coreg",
-            error_structure=structure,
-            n_samples=3,
-            random_state=4,
-            return_samples=True,
-            return_coregs=True,
-            inputs={"coreg": {"reference_elev": reference}},
-            operation_options={
-                "coreg_method": method,
-                "error_applied_to": error_applied_to,
-                "precoreg": precoreg,
-            },
+        result, repeated = (
+            xdem.uncertainty.propagate_uncertainty(
+                source,
+                "coreg",
+                error_structure={error_applied_to: structure},
+                n_samples=3,
+                random_state=4,
+                return_samples=True,
+                return_coregs=True,
+                inputs={"coreg": {"reference_elev": reference}},
+                operation_options={
+                    "coreg_method": method,
+                },
+            )
+            for _ in range(2)
         )
         assert isinstance(result.estimate, pd.Series)
         assert isinstance(result.mean, pd.Series)
@@ -457,10 +521,9 @@ class TestCoregistrationPropagation:
         assert isinstance(repeated.std, pd.Series)
 
         # 3/ Compare results
-        # Initial alignment removes the original vertical shift
-        expected_nominal_shift = 0 if precoreg else -5
-        assert result.estimate["tz"] == pytest.approx(expected_nominal_shift)
-        assert result.mean["tz"] == pytest.approx(expected_nominal_shift, abs=0.1)
+        # Allow numerical fitting tolerance on the known vertical offset
+        assert result.estimate["tz"] == pytest.approx(-5, abs=1e-4)
+        assert result.mean["tz"] == pytest.approx(-5, abs=0.1)
         assert "centroid" in result.output
 
         # Check equal means and uncertainties
@@ -486,72 +549,155 @@ class TestCoregistrationPropagation:
         np.testing.assert_array_equal(reference.data, original_reference)
         np.testing.assert_array_equal(source.data, original_source)
 
-    @pytest.mark.parametrize("input_kind", ["raster", "pointcloud"])
     @pytest.mark.parametrize("error_applied_to", ["ref", "tba"])
-    def test_propagate_uncertainty_coreg__xarray(
-        self, input_kind: str, error_applied_to: Literal["ref", "tba"]
+    def test_coregistration_uncertainty_workflow(
+        self, curved_dem: xdem.DEM, coreg_method: xdem.coreg.AffineCoreg, error_applied_to: Literal["ref", "tba"]
     ) -> None:
-        """Checks that Dataset variables and native inputs give the same LZD uncertainty."""
+        """Checks that errors estimated after alignment give uncertainty on the original transformation."""
 
-        # 1/ Prepare inputs
-        # Create curved terrain to constrain all translations
-        rows, columns = np.mgrid[:15, :17]
-        values = 5 * np.sin(columns / 7) + 3 * np.cos(rows / 6) + 2 * np.sin((columns + rows) / 11)
-        transform = Affine(1, 0, 500_000, 0, -1, 7_000_000)
-        reference = xdem.DEM(gu.Raster.from_array(values, transform, 32632))
-        source = reference + 1
-        if input_kind == "pointcloud":
-            source = source.to_pointcloud()
-        errors = xdem.ErrorStructure([xdem.ErrorComponent("measurement", 0.01)])
-        coreg_method = xdem.coreg.LZD(
-            only_translation=True, subsample=1, tolerance_translation=1e-6, tolerance_rotation=None
+        # 1/ Fit and estimate errors
+        # Create curved terrain with a vertical offset and measurement noise
+        reference = curved_dem
+        elevations = reference.data.copy()
+        # Small errors let repeated rigid fits converge within the local linear approximation
+        noise = np.random.default_rng(42).normal(0, 0.001, reference.shape)
+        source = reference.copy(new_array=elevations + 1 + noise)
+
+        # Estimate independent errors from aligned residuals on the selected dataset
+        fitted = coreg_method.copy().fit(reference, source, random_state=42)
+        aligned = fitted.apply(source, resample=True)
+        uncertain, other = (reference, aligned) if error_applied_to == "ref" else (aligned, reference)
+        errors = xdem.uncertainty.estimate_error_structure(
+            uncertain,
+            other=other,
+            predictors={},
+            components={"measurement": {"magnitude": "constant", "correlation": None}},
+            spread_estimator=np.std,
+            precoreg=False,
         )
 
-        # Create a Dataset with separate raster and point coordinates
-        source_array = source.to_xarray()
-        if input_kind == "pointcloud":
-            source_array = source_array.rename({"x": "x_point", "y": "y_point"})
-        dataset = xr.Dataset({"reference": reference.to_xarray(), "elevation": source_array})
-        original = dataset.copy(deep=True)
-        options: dict[str, Any] = dict(
-            error_structure=errors,
-            method="numerical",
-            error_applied_to=error_applied_to,
-            random_state=2,
-            n_samples=3,
-            return_samples=True,
+        # Check magnitude against finite residuals, excluding borders masked during resampling
+        residuals = (aligned - reference).data.compressed()
+        assert errors.predict_magnitude() == pytest.approx(np.std(residuals))
+        assert errors.predict_magnitude() > 0
+
+        # 2/ Propagate on the original pair
+        options: dict[str, Any] = {
+            "error_structure": {error_applied_to: errors},
+            "n_samples": 3,
+            "random_state": 42,
+            "return_samples": True,
+            "return_coregs": True,
+        }
+        direct = xdem.uncertainty.propagate_uncertainty_coreg(reference, source, coreg_method, **options)
+        generic = xdem.uncertainty.propagate_uncertainty(
+            source,
+            "coreg",
+            inputs={"coreg": {"reference_elev": reference}},
+            operation_options={"coreg_method": coreg_method},
+            **options,
         )
 
-        # 2/ Run and compare outputs
-        # Run propagation on native inputs and Dataset variables
-        expected = xdem.uncertainty.propagate_uncertainty_coreg(reference, source, coreg_method, **options)
-        actual = xdem.uncertainty.propagate_uncertainty_coreg(
-            dataset["reference"], dataset["elevation"], coreg_method, **options
-        )
+        # 3/ Compare results
+        # The estimate describes the original offset and both entry points give the same simulations
+        assert direct.estimate["tz"] == pytest.approx(-1, abs=0.05)
+        assert direct.n_success == generic.n_success == 3
+        assert direct.error_structure[error_applied_to] is errors
+        assert np.isfinite(direct.std).all()
+        assert direct.std["tz"] > 0
+        pd.testing.assert_series_equal(direct.estimate, generic.estimate)
+        pd.testing.assert_series_equal(direct.mean, generic.mean)
+        pd.testing.assert_series_equal(direct.std, generic.std)
+        assert direct.samples is not None and generic.samples is not None
+        pd.testing.assert_frame_equal(direct.samples, generic.samples)
 
-        # Check equal summaries and samples
-        pd.testing.assert_series_equal(actual.mean, expected.mean)
-        pd.testing.assert_series_equal(actual.std, expected.std)
-        assert actual.samples is not None and expected.samples is not None
-        pd.testing.assert_frame_equal(actual.samples, expected.samples)
-
-        # Check unchanged inputs
-        xr.testing.assert_identical(dataset, original)
+        # Check unchanged method and input elevations
         assert not coreg_method._fit_called
+        np.testing.assert_array_equal(reference.data, elevations)
+        np.testing.assert_array_equal(source.data, elevations + 1 + noise)
 
 
 class TestElevationErrorEstimationChunked:
     """Test module for elevation error estimation with Dask and multiprocessing."""
 
-    @pytest.mark.parametrize(
-        "backend",
-        [
-            pytest.param("dask", marks=pytest.mark.skipif(find_spec("dask") is None, reason="Requires Dask")),
-            "multiproc",
-        ],
-    )
+    @pytest.mark.parametrize("backend", ["dask", "multiproc"])
+    def test_estimate_error_structure__proxy(self, backend: str, tmp_path: Path) -> None:
+        """Checks that lazy and file proxies match eager estimation without loading their inputs."""
+
+        if backend == "dask":
+            pytest.importorskip("dask")
+
+        # 1/ Create a proxy and expected spread
+        values = np.arange(63.0).reshape(7, 9)
+        proxy = xdem.DEM.from_array(values, Affine(2, 0, 0, 0, -2, 14), 32632, nodata=-9999)
+        options: dict[str, Any] = {
+            "components": {"measurement": {"magnitude": "constant", "correlation": None}},
+            "spread_estimator": np.std,
+        }
+        expected = proxy.estimate_error_structure(**options)
+
+        # Split into 3 x 4 tiles with shorter final rows and columns
+        if backend == "dask":
+            source = proxy.to_xarray().chunk({"y": 3, "x": 4})
+            graph = source.data
+            mp_config = None
+            assert not source.rst.is_loaded
+        else:
+            path = tmp_path / "proxy.tif"
+            proxy.to_file(path)
+            source = xdem.DEM(path)
+            mp_config = MultiprocConfig(chunks=(3, 4))
+            assert not source.is_loaded
+
+        # 2/ Estimate without loading the original proxy
+        actual = xdem.uncertainty.estimate_error_structure(source=source, mp_config=mp_config, **options)
+        assert type(actual) is gu.ErrorStructure
+
+        # Allow rounding from reductions across chunks
+        assert actual.predict_magnitude() == pytest.approx(expected.predict_magnitude(), rel=0, abs=1e-12)
+        if backend == "dask":
+            assert source.data is graph
+            assert not source.rst.is_loaded
+        else:
+            assert not source.is_loaded
+        assert proxy.is_loaded
+
+    def test_estimate_error_structure__point_proxy(self) -> None:
+        """Checks that a lazy point proxy matches eager estimation and preserves its graph."""
+
+        dask_geopandas = pytest.importorskip("dask_geopandas")
+
+        from xdem.epc.pd_accessor import _register_dask_epc_accessor
+
+        # Create errors at 35 point locations
+        values = np.linspace(-1, 1, 35)
+        source = xdem.EPC(gu.PointCloud.from_xyz(np.arange(35), np.zeros(35), values, crs=32632))
+        options: dict[str, Any] = {
+            "components": {"measurement": {"magnitude": "constant", "correlation": None}},
+            "spread_estimator": np.std,
+        }
+        expected = source.estimate_error_structure(**options)
+
+        # Split points into three uneven partitions to check that no rows are dropped
+        _register_dask_epc_accessor()
+        lazy = dask_geopandas.from_geopandas(source.gdf, npartitions=3, sort=False)
+        graph = lazy.expr
+        assert not lazy.epc.is_loaded
+
+        # Estimate the proxy with no comparison dataset or prealignment opt-out
+        actual = lazy.epc.estimate_error_structure(**options)
+
+        # Allow rounding from reductions across partitions
+        assert actual.predict_magnitude() == pytest.approx(expected.predict_magnitude(), rel=0, abs=1e-12)
+        assert lazy.expr is graph and not lazy.epc.is_loaded
+        assert source.is_loaded
+
+    @pytest.mark.parametrize("backend", ["dask", "multiproc"])
     def test_estimate_error_structure__terrain_predictors(self, backend: str, tmp_path: Path) -> None:
         """Checks that Dask/MP terrain predictors give the same grouped statistics as in-memory inputs."""
+
+        if backend == "dask":
+            pytest.importorskip("dask")
 
         # 1/ Create inputs and expected result
         # Create curved terrain with random errors
@@ -571,7 +717,7 @@ class TestElevationErrorEstimationChunked:
             "random_state": 4,
         }
 
-        expected = source.estimate_error_structure(reference, **options)
+        expected = source.estimate_error_structure(reference, precoreg=False, **options)
 
         # 2/ Run Dask or MP estimation
         if backend == "dask":
@@ -595,7 +741,7 @@ class TestElevationErrorEstimationChunked:
 
         # Estimate from slope and curvature without loading either input
         result = xdem.uncertainty.estimate_error_structure(
-            chunked_source, chunked_reference, mp_config=mp_config, **options
+            chunked_source, chunked_reference, mp_config=mp_config, precoreg=False, **options
         )
         source_loaded = chunked_source.rst.is_loaded if backend == "dask" else chunked_source.is_loaded
         reference_loaded = chunked_reference.rst.is_loaded if backend == "dask" else chunked_reference.is_loaded
@@ -615,11 +761,10 @@ class TestElevationErrorEstimationChunked:
             magnitude.grouped_statistics, eager_magnitude.grouped_statistics, check_exact=False, rtol=0, atol=1e-12
         )
 
-    @pytest.mark.skipif(find_spec("dask_geopandas") is None, reason="Requires Dask-GeoPandas")
     def test_estimate_error_structure__point_raster(self) -> None:
         """Checks that a Dask EPC matches in-memory estimation against a DEM and stays lazy."""
 
-        import dask_geopandas
+        dask_geopandas = pytest.importorskip("dask_geopandas")
 
         from xdem.epc.pd_accessor import _register_dask_epc_accessor
 
@@ -642,8 +787,8 @@ class TestElevationErrorEstimationChunked:
         assert not lazy.epc.is_loaded
 
         # Run in-memory and Dask estimation
-        expected = source.estimate_error_structure(reference, **options)
-        actual = lazy.epc.estimate_error_structure(reference, **options)
+        expected = source.estimate_error_structure(reference, precoreg=False, **options)
+        actual = lazy.epc.estimate_error_structure(reference, precoreg=False, **options)
 
         # Allow rounding from reductions across partitions
         assert isinstance(actual, gu.ErrorStructure)
@@ -657,6 +802,19 @@ class TestElevationErrorEstimationChunked:
 class TestElevationErrorEstimationErrors:
     """Test module for grid validation during error estimation."""
 
+    @pytest.mark.parametrize("predictors", [("slope",), {"slope": "slope"}])
+    def test_estimate_error_structure__error_proxy_predictors(self, predictors: Any) -> None:
+        """Checks an error is raised for terrain attribute names supplied without elevations."""
+
+        # Create a proxy whose values describe errors, not terrain
+        proxy = xdem.DEM.from_array(np.ones((5, 7)), Affine(2, 0, 0, 0, -2, 10), 32632, nodata=-9999)
+
+        # Require predictor values derived from actual elevations
+        with pytest.raises(
+            ValueError, match="Terrain predictors for an error proxy must be supplied as arrays or rasters"
+        ):
+            proxy.estimate_error_structure(predictors=predictors)
+
     def test_estimate_error_structure__error_mismatched_grids(self) -> None:
         """Checks an error is raised for mismatched grids when alignment is disabled."""
 
@@ -668,64 +826,39 @@ class TestElevationErrorEstimationErrors:
 
         # Check the error with alignment disabled
         with pytest.raises(ValueError, match="does not share the selected support grid"):
-            source.estimate_error_structure(other=reference, predictors={}, align="raise")
+            source.estimate_error_structure(other=reference, predictors={}, align="raise", precoreg=False)
+
+    def test_estimate_error_structure__error_coreg_method(self) -> None:
+        """Checks an error is raised for a coregistration method that is not a Coreg instance."""
+
+        # Create a raster and supply an invalid method
+        source = xdem.DEM.from_array(np.ones((5, 7)), Affine(2, 0, 0, 0, -2, 10), 32632, nodata=-9999)
+        options: dict[str, Any] = {"coreg_method": "NuthKaab"}
+
+        # Check the method type
+        with pytest.raises(TypeError, match="coreg_method must be a Coreg instance or None"):
+            xdem.uncertainty.estimate_error_structure(source, source, **options)
+
+    def test_estimate_error_structure__error_lazy_precoreg(self) -> None:
+        """Checks an error is raised for prealignment of lazy inputs without computing them."""
+
+        pytest.importorskip("dask")
+
+        # Split a raster into uneven chunks and preserve its lazy array
+        source = xdem.DEM.from_array(np.ones((9, 11)), Affine(2, 0, 0, 0, -2, 18), 32632, nodata=-9999)
+        lazy = source.to_xarray().chunk({"x": 4, "y": 5})
+        values = lazy.data
+        assert not lazy.rst.is_loaded
+
+        # Prealignment requires eager data, so fail before any Dask tasks run
+        with pytest.raises(NotImplementedError, match="Dask coregistration"):
+            xdem.uncertainty.estimate_error_structure(lazy, source)
+        assert lazy.data is values
+        assert not lazy.rst.is_loaded
 
 
 class TestPropagationErrors:
     """Test module for unsupported analytical fits and explicit numerical sample selection."""
-
-    def test_propagate_uncertainty_coreg__error_analytical_coregs(self) -> None:
-        """Checks an error is raised for simulated Coregs requested with analytical propagation."""
-
-        # Create an error model
-        errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.1)])
-        method = xdem.coreg.VerticalShift()
-
-        # Check analytical propagation cannot return simulated Coregs
-        with pytest.raises(ValueError, match="Analytical propagation cannot return simulated Coreg objects"):
-            xdem.uncertainty.propagate_uncertainty_coreg(
-                None, None, method, error_structure=errors, method="analytical", return_coregs=True
-            )
-
-    def test_propagate_uncertainty_coreg__error_failed_draw(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Checks that saved Coregs have the correct simulation numbers after a failed draw."""
-
-        # Create a vertical offset and fail the first error draw
-        reference = gu.Raster.from_array(np.arange(48, dtype=float).reshape(6, 8), Affine(2, 0, 0, 0, -2, 12), 32632)
-        errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.2)])
-        generate = gu.ErrorStructure.generate_random_field
-        draws = iter([False, True, True])
-
-        def draw(self: gu.ErrorStructure, *args: Any, **kwargs: Any) -> Any:
-            """Fail the first draw and generate the remaining error fields normally."""
-
-            if not next(draws):
-                raise RuntimeError("failed draw")
-            return generate(self, *args, **kwargs)
-
-        # Run simulations and check the failure warning
-        monkeypatch.setattr(gu.ErrorStructure, "generate_random_field", draw)
-        with pytest.warns(UserWarning, match="failed draw"):
-            summary = xdem.uncertainty.propagate_uncertainty_coreg(
-                reference,
-                reference + 5,
-                xdem.coreg.VerticalShift(vshift_reduc_func=np.mean),
-                error_structure=errors,
-                n_samples=3,
-                random_state=2,
-                return_coregs=True,
-                return_samples=True,
-            )
-
-        # Check the failed draw and saved fits
-        assert summary.failures == {1: "failed draw"}
-        assert summary.n_success == 2
-        assert summary.coregs is not None
-        assert list(summary.coregs) == [2, 3]
-        assert summary.samples is not None
-        assert summary.samples.loc[1].isna().all()
-        for number, fitted in summary.coregs.items():
-            assert fitted.to_matrix()[2, 3] == summary.samples.loc[number, "tz"]
 
     @pytest.mark.parametrize("with_source", [False, True])
     def test_propagate_uncertainty__error_custom_analytical(self, with_source: bool, tmp_path: Path) -> None:
@@ -755,25 +888,6 @@ class TestPropagationErrors:
         if source is not None:
             assert not source.is_loaded
 
-    def test_propagate_uncertainty_coreg__error_ols(self) -> None:
-        """Checks an error is raised for analytical coregistration without GLS/TLS fit uncertainties."""
-
-        # Create curved terrain for LZD
-        rows, columns = np.indices((9, 11))
-        values = np.sin(columns / 2) + np.cos(rows / 3)
-        raster = gu.Raster.from_array(values, Affine(2, 0, 0, 0, -2, 18), 32632)
-        errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.1)])
-
-        # Check OLS cannot provide analytical fit uncertainty
-        with pytest.raises(ValueError, match="GLS/TLS uncertainties"):
-            xdem.uncertainty.propagate_uncertainty_coreg(
-                raster,
-                raster + 1,
-                xdem.coreg.LZD(only_translation=True, subsample=1),
-                error_structure=errors,
-                method="analytical",
-            )
-
     def test_propagate_uncertainty__error_sample_selection(self) -> None:
         """Checks an error is raised when raster simulation draws are requested without selecting pixels."""
 
@@ -784,60 +898,3 @@ class TestPropagationErrors:
         # Check saving samples requires selected pixels
         with pytest.raises(ValueError, match="Select outputs with at"):
             xdem.uncertainty.propagate_uncertainty(raster, error_structure=errors, return_samples=True)
-
-
-class TestCoregistrationPropagationErrors:
-    """Test module for failed coregistration fits during uncertainty propagation."""
-
-    def test_propagate_uncertainty_coreg__error_failed_fit(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Checks that failed fits are recorded and excluded from parameter summaries."""
-
-        # 1/ Prepare a fitting failure
-        # Create flat terrain for a vertical shift
-        reference = xdem.DEM(gu.Raster.from_array(np.ones((4, 5)), Affine(1, 0, 0, 0, -1, 4), 32632))
-        method = xdem.coreg.VerticalShift()
-        structure = xdem.ErrorStructure([xdem.ErrorComponent("measurement", 0.2)])
-
-        # Fail the first simulation after the original fit
-        original_fit = xdem.coreg.VerticalShift.fit
-        calls = iter([True, False, True, True])
-
-        def fit(self: Any, *args: Any, **kwargs: Any) -> Any:
-            """Fail the selected fit and otherwise use the original coregistration method."""
-
-            if not next(calls):
-                raise RuntimeError("failed fit")
-            return original_fit(self, *args, **kwargs)
-
-        # 2/ Run simulations
-        # Check the fitting failure emits a warning
-        monkeypatch.setattr(xdem.coreg.VerticalShift, "fit", fit)
-        with pytest.warns(UserWarning, match="failed fit"):
-            summary = xdem.uncertainty.propagate_uncertainty_coreg(
-                reference,
-                reference + 5,
-                method,
-                error_structure=structure,
-                n_samples=3,
-                random_state=4,
-                return_samples=True,
-                return_coregs=True,
-            )
-
-        # 3/ Check successful fits and samples
-        # Check counts and missing samples for the failed fit
-        assert summary.n_samples == 3
-        assert summary.n_success == 2
-        assert summary.failures == {1: "failed fit"}
-        assert summary.samples is not None
-        assert summary.samples.index.tolist() == [1, 2, 3]
-        assert summary.samples.loc[1].isna().all()
-
-        # Compare saved Coregs with successful samples
-        assert summary.coregs is not None
-        assert list(summary.coregs) == [2, 3]
-        for number, fitted in summary.coregs.items():
-            assert fitted.to_matrix()[2, 3] == summary.samples.loc[number, "tz"]
-
-        # Check uncertainty from successful fits
-        np.testing.assert_allclose(summary.std, summary.samples.std())

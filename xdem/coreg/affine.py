@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import Any, Callable, Iterable, Literal, TypedDict, TypeVar
+from collections.abc import Mapping
+from typing import Any, Callable, Iterable, Literal, Sequence, TypedDict, TypeVar
 
 import affine
 import geopandas as gpd
+import geoutils as gu
 import numpy as np
 import pandas as pd
 import rasterio as rio
@@ -36,6 +38,11 @@ from geoutils._typing import Number
 from geoutils.interface.resampling import _interp_points_base
 from geoutils.raster.referencing import _coords, _res
 from geoutils.stats import nmad
+from geoutils.uncertainty.error_structure import (
+    _prepare_source_errors,
+    _source_covariance_matrix,
+)
+from numpy.typing import NDArray
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as Rot
 
@@ -63,15 +70,8 @@ from xdem.coreg.base import (
 )
 from xdem.fit import _check_fit_rank, index_trimmed
 
-_LzdInterpolator = Callable[[tuple[NDArrayf, NDArrayf]], NDArrayf]
 _CorrelationModel = tuple[Callable[..., NDArrayf], float]
-_LzdErrorInterpolators = tuple[
-    _LzdInterpolator | None,
-    _CorrelationModel | None,
-    _LzdInterpolator | None,
-    _CorrelationModel | None,
-]
-_LzdSampledErrors = tuple[NDArrayf | None, _CorrelationModel | None, NDArrayf | None, _CorrelationModel | None]
+_SampledErrors = tuple[NDArrayf | None, _CorrelationModel | None, NDArrayf | None, _CorrelationModel | None]
 
 ######################################
 # Generic functions for affine methods
@@ -410,19 +410,23 @@ def _get_centroid_scale(
     # For a DEM
     if isinstance(ref_elev, np.ndarray):
 
-        # Get coordinates of DEM
-        coords_x, coords_y = _coords(transform=transform, shape=ref_elev.shape, area_or_point=None, grid=False)
-        # Derive centroid
-        centroid_x = np.nanmedian(coords_x)
-        centroid_y = np.nanmedian(coords_y)
+        # Derive centroid from the middle of the grid
+        assert transform is not None
+        centroid_x, centroid_y = transform * (
+            (ref_elev.shape[1] - 1) / 2,
+            (ref_elev.shape[0] - 1) / 2,
+        )
         if np.ma.isMaskedArray(ref_elev):
             centroid_z = np.ma.median(ref_elev)
         else:
             centroid_z = np.nanmedian(ref_elev)
         centroid = (centroid_x, centroid_y, centroid_z)
 
-        # Derive standardization factor
-        std_fac = np.mean([nmad(coords_x - centroid[0]), nmad(coords_y - centroid[1]), nmad(ref_elev - centroid[2])])
+        # Derive standardization factor along the pixel axes without building coordinate grids
+        # (and accounting for possible rotated grids)
+        column_distances = np.arange(ref_elev.shape[1]) * np.hypot(transform.a, transform.d)
+        row_distances = np.arange(ref_elev.shape[0]) * np.hypot(transform.b, transform.e)
+        std_fac = np.mean([nmad(column_distances), nmad(row_distances), nmad(ref_elev - centroid[2])])
 
     # For an elevation point cloud
     else:
@@ -505,26 +509,14 @@ def _dem_normals_curvature(
     This helper is meant to be used consistently by both ICP ("point-to-plane") and CPD (LSG variant),
     so that "fixed surface" geometry is derived the same way across methods.
 
-    Notes
-    -----
-    - Normals are derived from the height field z(x, y) using:
-          n ∝ (-dz/dx, -dz/dy, 1)
-      then normalized to unit length.
-    - Curvature is an optional, lightweight proxy derived from the Hessian magnitude:
-          curvature ≈ ||[d²z/dx², d²z/dy²]||
-      scaled by pixel size so it has comparable behavior across resolutions.
-      This is not a differential-geometry "true curvature", but it is a stable surface-variation indicator
-      suitable to modulate planarity weights (as in LSG-CPD).
+    Normals are derived from the height field z(x, y) using (-dz/dx, -dz/dy, 1) normalized to unit length.
 
     :param dem: DEM array.
     :param transform: Affine transform of DEM.
     :param return_curvature: Whether to derive and return a curvature-like proxy.
 
-    :return: Dictionary of DEM-derived rasters:
-        - nx: East component of unit normal.
-        - ny: North component of unit normal.
-        - nz: Up component of unit normal.
-        - curvature: Curvature proxy (if return_curvature=True).
+    :return: Dictionary of rasters: nx (east component of unit normal), ny (north), nz (up), and curvature (if
+        return_curvature=True)
     """
     # Get resolution
     res_x, res_y = _res(transform)
@@ -535,8 +527,9 @@ def _dem_normals_curvature(
 
     # 1) First derivatives (dz/dx, dz/dy) in map units (need to scale per resolution)
     dz_drow, dz_dcol = np.gradient(dem.astype(float), edge_order=1)
-    dz_dx = dz_dcol / res_x
-    dz_dy = -dz_drow / res_y
+    inverse = ~transform
+    dz_dx = inverse.a * dz_dcol + inverse.d * dz_drow
+    dz_dy = inverse.b * dz_dcol + inverse.e * dz_drow
 
     # 2) Unit normals: (-dz/dx, -dz/dy, 1)
     nx = -dz_dx
@@ -560,8 +553,6 @@ def _dem_normals_curvature(
         # Convert to map-coordinate second derivatives
         d2z_dx2 = d2z_dcol2 / (res_x * res_x)
         d2z_dy2 = d2z_drow2 / (res_y * res_y)
-
-        # Raw (units ~ 1/length): magnitude of principal second derivatives
         curv_raw = np.sqrt(d2z_dx2 * d2z_dx2 + d2z_dy2 * d2z_dy2)
         curv_raw = np.clip(curv_raw, np.finfo(float).eps, None)
 
@@ -569,12 +560,12 @@ def _dem_normals_curvature(
         pix = float(np.sqrt(res_x * res_y))
         curv_dimless = curv_raw * pix
 
-        # Map to (0, 1) with a robust scale c0 (median is a good default)
+        # Map to (0, 1) with a robust scale
         c0 = float(np.nanmedian(curv_dimless))
         c0 = max(c0, float(np.finfo(float).eps))
         curvature = curv_dimless / (curv_dimless + c0)
 
-        # Final clip so 1/curvature is well-behaved
+        # Final clip (so that 1/curvature is well-behaved)
         curvature = np.clip(curvature, 1e-12, 1.0)
 
         out["curv"] = curvature
@@ -591,7 +582,7 @@ def _epc_normals_curvature(points: NDArrayf, neighbours: int) -> tuple[NDArrayf,
     :return: normals (M,3) unit, curvature (M,) = smallest_eig / sum_eigs.
     """
     Y = np.asarray(points, dtype=float)
-    k = max(int(neighbours), 3)
+    k = min(max(int(neighbours), 3), len(Y) - 1)
 
     tree = cKDTree(Y)
     _, idx = tree.query(Y, k=k + 1)  # includes itself
@@ -658,6 +649,953 @@ def _axis_weights_from_epc(
         raise ValueError("anisotropic must be None, 'xy_vs_z', or 'per_axis'.")
 
     return w.astype(float)
+
+
+###########################################
+# Shared helpers for error propagation
+###########################################
+
+
+def _coreg_error_inputs(
+    error_structure: gu.ErrorStructure | Mapping[str, gu.ErrorStructure] | None,
+    error_predictors: Mapping[str, Mapping[str, Any]] | None,
+) -> tuple[dict[str, gu.ErrorStructure], dict[str, Mapping[str, Any]]]:
+    """Check error inputs, before analytical propagation."""
+
+    #  By default, a single error structure is associated to "tba"
+    models = {"tba": error_structure} if isinstance(error_structure, gu.ErrorStructure) else error_structure
+    if models is not None and (not isinstance(models, Mapping) or not models):
+        raise TypeError("error_structure must be an ErrorStructure or a nonempty mapping keyed by 'ref' and 'tba'.")
+    models = dict(models or {})
+    if set(models) - {"ref", "tba"}:
+        raise ValueError("error_structure keys must be 'ref' or 'tba'.")
+    if any(not isinstance(model, gu.ErrorStructure) for model in models.values()):
+        raise TypeError("Each error_structure value must be an ErrorStructure.")
+
+    # Coregistration error models use horizontal coordinates
+    for model in models.values():
+        for component in model.components.values():
+            dimensions = None if component.correlation is None else component.correlation.active_dims
+            if dimensions is not None and max(dimensions) >= 2:
+                raise ValueError("Coregistration error correlations require X/Y coordinates.")
+
+    # Predictors must also be a dictionary with "ref"/"tba"
+    if error_predictors is not None and not isinstance(error_predictors, Mapping):
+        raise TypeError("error_predictors must be a mapping keyed by 'ref' and 'tba'.")
+    predictors = dict(error_predictors or {})
+    if set(predictors) - set(models):
+        raise ValueError("error_predictors keys must name inputs in error_structure.")
+    if any(not isinstance(values, Mapping) for values in predictors.values()):
+        raise TypeError("Each error_predictors value must be a mapping of predictor names to values.")
+    return models, predictors
+
+
+def _transform_parameter_covariance(
+    matrix: NDArrayf,
+    covariance: NDArrayf,
+    *,
+    local_increments: bool = False,
+    invert_output: bool = False,
+) -> NDArrayf:
+    """
+    Convert the final matrix covariance into 6-parameter translations and Euler angles.
+
+    Translations use coordinate units and rotations use radians. With local_increments=True, covariance describes
+    increments applied on the left of matrix and the result has shape (6, 6). Otherwise, covariance describes
+    the translations and Euler angles of matrix and its shape is unchanged. Set invert_output=True when the
+    reported matrix is inverted to restore the original reference/moving order.
+    """
+
+    if not local_increments and not invert_output:
+        return covariance
+    count = len(covariance)
+
+    # Convert local increments using centered differences around the fitted transform
+    if local_increments:
+        jacobian = np.empty((6, count))
+        step = 1e-6
+        for column in range(count):
+            delta = np.zeros(6)
+            delta[column] = step
+            tx, ty, tz, rx, ry, rz = delta
+            plus = matrix_from_translations_rotations(tx, ty, tz, rx, ry, rz, use_degrees=False) @ matrix
+            minus = matrix_from_translations_rotations(-tx, -ty, -tz, -rx, -ry, -rz, use_degrees=False) @ matrix
+            if invert_output:
+                plus, minus = invert_matrix(plus), invert_matrix(minus)
+            positive = np.asarray(translations_rotations_from_matrix(plus, return_degrees=False))
+            negative = np.asarray(translations_rotations_from_matrix(minus, return_degrees=False))
+            jacobian[:, column] = (positive - negative) / (2 * step)
+
+    # Convert fitted translations and Euler angles when the output transform is inverted
+    else:
+        beta = np.asarray(translations_rotations_from_matrix(matrix, return_degrees=False))[:count]
+        baseline = np.asarray(translations_rotations_from_matrix(invert_matrix(matrix), return_degrees=False))[:count]
+        jacobian = np.empty((count, count))
+        for column in range(count):
+            step = 1e-6 if column < 3 else 1e-7
+            moved = beta.copy()
+            moved[column] += step
+            inverse = invert_matrix(matrix_from_translations_rotations(*moved, use_degrees=False))  # type: ignore
+            inverted = np.asarray(translations_rotations_from_matrix(inverse, return_degrees=False))[:count]
+            jacobian[:, column] = (inverted - baseline) / step
+
+    # Combine parameter changes with the fitted covariance
+    return jacobian @ covariance @ jacobian.T
+
+
+def _propagate_sampled_covariance(
+    coordinates: NDArrayf,
+    jacobian: NDArrayf,
+    error_structure: gu.ErrorStructure,
+    predictors: Mapping[str, Any] | None = None,
+    gradient_jacobians: tuple[NDArrayf, NDArrayf] | None = None,
+    pixel_size: float | tuple[float, float] = 1.0,
+) -> NDArrayf:
+    """
+    Propagate error structure to the result.
+
+    The Jacobian describes how the fitted parameters change with each observation. Gradient errors use centered
+    differences of the model elevation errors at offsets of pixel_size.
+    We evaluate the covariance in blocks of at most 512 observations to limit RAM usage.
+    """
+
+    # Express gradient errors as differences of the same spatial error field
+    if gradient_jacobians is not None:
+        spacing_x, spacing_y = pixel_size if isinstance(pixel_size, tuple) else (pixel_size, pixel_size)
+        if not np.all(np.isfinite((spacing_x, spacing_y))) or min(spacing_x, spacing_y) <= 0:
+            raise ValueError("Gradient spacing must be finite and positive.")
+        offsets = np.array([[0, 0], [spacing_x, 0], [-spacing_x, 0], [0, spacing_y], [0, -spacing_y]])
+        coordinates = np.concatenate([coordinates + offset for offset in offsets])
+        gx, gy = gradient_jacobians
+        jacobian = np.column_stack(
+            (jacobian, gx / (2 * spacing_x), -gx / (2 * spacing_x), gy / (2 * spacing_y), -gy / (2 * spacing_y))
+        )
+        predictors = {
+            name: np.tile(values, 5) if np.ndim(values) else values for name, values in (predictors or {}).items()
+        }
+
+    # Gradient differences share field values where their offset locations overlap
+    if gradient_jacobians is not None:
+        _, source_ids = np.unique(coordinates, axis=0, return_inverse=True)
+    else:
+        source_ids = np.arange(len(coordinates))
+    _, components = _prepare_source_errors(error_structure, len(coordinates), coordinates, predictors)
+    covariance = np.zeros((len(jacobian), len(jacobian)))
+    spatial_components = []
+    for component, magnitude in components:
+        if component.correlation is not None:
+            spatial_components.append((component, magnitude))
+            continue
+
+        # Combine contributions from repeated observations before calculating their covariance
+        weighted = np.zeros((source_ids.max() + 1, len(jacobian)))
+        np.add.at(weighted, source_ids, (jacobian * magnitude).T)
+        covariance += weighted.T @ weighted
+
+    # Multiply correlated components in bounded blocks instead of storing the complete covariance
+    if spatial_components:
+        component_data = tuple(spatial_components)
+        for start in range(0, len(coordinates), 512):
+            rows = np.arange(start, min(start + 512, len(coordinates)))
+            for stop in range(start, len(coordinates), 512):
+                columns = np.arange(stop, min(stop + 512, len(coordinates)))
+                block = _source_covariance_matrix(source_ids, coordinates, component_data, rows, columns)
+                product = jacobian[:, rows] @ block @ jacobian[:, columns].T
+                covariance += product if start == stop else product + product.T
+    return (covariance + covariance.T) / 2
+
+
+###########################################
+# Shared helpers for GLS and TLS fitting
+###########################################
+
+
+def _check_gls_tls_options(
+    models: Mapping[str, gu.ErrorStructure],
+    legacy_errors: bool,
+    force_opti: Literal["ols", "gls", "tls"] | None,
+    gls_method: Literal["approximate", "exact", "inducing"],
+    gls_neighbors: int | None,
+    gls_rank: int | None,
+    tls_method: Literal["spatial", "independent"] | None,
+) -> Literal["spatial", "independent"]:
+    """Check shared error inputs and solver settings before preparing fitting observations."""
+
+    # User inputs
+    if force_opti not in (None, "ols", "gls", "tls"):
+        raise ValueError("force_opti must be 'ols', 'gls', 'tls' or None.")
+    if models and legacy_errors:
+        raise ValueError("Use error_structure or sig_ref/sig_tba/corr_ref/corr_tba, without combining them.")
+    if models and force_opti == "ols":
+        raise ValueError("error_structure cannot be combined with force_opti='ols'.")
+    if force_opti in ("gls", "tls") and not models and not legacy_errors:
+        raise ValueError(f"{force_opti.upper()} requires observation errors for at least one elevation input.")
+    if tls_method not in (None, "spatial", "independent"):
+        raise ValueError("tls_method must be 'spatial' or 'independent'.")
+    if tls_method == "spatial" and not models:
+        raise ValueError("tls_method='spatial' requires native models supplied through error_structure.")
+    if gls_method not in ("approximate", "exact", "inducing"):
+        raise ValueError("gls_method must be 'approximate', 'exact' or 'inducing'.")
+    for name, value, minimum in (("gls_neighbors", gls_neighbors, 1), ("gls_rank", gls_rank, 0)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
+            raise ValueError(f"{name} must be an integer greater than or equal to {minimum}.")
+    return tls_method or ("spatial" if models else "independent")
+
+
+def _gls_covariance_operator(
+    coordinates: Sequence[NDArrayf],
+    magnitudes: Sequence[NDArrayf],
+    correlations: tuple[Callable[..., NDArrayf], ...],
+    block_size: int,
+) -> Any:
+    """Build a linear_operator (library below GPyTorch) covariance from the supplied spatial error components."""
+
+    import_optional("linear_operator")
+
+    import torch
+    from linear_operator.operators import LinearOperator
+
+    class CovarianceOperator(LinearOperator):  # type: ignore[misc]
+        """
+        Multiply by the spatial covariance using blocks of observation pairs.
+
+        Follows the custom operator interface:
+        https://linear-operator.readthedocs.io/en/latest/custom_linear_operators.html
+        """
+
+        def __init__(
+            self,
+            coordinates: torch.Tensor,
+            magnitudes: torch.Tensor,
+            *,
+            correlations: tuple[Callable[..., NDArrayf], ...],
+            block_size: int,
+        ) -> None:
+            """Store coordinates and error magnitudes, without calculating pairwise covariances."""
+
+            super().__init__(coordinates, magnitudes, correlations=correlations, block_size=block_size)
+            self.coordinates = coordinates
+            self.magnitudes = magnitudes
+            self.correlations = correlations
+            self.block_size = block_size
+
+        def _size(self) -> torch.Size:
+            """Return the number of observations along each covariance axis."""
+
+            count = len(self.coordinates)
+            return torch.Size((count, count))
+
+        def _transpose_nonbatch(self) -> CovarianceOperator:
+            """Return the same operator because the covariance is symmetric."""
+
+            return self
+
+        def _get_indices(
+            self, row_index: torch.Tensor, col_index: torch.Tensor, *batch_indices: torch.Tensor
+        ) -> torch.Tensor:
+            """Calculate selected covariances, including rows needed by the preconditioner."""
+
+            values = self.coordinates.new_zeros(torch.broadcast_shapes(row_index.shape, col_index.shape))
+            for index, correlation in enumerate(self.correlations):
+                differences = self.coordinates[row_index, index] - self.coordinates[col_index, index]
+                distances = torch.linalg.vector_norm(differences, dim=-1).detach().numpy()
+                scale = self.magnitudes[row_index, index] * self.magnitudes[col_index, index]
+                values += scale * torch.as_tensor(correlation(distances), dtype=values.dtype)
+            return values
+
+        def _matmul(self, rhs: torch.Tensor) -> torch.Tensor:
+            """Multiply all right-hand sides together while storing only one covariance block."""
+
+            coordinates = self.coordinates.detach().numpy()
+            magnitudes = self.magnitudes.detach().numpy()
+            result = rhs.new_zeros(rhs.shape)
+            count = len(coordinates)
+
+            # Evaluate one triangle of blocks and use symmetry for the other triangle
+            for row_start in range(0, count, self.block_size):
+                rows = slice(row_start, min(row_start + self.block_size, count))
+                for column_start in range(0, row_start + 1, self.block_size):
+                    columns = slice(column_start, min(column_start + self.block_size, count))
+                    # Each independent error component contributes its own spatial covariance
+                    covariance = np.zeros((len(coordinates[rows]), len(coordinates[columns])))
+                    for index, correlation in enumerate(self.correlations):
+                        distances = scipy.spatial.distance.cdist(coordinates[rows, index], coordinates[columns, index])
+                        scale = magnitudes[rows, index, None] * magnitudes[columns, index][None, :]
+                        covariance += correlation(distances) * scale
+
+                    # Accumulate products directly instead of storing a complete covariance matrix
+                    block = torch.from_numpy(covariance)
+                    result[rows].addmm_(block, rhs[columns])
+                    if column_start != row_start:
+                        result[columns].addmm_(block.T, rhs[rows])
+            return result
+
+    return CovarianceOperator(
+        torch.from_numpy(np.stack(coordinates, axis=1)),
+        torch.from_numpy(np.column_stack(magnitudes)),
+        correlations=correlations,
+        block_size=block_size,
+    )
+
+
+def _gls_fit_coefficients(
+    design: NDArrayf, residuals: NDArrayf, initial_beta: NDArrayf, covariance: Any
+) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
+    """
+    Solve GLS normal equations with the supplied observation covariance.
+
+    residuals contains the response after subtracting design @ initial_beta. Solve for a correction and
+    add it back to initial_beta. Known observation errors set the parameter covariance without residual scaling.
+    """
+
+    import torch
+    from linear_operator import settings
+    from linear_operator.operators import DenseLinearOperator
+
+    # Apply the observation covariance to the residuals and design in one solve
+    design_tensor = torch.from_numpy(design)
+    values = torch.column_stack((torch.from_numpy(residuals), design_tensor))
+    with torch.no_grad():
+        weighted = covariance.solve(values)
+
+        # Compute GLS coefficients and their covariance from the weighted normal equations
+        # This is the standard GLS estimator documented in _fit_gls()
+        normal = design_tensor.T @ weighted[:, 1:]
+        normal = (normal + normal.T) * 0.5
+        target = design_tensor.T @ weighted[:, 0]
+        right_hand_sides = torch.column_stack((target, torch.eye(len(initial_beta), dtype=normal.dtype)))
+
+        # Solve the small parameter system directly, even when observation solves use CG
+        with settings.max_cholesky_size(len(initial_beta) + 1):
+            solution = DenseLinearOperator(normal).solve(right_hand_sides)
+        beta = torch.from_numpy(initial_beta) + solution[:, 0]
+        covariance_beta = solution[:, 1:]
+        standard_errors = torch.sqrt(covariance_beta.diagonal())
+    return beta.numpy(), standard_errors.numpy(), covariance_beta.numpy()
+
+
+def _gls_neighbors(
+    coordinates: NDArrayf, neighbors: int, block_size: int
+) -> Iterable[tuple[slice, NDArray[np.intp], NDArrayf]]:
+    """
+    Find the nearest preceding observations in blocks for Vecchia conditioning.
+
+    A forest of KD-trees covers disjoint groups of preceding observations. Equal-sized groups are merged as
+    blocks are added, so searches and tree construction avoid repeatedly scanning all preceding observations.
+    Distances within the current block exclude observations that come later in the ordering.
+
+    Neighbors are selected by Euclidean distance. The tree forest accelerates this search without changing
+    the conditioning sets used by _gls_approximate() and _gls_inducing().
+    """
+
+    trees: list[tuple[int, int, cKDTree]] = []
+    for start in range(0, len(coordinates), block_size):
+        stop = min(start + block_size, len(coordinates))
+        current = coordinates[start:stop]
+        size = len(current)
+
+        # Query every preceding group and select the closest candidates across groups
+        previous_distances = []
+        previous_indexes = []
+        for first, last, tree in trees:
+            number = min(neighbors, last - first)
+            distances, indexes = tree.query(current, k=number)
+            previous_distances.append(distances.reshape(size, number))
+            previous_indexes.append(indexes.reshape(size, number) + first)
+
+        # Earlier observations within this block are also eligible neighbors
+        distances = scipy.spatial.distance.cdist(current, current)
+        distances[np.triu_indices(size)] = np.inf
+        number = min(neighbors, size)
+        indexes = np.argpartition(distances, number - 1, axis=1)[:, :number]
+        previous_distances.append(np.take_along_axis(distances, indexes, axis=1))
+        previous_indexes.append(indexes + start)
+        candidate_distances = np.column_stack(previous_distances)
+        candidate_indexes = np.column_stack(previous_indexes)
+
+        # The first observations have fewer than the requested neighbors and are handled together by GLS
+        number = min(neighbors, candidate_distances.shape[1])
+        closest = np.argpartition(candidate_distances, number - 1, axis=1)[:, :number]
+        distances = np.take_along_axis(candidate_distances, closest, axis=1)
+        indexes = np.take_along_axis(candidate_indexes, closest, axis=1)
+        yield slice(start, stop), indexes, distances
+
+        # Merge groups of equal size, as in a binary counter, to bound the number of trees
+        first = start
+        while trees and trees[-1][1] - trees[-1][0] == stop - first:
+            first = trees.pop()[0]
+        trees.append((first, stop, cKDTree(coordinates[first:stop])))
+
+
+def _gls_approximate(
+    xcoord: NDArrayf,
+    ycoord: NDArrayf,
+    X: NDArrayf,
+    Y: NDArrayf,
+    errors: _SampledErrors,
+    neighbors: int = 30,
+    rank: int = 64,
+    jitter: float = 1e-3,
+    block_size: int = 512,
+    components: Sequence[tuple[NDArrayf, _CorrelationModel | None]] | None = None,
+    component_coordinates: Sequence[NDArrayf] | None = None,
+    factor_method: Literal["cholesky", "inducing"] = "cholesky",
+) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
+    """
+    Fit GLS with pivoted Cholesky and local Vecchia conditioning.
+
+    Return coefficients, standard errors and parameter covariance. Storage grows linearly at fixed rank and
+    neighbor count. Samples within one block are exact. See https://doi.org/10.1214/19-STS755 for conditioning.
+
+    For observation covariance C and global factor L, approximate the residual covariance R = C - L L.T
+    by conditioning on neighbors from _gls_neighbors(). Whitening the residuals, design and L together
+    lets linear_operator apply the Woodbury correction before solving the small normal equations.
+
+    This low rank plus residual Vecchia construction is described by Gyger et al. (2026), Section 2.1:
+    https://www.jmlr.org/papers/volume27/25-1549/25-1549.pdf#page=5
+    The random ordering, Euclidean neighbors and per-component pivoted Cholesky factors are choices made here.
+
+    factor_method="inducing" uses _gls_inducing_factor() instead of pivoted Cholesky. Both methods share
+    the conditioning and fitting steps. Independent errors use diagonal weighting without optional dependencies.
+    """
+
+    # 1/ Prepare observations and their variances
+    for name, value, minimum in (("neighbors", neighbors, 1), ("rank", rank, 0), ("block_size", block_size, 1)):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
+            raise ValueError(f"{name} must be an integer greater than or equal to {minimum}.")
+    if components is None:
+        components = [
+            (sigma, corr) for sigma, corr in ((errors[0], errors[1]), (errors[2], errors[3])) if sigma is not None
+        ]
+    if not components:
+        raise ValueError("GLS requires observation errors for at least one elevation input.")
+
+    # Order observations across the whole area
+    count = len(Y)
+    if count <= max(block_size, neighbors + 1):
+        rank = 0
+    order = np.random.default_rng(0).permutation(count)
+    coordinates = np.column_stack((xcoord, ycoord))[order]
+    design = X[order]
+    initial_beta = np.linalg.lstsq(design, Y[order], rcond=None)[0]
+    residuals = Y[order] - design @ initial_beta
+
+    # Separate independent and spatial components
+    # Independent variances are exact, jitter adds a small diagonal term for numerical stability
+    diagonal = np.zeros(count)
+    spatial = []
+    for component_index, (sigma, correlation) in enumerate(components):
+        if sigma is None:
+            continue
+        magnitude = sigma[order]
+        if correlation is None:
+            diagonal += magnitude**2
+        else:
+            locations = coordinates if component_coordinates is None else component_coordinates[component_index][order]
+            spatial.append((magnitude, correlation[0], locations))
+            diagonal += jitter * magnitude**2
+    variance = diagonal.copy()
+    for magnitude, correlation_function, _locations in spatial:
+        variance += correlation_function(np.zeros(1))[0] * magnitude**2
+
+    # Independent errors require only diagonal weighting
+    if not spatial:
+        weighted_design = design / variance[:, None]
+        normal = design.T @ weighted_design
+        covariance_beta = np.linalg.inv(normal)
+        beta = initial_beta + np.linalg.solve(normal, weighted_design.T @ residuals)
+        return beta, np.sqrt(np.diag(covariance_beta)), covariance_beta
+
+    import_optional("linear_operator")
+
+    import torch
+    from linear_operator import settings
+    from linear_operator.operators import (
+        DenseLinearOperator,
+        DiagLinearOperator,
+        LowRankRootLinearOperator,
+    )
+
+    # 2/ Approximate broad spatial correlation with a small global factor
+    # Standard pivoted Cholesky: Gardner et al. (2018), Section 4.1
+    # https://arxiv.org/pdf/1809.11165#page=5
+    factors = []
+    for magnitude, correlation_function, locations in spatial:
+        if factor_method == "inducing":
+            factor = _gls_inducing_factor(locations, magnitude, correlation_function, min(rank, count))
+        elif rank:
+            spatial_covariance = _gls_covariance_operator([locations], [magnitude], (correlation_function,), block_size)
+            with torch.no_grad():
+                if torch.any(spatial_covariance.diagonal() > 0):
+                    # The library tests residual trace, so scale its tolerance with observation count
+                    factor = spatial_covariance.pivoted_cholesky(rank=min(rank, count), error_tol=1e-12 * count).numpy()
+                    # Stop at the last finite column when roundoff exhausts the numerical rank
+                    finite = np.all(np.isfinite(factor), axis=0)
+                    if not np.all(finite):
+                        factor = factor[:, : np.flatnonzero(~finite)[0]]
+                else:
+                    factor = np.empty((count, 0))
+        else:
+            factor = np.empty((count, 0))
+        factors.append(factor)
+    if len(factors) == 1:
+        global_factor = factors[0]
+    else:
+        global_factor = np.column_stack(factors)
+    del factors, factor
+
+    # Subtract diag(L L.T) to obtain the residual variances diag(R)
+    variance -= np.sum(global_factor**2, axis=1)
+    right_hand_sides = np.column_stack((residuals, design, global_factor))
+    global_factor = right_hand_sides[:, X.shape[1] + 1 :]
+
+    # 3/ Whiten the remaining covariance using nearby observations
+    neighbors = min(neighbors, count - 1)
+    whitened_all = np.empty_like(right_hand_sides)
+
+    # Whiten the first block with its full covariance
+    block_size = max(block_size, neighbors + 1)
+    for rows, indexes, distances in _gls_neighbors(coordinates, neighbors, block_size):
+        if rows.start == 0:
+            covariance = np.diag(diagonal[rows])
+            for magnitude, correlation_function, locations in spatial:
+                pair_distances = scipy.spatial.distance.cdist(locations[rows], locations[rows])
+                covariance += correlation_function(pair_distances) * np.outer(magnitude[rows], magnitude[rows])
+            covariance -= global_factor[rows] @ global_factor[rows].T
+            cholesky = DenseLinearOperator(torch.from_numpy(covariance)).cholesky()
+            whitened = cholesky.solve(torch.from_numpy(right_hand_sides[rows])).numpy()
+        else:
+            # Build each neighborhood covariance
+            covariance = np.zeros((*indexes.shape, indexes.shape[1]))
+            cross_covariance = np.zeros_like(distances)
+            for magnitude, correlation_function, locations in spatial:
+                neighbor_coordinates = locations[indexes]
+                differences = neighbor_coordinates[:, :, None, :] - neighbor_coordinates[:, None, :, :]
+                pair_distances = np.linalg.norm(differences, axis=-1)
+                component_distances = np.linalg.norm(locations[rows, None] - neighbor_coordinates, axis=-1)
+                neighbor_magnitude = magnitude[indexes]
+                covariance += (
+                    correlation_function(pair_distances)
+                    * neighbor_magnitude[:, :, None]
+                    * neighbor_magnitude[:, None, :]
+                )
+                cross_covariance += (
+                    correlation_function(component_distances) * magnitude[rows, None] * neighbor_magnitude
+                )
+
+            # Subtract the global covariance factor
+            neighbor_factor = global_factor[indexes]
+            covariance -= neighbor_factor @ neighbor_factor.swapaxes(1, 2)
+            cross_covariance -= np.einsum("br,bkr->bk", global_factor[rows], neighbor_factor)
+            positions = np.arange(neighbors)
+            covariance[:, positions, positions] += diagonal[indexes]
+
+            # Gaussian conditioning: a = R_NN^-1 R_Ni and d = R_ii - R_iN a
+            # These are the neighbor weights and conditional variance in Gyger et al. (2026), Eq. (4)
+            with settings.max_cholesky_size(neighbors + 1):
+                weights = (
+                    DenseLinearOperator(torch.from_numpy(covariance))
+                    .solve(torch.from_numpy(cross_covariance[..., None]))
+                    .numpy()[..., 0]
+                )
+            conditional_variance = variance[rows] - np.einsum("bk,bk->b", cross_covariance, weights)
+            if np.any(~np.isfinite(conditional_variance) | (conditional_variance <= 0)):
+                raise ValueError("GLS requires a positive definite observation covariance.")
+
+            # Whiten local errors with their conditional mean and variance
+            # Each row becomes (z_i - a.T z_N) / sqrt(d), for every right-hand side z
+            conditional_mean = np.einsum("bk,bkp->bp", weights, right_hand_sides[indexes])
+            whitened = (right_hand_sides[rows] - conditional_mean) / np.sqrt(conditional_variance[:, None])
+
+        whitened_all[rows] = whitened
+
+    del right_hand_sides, global_factor
+
+    # 4/ Integrate out the global factors and solve for the fitted parameters
+    # Woodbury adds L L.T back to the Vecchia residual covariance using a small factor system
+    # Rasmussen and Williams (2006), Eq. (A.9): https://gaussianprocess.org/gpml/chapters/RWA.pdf#page=3
+    parameters = X.shape[1]
+    factor_tensor = torch.from_numpy(whitened_all[:, parameters + 1 :])
+    diagonal_tensor = factor_tensor.new_ones(count)
+    covariance_operator = DiagLinearOperator(diagonal_tensor)
+    if factor_tensor.shape[1]:
+        # The whitened residual covariance is I, with global covariance (W L)(W L).T added back
+        covariance_operator = LowRankRootLinearOperator(factor_tensor).add_diagonal(diagonal_tensor)
+
+    # Standard GLS normal equations for the approximated covariance (see _fit_gls())
+    return _gls_fit_coefficients(
+        whitened_all[:, 1 : parameters + 1], whitened_all[:, 0], initial_beta, covariance_operator
+    )
+
+
+def _gls_inducing_factor(
+    coordinates: NDArrayf, magnitude: NDArrayf, correlation: Callable[..., NDArrayf], rank: int
+) -> NDArrayf:
+    """
+    Calculate a spatial covariance factor with GPyTorch inducing points.
+
+    At inducing locations U, L L.T = D K_XU K_UU^-1 K_UX D, where D = diag(magnitude).
+    This is the Nystrom approximation in Rasmussen and Williams (2006), Eq. (8.4):
+    https://gaussianprocess.org/gpml/chapters/RW8.pdf#page=2
+    K-means selects the locations geometrically, with the supplied kernel parameters fixed.
+    """
+
+    if rank == 0:
+        return np.empty((len(coordinates), 0))
+
+    import_optional("gpytorch")
+
+    import gpytorch
+    import torch
+    from sklearn.cluster import MiniBatchKMeans
+
+    # Spread inducing points across the observed area
+    centers = (
+        MiniBatchKMeans(n_clusters=rank, n_init=1, max_iter=20, batch_size=4096, random_state=0)
+        .fit(coordinates)
+        .cluster_centers_
+    )
+
+    class SuppliedKernel(gpytorch.kernels.Kernel):  # type: ignore[misc]
+        """Evaluate the supplied correlation without changing its covariance model."""
+
+        def forward(self, x1: torch.Tensor, x2: torch.Tensor, diag: bool = False, **kwargs: Any) -> torch.Tensor:
+            """Calculate correlations for all requested pairs or corresponding observations."""
+
+            differences = x1 - x2 if diag else x1[..., :, None, :] - x2[..., None, :, :]
+            distances = torch.linalg.vector_norm(differences, dim=-1).numpy()
+            return torch.from_numpy(correlation(distances))
+
+    # Use only the global factor, since Vecchia conditioning accounts for C - L L.T separately
+    # Disabling GPyTorch's diagonal correction avoids counting residual variance twice
+    kernel = gpytorch.kernels.InducingPointKernel(
+        SuppliedKernel().double(),
+        torch.from_numpy(centers),
+        gpytorch.likelihoods.GaussianLikelihood().double(),
+    ).double()
+    kernel.train(False)
+    kernel.requires_grad_(False)
+    with torch.no_grad(), gpytorch.settings.sgpr_diagonal_correction(False):
+        covariance = kernel(torch.from_numpy(coordinates)).evaluate_kernel()
+        return magnitude[:, None] * covariance.root.to_dense().numpy()
+
+
+def _gls_inducing(
+    xcoord: NDArrayf,
+    ycoord: NDArrayf,
+    X: NDArrayf,
+    Y: NDArrayf,
+    errors: _SampledErrors,
+    neighbors: int = 60,
+    rank: int = 512,
+    jitter: float = 1e-3,
+    block_size: int = 512,
+    components: Sequence[tuple[NDArrayf, _CorrelationModel | None]] | None = None,
+    component_coordinates: Sequence[NDArrayf] | None = None,
+) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
+    """
+    Fit GLS with GPyTorch inducing points and local Vecchia conditioning.
+
+    Return coefficients, standard errors and parameter covariance. Storage grows linearly at fixed rank and
+    neighbor count. See https://docs.gpytorch.ai/en/stable/kernels.html#gpytorch.kernels.InducingPointKernel
+    and https://doi.org/10.1214/19-STS755. Samples within one block are exact.
+
+    Use the same residual Vecchia construction as _gls_approximate(), with L from _gls_inducing_factor().
+    With W the Vecchia whitening matrix, solve with I + (W L)(W L).T to account for global correlation.
+    linear_operator applies its inverse before _gls_fit_coefficients() solves the standard GLS normal equations.
+    """
+
+    return _gls_approximate(
+        xcoord,
+        ycoord,
+        X,
+        Y,
+        errors,
+        neighbors,
+        rank,
+        jitter,
+        block_size,
+        components,
+        component_coordinates,
+        factor_method="inducing",
+    )
+
+
+#############################################
+# GLS with the full observation covariance
+#############################################
+
+
+def _gls_lazy_gpytorch(
+    xcoord: NDArrayf,
+    ycoord: NDArrayf,
+    X: NDArrayf,
+    Y: NDArrayf,
+    errors: _SampledErrors,
+    cg_tol: float = 1e-3,
+    max_preconditioner_size: int = 100,
+    jitter: float = 1e-3,
+    block_size: int = 512,
+    components: Sequence[tuple[NDArrayf, _CorrelationModel | None]] | None = None,
+    component_coordinates: Sequence[NDArrayf] | None = None,
+) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
+    """
+    Fit GLS with the full covariance evaluated in bounded blocks.
+
+    Return coefficients, standard errors and parameter covariance. Conjugate gradients avoid storing the N by N
+    covariance, but each iteration still needs quadratic work. See https://arxiv.org/abs/1809.11165 for the solver.
+
+    The "exact" option uses the full covariance, including jitter, with CG accuracy controlled by cg_tol.
+    Gardner et al. (2018), Appendix A, Algorithm 2 describes batched conjugate gradients, and Section 4.1
+    describes pivoted Cholesky preconditioning. Preconditioning changes convergence, while the covariance
+    operator still evaluates all observation pairs.
+    """
+    # 1/ Prepare observations and a covariance operator
+    # Import optional linear_operator dependencies
+    import_optional("linear_operator")
+
+    import linear_operator
+    import torch
+    from linear_operator.operators import DiagLinearOperator
+
+    # Share memory with NumPy inputs
+    if block_size < 1:
+        raise ValueError("block_size must be a positive integer.")
+    Xt = torch.from_numpy(X)
+    Yt = torch.from_numpy(Y)
+    coords = np.column_stack((xcoord, ycoord))
+
+    # 2/ Sum the spatial covariances and observation variances
+    # C_ij = sum_k sigma_ki sigma_kj rho_k(d_kij), with independent variances added on the diagonal
+    # Jitter adds a small variance to each spatial component for numerical stability
+    if components is None:
+        components = [
+            (sigma, corr) for sigma, corr in ((errors[0], errors[1]), (errors[2], errors[3])) if sigma is not None
+        ]
+    if not components:
+        raise ValueError("GLS requires observation errors for at least one elevation input.")
+    diagonal = np.zeros(len(coords))
+    spatial_magnitudes = []
+    spatial_coordinates = []
+    correlations = []
+    for component_index, (sigma, correlation) in enumerate(components):
+        if sigma is None:
+            continue
+        sigma_noise = sigma
+        if correlation is None:
+            diagonal += sigma_noise**2
+        else:
+            spatial_magnitudes.append(sigma_noise)
+            locations = coords if component_coordinates is None else component_coordinates[component_index]
+            spatial_coordinates.append(locations)
+            correlations.append(correlation[0])
+            diagonal += jitter * sigma_noise**2
+
+    # Use diagonal noise for the low rank preconditioner
+    K_lazy = DiagLinearOperator(torch.from_numpy(diagonal))
+    if spatial_magnitudes:
+        spatial = _gls_covariance_operator(spatial_coordinates, spatial_magnitudes, tuple(correlations), block_size)
+        # A zero regularization leaves no diagonal noise for the preconditioner to invert
+        K_lazy = spatial + K_lazy if np.any(diagonal != 0) else spatial
+
+    # 3/ Solve the weighted normal equations
+    # Subtract an OLS fit so CG accuracy is set by residuals rather than large offsets
+    initial_beta = torch.linalg.lstsq(Xt, Yt).solution
+    residuals = Yt - Xt @ initial_beta
+
+    # Use conjugate gradients above the block size
+    cholesky_size = min(block_size, linear_operator.settings.max_cholesky_size.value())
+    precondition_size = min(block_size + 1, linear_operator.settings.min_preconditioning_size.value())
+    with (
+        torch.no_grad(),
+        linear_operator.settings.cg_tolerance(cg_tol),
+        linear_operator.settings.max_preconditioner_size(max_preconditioner_size),
+        linear_operator.settings.min_preconditioning_size(precondition_size),
+        linear_operator.settings.max_cholesky_size(cholesky_size),
+        linear_operator.settings.fast_computations(solves=True),
+    ):
+        return _gls_fit_coefficients(X, residuals.numpy(), initial_beta.numpy(), K_lazy)
+
+
+def _fit_gls(
+    x: NDArrayf,
+    y: NDArrayf,
+    design: NDArrayf,
+    Y: NDArrayf,
+    errors: _SampledErrors,
+    gls_method: Literal["approximate", "exact", "inducing"] = "approximate",
+    gls_neighbors: int | None = None,
+    gls_rank: int | None = None,
+    components: Sequence[tuple[NDArrayf, _CorrelationModel | None]] | None = None,
+    component_coordinates: Sequence[NDArrayf] | None = None,
+) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
+    """
+    Fit the supplied linear design with the selected spatial GLS solver.
+
+    component_coordinates supplies one (N, 2) coordinate array per covariance component to describe each input's
+    native locations. The solvers return coefficients, standard errors and their covariance.
+
+    All solvers use standard GLS: beta = (X.T C^-1 X)^-1 X.T C^-1 Y and
+    Cov(beta) = (X.T C^-1 X)^-1, with known observation covariance C.
+    See https://en.wikipedia.org/wiki/Generalized_least_squares#Method.
+    _gls_approximate() and _gls_inducing() approximate C, while _gls_lazy_gpytorch() uses its full form.
+    """
+
+    component_options: dict[str, Any] = {} if components is None else {"components": components}
+    if component_coordinates is not None:
+        component_options["component_coordinates"] = component_coordinates
+    if gls_method in ("approximate", "inducing"):
+        solver = _gls_inducing if gls_method == "inducing" else _gls_approximate
+        options: dict[str, Any] = {}
+        if gls_neighbors is not None:
+            options["neighbors"] = gls_neighbors
+        if gls_rank is not None:
+            options["rank"] = gls_rank
+        beta, sd_beta, cov_beta = solver(
+            xcoord=x, ycoord=y, X=design, Y=Y, errors=errors, **component_options, **options
+        )
+    elif gls_method == "exact":
+        beta, sd_beta, cov_beta = _gls_lazy_gpytorch(
+            xcoord=x, ycoord=y, X=design, Y=Y, errors=errors, **component_options
+        )
+    else:
+        raise ValueError("gls_method must be 'approximate', 'exact' or 'inducing'.")
+
+    return beta, sd_beta, cov_beta
+
+
+#############################################
+# TLS with errors in the response and design
+#############################################
+
+
+def _fit_tls(
+    X: NDArrayf,
+    Y: NDArrayf,
+    cov_Y: NDArrayf,
+    cov_XX: NDArrayf,
+    cov_XY: NDArrayf | None = None,
+) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
+    """
+    Fit an intercept and linear coefficients with known errors in the response and design.
+
+    X has shape (variables, observations), cov_XX has shape (variables, variables, observations), and
+    cov_XY optionally contains the covariance between each design variable and its response.
+
+    This is weighted orthogonal distance regression with independent observations, as in Boggs et al.
+    (1992), Eq. (1.8): https://docs.scipy.org/doc/external/odrpack_guide.pdf#page=21
+    Within each observation, design and response errors may be correlated. _tls_score() differentiates
+    the same objective after eliminating the observation corrections.
+    """
+
+    # Convert to weight, easy for a vector variance
+    w_Y = 1 / cov_Y
+
+    from scipy.odr import ODR, Data, Model, RealData, multilinear
+
+    var_X = np.diagonal(cov_XX, axis1=0, axis2=1).T
+
+    ratio_X = np.mean(cov_Y) / np.var(Y)
+    logging.info(f"Y error/variance ratio: {ratio_X}")
+    ratio_X = np.mean(var_X, axis=1) / np.var(X, axis=1)
+    logging.info(f"X error/variance ratio: {ratio_X}")
+
+    # TODO: Move those to tests
+    # ind_symmetric = [np.all(np.array_equal(cov_XX[:, :, i], cov_XX[:, :, i].T)) for i in range(cov_XX.shape[-1])]
+    # ind_pos_semidef = np.array([np.all(np.linalg.eigvals(cov_XX[:, :, i]) > 0) for i in range(cov_XX.shape[-1])])
+    #
+    # indices_wrong = np.arange(len(ind_pos_semidef))[ind_pos_semidef]
+    #
+    # for i in range(len(indices_wrong)):
+    #     print(f"Variance: {var_h_grid[indices_wrong[i]]}")
+    #     print(f"Gradient X: {gx[indices_wrong[i]]}")
+    #     print(f"Gradient Y: {gy[indices_wrong[i]]}")
+    #     print(f"X: {x[indices_wrong[i]]}")
+    #     print(f"Y: {y[indices_wrong[i]]}")
+    #     print(f"Z: {z[indices_wrong[i]]}")
+
+    # Regularize the design covariance before separating correlated observation variables
+    # This is a numerical safeguard for nearly dependent design variables
+    regularization = 1e-5 * np.trace(cov_XX, axis1=0, axis2=1) / cov_XX.shape[0]
+    cov_XX = cov_XX + np.eye(cov_XX.shape[0])[:, :, None] * regularization
+
+    # Separate response and design errors before fitting correlated observation variables
+    # X' = X - Cov(X,Y) / Var(Y) * Y has zero covariance with Y
+    # Its covariance is the Gaussian Schur complement in Rasmussen and Williams (2006), Eq. (A.6)
+    # https://gaussianprocess.org/gpml/chapters/RWA.pdf#page=2
+    model = multilinear
+    if cov_XY is not None:
+        response_scale = cov_XY / cov_Y
+        X = X - response_scale * Y
+        cov_XX = cov_XX - np.einsum("in,jn->ijn", cov_XY, response_scale)
+
+        # Substitute X = X' + response_scale * Y into Y = beta[0] + beta[1:].T X
+        def correlated_model(beta: NDArrayf, variables: NDArrayf) -> NDArrayf:
+            """Calculate the response after removing its covariance with the design."""
+
+            return (beta[0] + beta[1:] @ variables) / (1 - beta[1:] @ response_scale)
+
+        model = Model(correlated_model)
+
+    # Invert each observation covariance to obtain weights (observations are assumed uncorrelated)
+    w_XX = RealData(x=X, y=Y, covx=cov_XX).wd
+
+    # rd = RealData(x=X, y=Y, covx=cov_XX, covy=cov_Y)
+    rd = Data(x=X, y=Y, we=w_Y, wd=w_XX)
+    # Fit one coefficient per input variable and the vertical translation as an intercept
+    odr = ODR(rd, model, beta0=np.zeros(X.shape[0] + 1))
+
+    output = odr.run()
+    # logging.info("TLS summary from scipy.odr:")
+    # logging.info(output.pprint())
+
+    # Get output
+    beta = output.beta
+    cov_beta = output.cov_beta
+    # Known observation errors set uncertainty independently of the fitted residual scatter
+    # SciPy returns cov_beta without residual scaling (sd_beta includes it)
+    # https://docs.scipy.org/doc/scipy/reference/generated/scipy.odr.Output.html
+    sd_beta = np.sqrt(np.diag(cov_beta))
+
+    return beta, sd_beta, cov_beta
+
+
+def _tls_score(
+    beta: NDArray[Any],
+    variables: NDArray[Any],
+    response: NDArray[Any],
+    variance_y: NDArray[Any],
+    covariance_x: NDArray[Any],
+    covariance_xy: NDArray[Any] | None = None,
+) -> NDArray[Any]:
+    """
+    Calculate each observation's derivative of the profiled TLS objective.
+
+    Eliminating observation corrections from the linear ODR objective in _fit_tls() gives sum(r_i**2 / v_i).
+    For slopes b = beta[1:], r_i = Y_i - beta[0] - X_i.T b and
+    v_i = Var(Y_i) + b.T Cov(X_i) b - 2 Cov(X_i,Y_i).T b.
+    We differentiate this expression directly, including the change in v_i with b.
+    """
+
+    # Match the covariance ridge used by _fit_tls()
+    covariance_x = covariance_x.transpose(2, 0, 1)
+    regularization = 1e-5 * np.trace(covariance_x, axis1=1, axis2=2) / covariance_x.shape[1]
+    covariance_x = covariance_x + regularization[:, None, None] * np.eye(covariance_x.shape[1])
+    design = np.column_stack((np.ones(len(response)), variables.T))
+
+    # Propagate response and design errors into the residual variance v_i
+    residual = response - design @ beta
+    covariance_beta = covariance_x @ beta[1:]
+    variance = variance_y + covariance_beta @ beta[1:]
+    if covariance_xy is not None:
+        variance -= 2 * covariance_xy.T @ beta[1:]
+        covariance_beta -= covariance_xy.T
+
+    # Apply d(r^2/v) = 2r/v dr - r^2/v^2 dv to the intercept and slopes
+    variance_derivative = np.column_stack((np.zeros(len(response)), 2 * covariance_beta))
+    return -2 * design * (residual / variance)[:, None] - variance_derivative * (residual**2 / variance**2)[:, None]
 
 
 ##################################
@@ -1171,32 +2109,6 @@ def vertical_shift(
 ############################
 
 
-def _collapse_weights_to_points(weights: NDArrayf | None, n: int) -> NDArrayf | None:
-    """
-    Convert various weight shapes to per-point weights of shape (N,).
-
-    Accepts (N,), (N,1) or (N,3)/(3,N) collapsed to (N,) using a mean across xyz.
-    """
-    if weights is None:
-        return None
-
-    w = np.asarray(weights)
-
-    if w.ndim == 1:
-        if w.shape[0] != n:
-            raise ValueError(f"weights has length {w.shape[0]} but expected {n}.")
-        return w.astype(float, copy=False)
-
-    if w.ndim == 2:
-        if w.shape == (n, 1):
-            return w[:, 0].astype(float, copy=False)
-        if w.shape == (n, 3):
-            return np.nanmean(w, axis=1).astype(float, copy=False)
-        if w.shape == (3, n):
-            return np.nanmean(w, axis=0).astype(float, copy=False)
-    raise ValueError(f"Unsupported weights shape {w.shape}. Expected (N,), (N,1), (N,3) or (3,N) where N={n}.")
-
-
 def _icp_fit_func(
     inputs: tuple[NDArrayf, NDArrayf, NDArrayf | None],
     t1: float,
@@ -1238,11 +2150,9 @@ def _icp_fit_func(
 
     # Get inputs
     ref, tba, norm = inputs
-    n_pts = ref.shape[1]
 
     # Per point weights
-    w_point = _collapse_weights_to_points(weights, n_pts)
-    w_sqrt = None if w_point is None else np.sqrt(w_point)
+    w_sqrt = None if weights is None else np.sqrt(weights)
 
     # Axis weights
     if axis_weights is None:
@@ -1283,7 +2193,7 @@ def _icp_fit_func(
             q = ref.T  # (N,3)
             n = norm.T  # (N,3)
 
-            # Build residual directly without forming A explicitly: A_rot = cross(p, n); A_trans = n; B = dot(n, q - p)
+            # Build residual directly without forming A explicitly
             A_rot = np.cross(p, n)  # (N,3)
             A_trans = n  # (N,3)
             B = np.sum(n * (q - p), axis=1)  # (N,)
@@ -1300,20 +2210,244 @@ def _icp_fit_func(
             diffs = (trans_tba - ref) * norm
             res = np.sum(diffs, axis=0)  # shape (N,)
 
-            # Axis weighting for plane residuals
-            if w_axis is not None:
-                # The norm is (3, N)
-                nWn = np.sum((norm * norm) * w_axis[:, None], axis=0)  # (N,)
-                plane_sqrt = np.sqrt(np.clip(nWn, 0.0, None))
-                res = plane_sqrt * res
+        # Axis weighting for plane residuals
+        if w_axis is not None:
+            # The norm is (3, N)
+            normal_variance = np.sum(norm * norm / w_axis[:, None], axis=0)  # (N,)
+            res = res / np.sqrt(normal_variance)
 
-            # Apply per-point weight
-            if w_sqrt is not None:
-                res = w_sqrt * res
+        # Apply per-point weight
+        if w_sqrt is not None:
+            res = w_sqrt * res
     else:
         raise ValueError("ICP method must be 'point-to-point' or 'point-to-plane'.")
 
     return res
+
+
+def _icp_tls_observations(
+    ref: NDArray[Any],
+    tba: NDArray[Any],
+    gx: NDArray[Any],
+    gy: NDArray[Any],
+    variances: tuple[NDArrayf, NDArrayf, NDArrayf, NDArrayf],
+    moving_axis: NDArrayf,
+    only_translation: bool,
+) -> tuple[NDArray[Any], NDArray[Any], NDArray[Any], NDArray[Any], NDArray[Any]]:
+    """Calculate the linear ICP variables and their height and gradient error covariances."""
+
+    # Divide the plane equation by its vertical normal to use a vertical translation as the intercept
+    x, y, z = tba
+    separation_x, separation_y = ref[0] - x, ref[1] - y
+    response = ref[2] - z - gx * separation_x - gy * separation_y
+    variables = np.stack((-gx, -gy, y + gy * z, -x - gx * z, gx * y - gy * x))
+    derivative_x = np.stack((-np.ones_like(x), np.zeros_like(x), np.zeros_like(x), -z, y))
+    derivative_y = np.stack((np.zeros_like(x), -np.ones_like(x), z, np.zeros_like(x), -x))
+
+    # Moving height errors also change the rotation columns after the accumulated rigid transform
+    ax, ay, az = moving_axis
+    derivative_height = np.stack((np.zeros_like(x), np.zeros_like(x), ay + gy * az, -ax - gx * az, gx * ay - gy * ax))
+    projected_height = az - gx * ax - gy * ay
+    if only_translation:
+        variables = variables[:2]
+        derivative_x, derivative_y, derivative_height = derivative_x[:2], derivative_y[:2], derivative_height[:2]
+
+    # Normal errors affect both the response and design when the paired points have different X/Y coordinates
+    variance_ref, variance_tba, variance_gx, variance_gy = variances
+    covariance_y = variance_ref.copy()
+    covariance_x = np.zeros((len(variables), len(variables), len(x)), dtype=np.result_type(ref, tba, gx, gy))
+    covariance_xy = np.zeros(variables.shape, dtype=np.result_type(ref, tba, gx, gy))
+    for derivative, response_derivative, variance in (
+        (derivative_height, -projected_height, variance_tba),
+        (derivative_x, -separation_x, variance_gx),
+        (derivative_y, -separation_y, variance_gy),
+    ):
+        covariance_y = covariance_y + response_derivative**2 * variance
+        covariance_x += np.einsum("in,jn,n->ijn", derivative, derivative, variance)
+        covariance_xy += derivative * (response_derivative * variance)
+    return variables, response, covariance_y, covariance_x, covariance_xy
+
+
+def _icp_fit_gls_tls(
+    ref: NDArrayf,
+    tba: NDArrayf,
+    normals: NDArrayf,
+    only_translation: bool,
+    error_structure: Mapping[str, gu.ErrorStructure],
+    error_predictors: Mapping[str, Mapping[str, Any]],
+    error_samples: tuple[NDArrayf, NDArrayf],
+    error_indices: tuple[NDArray[np.intp], NDArray[np.intp]],
+    pixel_size: float | tuple[float, float],
+    scale: float,
+    moving_axis: NDArrayf,
+    force_opti: Literal["gls", "tls"] | None = None,
+    gls_method: Literal["approximate", "exact", "inducing"] = "approximate",
+    gls_neighbors: int | None = None,
+    gls_rank: int | None = None,
+    tls_method: Literal["spatial", "independent"] = "spatial",
+    sampled_errors: _SampledErrors | None = None,
+) -> tuple[NDArrayf, NDArrayf]:
+    """
+    Fit linearized point-to-plane ICP with the shared GLS or TLS solvers.
+
+    Covariance components use each input's original coordinates and sampled point IDs. Reference errors select
+    TLS unless force_opti selects GLS, as in LZD. TLS includes errors in normals and the linear design.
+    Point pairs are standardized by scale, while error_samples uses the original coordinate units.
+
+    _icp_tls_observations() builds the regression, and _fit_gls() or _fit_tls() solves it.
+    _propagate_sampled_covariance() accounts for the native spatial covariance in TLS uncertainties.
+    """
+
+    # Evaluate errors in the original sample order before nearest pairs select or repeat observations
+    reference, moving = error_samples
+    matched, selected = error_indices
+    components = []
+    component_coordinates = []
+    native_components: dict[str, list[tuple[NDArrayf, _CorrelationModel | None]]] = {}
+    native_locations: dict[str, list[NDArrayf]] = {}
+    native_dimensions: dict[str, list[Sequence[int] | None]] = {}
+    gx, gy = -normals[0] / normals[2], -normals[1] / normals[2]
+    projected_height = moving_axis[2] - gx * moving_axis[0] - gy * moving_axis[1]
+    variances = {}
+    for side, points, indexes, projection in (
+        ("ref", reference, matched, np.ones(len(matched))),
+        ("tba", moving, selected, projected_height),
+    ):
+        values = []
+        native_locations[side], native_dimensions[side] = [], []
+        if side in error_structure:
+            _, data = _prepare_source_errors(
+                error_structure[side], points.shape[1], points[:2].T, error_predictors.get(side)
+            )
+            for component, magnitude in data:
+                correlation = None if component.correlation is None else (component.predict_correlation, 0.0)
+                values.append((magnitude, correlation))
+                locations = points[:2].T.copy()
+                dimensions = None if component.correlation is None else component.correlation.active_dims
+                if dimensions is not None:
+                    locations[:, [axis for axis in range(2) if axis not in dimensions]] = 0
+                native_locations[side].append(locations)
+                native_dimensions[side].append(dimensions)
+        elif sampled_errors is not None:
+            sigma, correlation = sampled_errors[:2] if side == "tba" else sampled_errors[2:]
+            if sigma is not None:
+                values.append((sigma, correlation))
+                native_locations[side].append(points[:2].T)
+                native_dimensions[side].append(None)
+        native_components[side] = values
+        variances[side] = (
+            sum((magnitude[indexes] / scale) ** 2 for magnitude, _ in values) if values else np.zeros(len(indexes))
+        )
+
+        # Repeated reference observations share their independent noise across all matched pairs
+        for (magnitude, correlation), locations in zip(values, native_locations[side]):
+            locations = locations[indexes]
+            if correlation is None and len(np.unique(indexes)) != len(indexes):
+
+                def repeated_noise(distance: NDArrayf) -> NDArrayf:
+                    """Correlate pairs that reuse the same original observation."""
+
+                    return (distance == 0).astype(float)
+
+                correlation = (repeated_noise, 0.0)
+                locations = np.column_stack((indexes, np.zeros(len(indexes))))
+            components.append((magnitude[indexes] * projection / scale, correlation))
+            component_coordinates.append(locations)
+
+    # Reference gradients are uncertain only when their DEM has an error model
+    use_tls = force_opti == "tls" or (force_opti is None and bool(native_components["ref"]))
+    gradient_variances = [np.zeros(len(matched)), np.zeros(len(matched))]
+    spacing = pixel_size if isinstance(pixel_size, tuple) else (pixel_size, pixel_size)
+    if use_tls:
+        for axis, distance in enumerate(spacing):
+            for (magnitude, correlation), dimensions in zip(native_components["ref"], native_dimensions["ref"]):
+                lag = 2 * distance if dimensions is None or axis in dimensions else 0
+                correlation_at_spacing = 0 if correlation is None else correlation[0](np.asarray(lag))
+                gradient_variances[axis] += magnitude[matched] ** 2 * (1 - correlation_at_spacing) / (2 * distance**2)
+    if use_tls and not native_components["ref"]:
+        # Match LZD's small gradient variance when TLS is explicitly requested for an exact grid
+        for index, distance in enumerate(spacing):
+            gradient_variances[index] = np.full(
+                len(matched), np.mean(variances["tba"]) * scale**2 / (2000 * distance**2)
+            )
+    variances_tuple = (variances["ref"], variances["tba"], gradient_variances[0], gradient_variances[1])
+    observations = _icp_tls_observations(ref, tba, gx, gy, variances_tuple, moving_axis, only_translation)
+    variables, response, covariance_y, covariance_x, covariance_xy = observations
+    order = np.array([1, 2, 0] if only_translation else [1, 2, 0, 3, 4, 5])
+
+    # Solve the actual fixed-pair regression with the same backend selection as LZD
+    if not use_tls:
+        design = np.column_stack((np.ones(len(response)), variables.T))
+        beta, _, covariance = _fit_gls(
+            reference[0, matched],
+            reference[1, matched],
+            design,
+            response,
+            (None, None, None, None),
+            gls_method,
+            gls_neighbors,
+            gls_rank,
+            components,
+            component_coordinates,
+        )
+        return beta[order], covariance[np.ix_(order, order)]
+    beta, _, covariance = _fit_tls(variables, response, covariance_y, covariance_x, covariance_xy)
+    covariance = covariance[np.ix_(order, order)]
+    if tls_method != "spatial" or not error_structure:
+        return beta[order], covariance
+
+    # Differentiate the TLS estimating equation before propagating the native spatial errors
+    def score(parameters: NDArray[Any], inputs: Sequence[NDArray[Any]]) -> NDArray[Any]:
+        """Calculate the TLS score from the current paired points and DEM gradients."""
+
+        values, target, variance_y, covariance_x, covariance_xy = _icp_tls_observations(
+            inputs[0], inputs[1], inputs[2], inputs[3], variances_tuple, moving_axis, only_translation
+        )
+        return _tls_score(parameters, values, target, variance_y, covariance_x, covariance_xy)
+
+    inputs = (ref, tba, gx, gy)
+    step = 1e-20
+    hessian = np.empty((len(beta), len(beta)))
+    for column in range(len(beta)):
+        parameters = beta.astype(complex)
+        parameters[column] += 1j * step
+        hessian[:, column] = np.imag(score(parameters, inputs).sum(axis=0)) / step
+    hessian = (hessian + hessian.T) / 2
+    derivatives = []
+    for column in range(4):
+        changed = [value.astype(complex) for value in inputs]
+        if column == 0:
+            changed[column][2] += 1j * step / scale
+        elif column == 1:
+            changed[column] += moving_axis[:, None] * (1j * step / scale)
+        else:
+            changed[column] += 1j * step
+        derivative = np.imag(score(beta, changed)) / step
+        derivatives.append(-np.linalg.solve(hessian, derivative.T)[order])
+
+    # Add sensitivities for pairs that reuse an observation, then propagate its height and gradient fields
+    covariance = np.zeros((len(beta), len(beta)))
+    if "ref" in error_structure:
+        sensitivities = []
+        for derivative in (derivatives[0], derivatives[2], derivatives[3]):
+            total = np.zeros((reference.shape[1], len(beta)))
+            np.add.at(total, matched, derivative.T)
+            sensitivities.append(total.T)
+        covariance += _propagate_sampled_covariance(
+            reference[:2].T,
+            sensitivities[0],
+            error_structure["ref"],
+            error_predictors.get("ref"),
+            (sensitivities[1], sensitivities[2]),
+            pixel_size,
+        )
+    if "tba" in error_structure:
+        total = np.zeros((moving.shape[1], len(beta)))
+        np.add.at(total, selected, derivatives[1].T)
+        covariance += _propagate_sampled_covariance(
+            moving[:2].T, total.T, error_structure["tba"], error_predictors.get("tba")
+        )
+    return beta[order], covariance
 
 
 def _icp_fit(
@@ -1326,8 +2460,21 @@ def _icp_fit(
     params_fit_or_bin: InFitOrBinDict,
     only_translation: bool,
     linearized: bool,
+    error_structure: Mapping[str, gu.ErrorStructure] | None = None,
+    error_predictors: Mapping[str, Mapping[str, Any]] | None = None,
+    error_samples: tuple[NDArrayf, NDArrayf] | None = None,
+    error_indices: tuple[NDArray[np.intp], NDArray[np.intp]] | None = None,
+    pixel_size: float | tuple[float, float] = 1.0,
+    error_scale: float = 1.0,
+    moving_axis: NDArrayf | None = None,
+    force_opti: Literal["ols", "gls", "tls"] | None = None,
+    gls_method: Literal["approximate", "exact", "inducing"] = "approximate",
+    gls_neighbors: int | None = None,
+    gls_rank: int | None = None,
+    tls_method: Literal["spatial", "independent"] = "spatial",
+    sampled_errors: _SampledErrors | None = None,
     **kwargs: Any,
-) -> NDArrayf:
+) -> tuple[NDArrayf, NDArrayf | None]:
     """
     Optimization of ICP fit function, using either any optimizer or specific linearized approximations for ICP.
 
@@ -1344,12 +2491,16 @@ def _icp_fit(
         rotation as default.
     :param **kwargs: Keyword arguments passed to fit optimizer.
 
-    :return: Affine transform matrix.
+    :return: Affine transform matrix and optional parameter covariance.
     """
 
     # Trim if required
     if "trim_residuals" in params_fit_or_bin.keys() and params_fit_or_bin["trim_residuals"]:
         res = _icp_fit_func((ref, tba, norms), 0, 0, 0, 0, 0, 0, method=method)
+
+        # Point-to-point returns three coordinates, while trimming selects whole point pairs
+        if method == "point-to-point":
+            res = np.linalg.norm(res.reshape(3, -1), axis=0)
         ind = index_trimmed(
             res,
             central_estimator=params_fit_or_bin["trim_central_statistic"],
@@ -1363,11 +2514,15 @@ def _icp_fit(
         tba = tba[:, ~ind]
         if norms is not None:
             norms = norms[:, ~ind]
+        if weights is not None:
+            weights = weights[~ind]
+        if error_indices is not None:
+            error_indices = (error_indices[0][~ind], error_indices[1][~ind])
 
     # Group inputs into a single array
     inputs = (ref, tba, norms)
 
-    # Point-to-plane distances cannot determine every translation on a flat or planar surface
+    # Check rank to capture potential convergence issues on flat/planar surface
     if method == "point-to-plane":
         assert norms is not None
         design = norms.T
@@ -1375,68 +2530,110 @@ def _icp_fit(
         if not only_translation:
             design = np.column_stack((design, np.cross(tba.T, norms.T)))
             names = ("tx", "ty", "tz", "rx", "ry", "rz")
+
+        # Apply the same weights as the minimizer
+        row_scale = np.ones(ref.shape[1])
+        if axis_weights is not None:
+            normal_variance = np.sum(norms * norms / np.asarray(axis_weights).reshape(3, 1), axis=0)
+            row_scale /= np.sqrt(normal_variance)
+        if weights is not None:
+            row_scale *= np.sqrt(weights)
+        design = design * row_scale[:, None]
         _check_fit_rank(design, names, "ICP")
+
+    # Fit the supplied observation errors with GLS or TLS before constructing the step transform
+    if error_structure or (sampled_errors is not None and force_opti != "ols"):
+        if method != "point-to-plane" or not linearized or dict(params_fit_or_bin).get("fit_loss_func") != "linear":
+            raise NotImplementedError("ICP error models require linearized point-to-plane fitting with a linear loss.")
+        if error_structure and params_fit_or_bin.get("trim_residuals", False):
+            raise NotImplementedError("ICP error models do not support residual trimming.")
+        if force_opti == "ols":
+            raise ValueError("error_structure cannot be combined with force_opti='ols'.")
+        assert norms is not None and error_samples is not None and error_indices is not None
+        axis = np.array([0.0, 0.0, 1.0]) if moving_axis is None else moving_axis
+        beta, covariance = _icp_fit_gls_tls(
+            ref,
+            tba,
+            norms,
+            only_translation,
+            error_structure or {},
+            error_predictors or {},
+            error_samples,
+            error_indices,
+            pixel_size,
+            error_scale,
+            axis,
+            force_opti,
+            gls_method,
+            gls_neighbors,
+            gls_rank,
+            tls_method,
+            sampled_errors,
+        )
+        matrix = matrix_from_translations_rotations(*beta, use_degrees=False)  # type: ignore
+        return matrix, covariance
 
     # Solve the fixed point-to-plane correspondences directly when their residuals are linear
     fit_minimizer = params_fit_or_bin["fit_minimizer"]
     if isinstance(fit_minimizer, str):
         assert method == "point-to-plane" and linearized and norms is not None
-        target = np.sum(norms * (ref - tba), axis=0)
+        target = np.sum(norms * (ref - tba), axis=0) * row_scale
         beta, _ = _ols_fit(None, design, target, None)
-        return matrix_from_translations_rotations(*beta, use_degrees=False)  # type: ignore
+        matrix = matrix_from_translations_rotations(*beta, use_degrees=False)  # type: ignore
 
-    # Define loss function
-    loss_func = params_fit_or_bin["fit_loss_func"]
-
-    # With rotation
-    if not only_translation:
-
-        def fit_func(offsets: tuple[float, float, float, float, float, float]) -> NDArrayf:
-            return _icp_fit_func(
-                inputs=inputs,
-                t1=offsets[0],
-                t2=offsets[1],
-                t3=offsets[2],
-                alpha1=offsets[3],
-                alpha2=offsets[4],
-                alpha3=offsets[5],
-                method=method,
-                linearized=linearized,
-                weights=weights,
-                axis_weights=axis_weights,
-            )
-
-        # Initial offset near zero
-        init_offsets = np.zeros(6)
-
-    # Without rotation
     else:
+        # Define loss function
+        loss_func = params_fit_or_bin["fit_loss_func"]
 
-        def fit_func(offsets: tuple[float, float, float, float, float, float]) -> NDArrayf:
-            return _icp_fit_func(
-                inputs=inputs,
-                t1=offsets[0],
-                t2=offsets[1],
-                t3=offsets[2],
-                alpha1=0.0,
-                alpha2=0.0,
-                alpha3=0.0,
-                method=method,
-                linearized=linearized,
-                weights=weights,
-                axis_weights=axis_weights,
-            )
+        # With rotation
+        if not only_translation:
 
-        # Initial offset near zero
-        init_offsets = np.zeros(3)
+            def fit_func(offsets: tuple[float, float, float, float, float, float]) -> NDArrayf:
+                return _icp_fit_func(
+                    inputs=inputs,
+                    t1=offsets[0],
+                    t2=offsets[1],
+                    t3=offsets[2],
+                    alpha1=offsets[3],
+                    alpha2=offsets[4],
+                    alpha3=offsets[5],
+                    method=method,
+                    linearized=linearized,
+                    weights=weights,
+                    axis_weights=axis_weights,
+                )
 
-    results = fit_minimizer(fit_func, init_offsets, **kwargs, loss=loss_func)
-    # Mypy: having results as "None" is impossible, but not understood through overloading of _bin_or_and_fit_nd...
-    assert results is not None
-    # Build matrix out of optimized parameters
-    matrix = matrix_from_translations_rotations(*results.x, use_degrees=False)  # type: ignore
+            # Initial offset near zero
+            init_offsets = np.zeros(6)
 
-    return matrix
+        # Without rotation
+        else:
+
+            def fit_func(offsets: tuple[float, float, float, float, float, float]) -> NDArrayf:
+                return _icp_fit_func(
+                    inputs=inputs,
+                    t1=offsets[0],
+                    t2=offsets[1],
+                    t3=offsets[2],
+                    alpha1=0.0,
+                    alpha2=0.0,
+                    alpha3=0.0,
+                    method=method,
+                    linearized=linearized,
+                    weights=weights,
+                    axis_weights=axis_weights,
+                )
+
+            # Initial offset near zero
+            init_offsets = np.zeros(3)
+
+        results = fit_minimizer(fit_func, init_offsets, **kwargs, loss=loss_func)
+        # Mypy: having results as "None" is impossible, but not understood through overloading of _bin_or_and_fit_nd...
+        assert results is not None
+        # Build matrix out of optimized parameters
+        matrix = matrix_from_translations_rotations(*results.x, use_degrees=False)  # type: ignore
+
+    return matrix, None
 
 
 def _icp_iteration_step(
@@ -1451,7 +2648,13 @@ def _icp_iteration_step(
     picky: bool,
     linearized: bool,
     only_translation: bool,
-) -> tuple[NDArrayf, dict[str, float], None]:
+    error_structure: Mapping[str, gu.ErrorStructure] | None = None,
+    error_predictors: Mapping[str, Mapping[str, Any]] | None = None,
+    error_samples: tuple[NDArrayf, NDArrayf] | None = None,
+    pixel_size: float | tuple[float, float] = 1.0,
+    error_scale: float = 1.0,
+    error_fit_options: dict[str, Any] | None = None,
+) -> tuple[NDArrayf, dict[str, float], NDArrayf | None]:
     """
     Iteration step of Iterative Closest Point coregistration.
 
@@ -1476,7 +2679,8 @@ def _icp_iteration_step(
     # Apply transform matrix from previous steps
     trans_tba_epc = _apply_matrix_pts_mat(tba_epc, matrix=matrix)
 
-    # Create nearest neighbour tree from reference elevations, and query for transformed point cloud
+    # Choose nearest pairs: picky or not!
+    # Query the reference tree for the transformed point cloud
     dists, ind = ref_epc_nearest_tree.query(trans_tba_epc.T, k=1)
 
     # Picky ICP: Remove duplicates of transformed points with the same closest reference points
@@ -1488,10 +2692,12 @@ def _icp_iteration_step(
         logging.info(f"Picky ICP duplicate removal: Reducing from {init_len} to {len(ind)} point pairs.")
     # In case the number of points is different for ref and tba (can't happen with current subsampling)
     else:
-        ind_tba = ind < ref_epc.shape[1]
+        ind_tba = np.flatnonzero(ind < ref_epc_nearest_tree.n)
 
     # Reference index is the original indexed by the other
     ind_ref = ind[ind_tba]
+
+    ind_tba = np.asarray(ind_tba, dtype=np.intp)
 
     # Index points to get nearest
     step_ref = ref_epc[:, ind_ref]
@@ -1503,7 +2709,7 @@ def _icp_iteration_step(
         step_normals = None
 
     # Fit to get new step transform
-    step_matrix = _icp_fit(
+    step_matrix, covariance = _icp_fit(
         ref=step_ref,
         tba=step_trans_tba,
         norms=step_normals,
@@ -1513,6 +2719,14 @@ def _icp_iteration_step(
         linearized=linearized,
         weights=None,
         axis_weights=axis_weights,
+        error_structure=error_structure,
+        error_predictors=error_predictors,
+        error_samples=error_samples,
+        error_indices=(ind_ref, ind_tba),
+        pixel_size=pixel_size,
+        error_scale=error_scale,
+        moving_axis=matrix[:3, 2],
+        **(error_fit_options or {}),
     )
 
     # Increment transformation matrix by step
@@ -1527,7 +2741,7 @@ def _icp_iteration_step(
 
     step_statistics = {"translation": offset_translation, "rotation": offset_rotation}
 
-    return new_matrix, step_statistics, None
+    return new_matrix, step_statistics, covariance
 
 
 def icp(
@@ -1551,7 +2765,18 @@ def icp(
     only_translation: bool = False,
     anisotropic: Literal["xy_vs_z", "per_axis"] | None = "xy_vs_z",
     standardize: bool = True,
-) -> tuple[NDArrayf, tuple[float, float, float], int, OutIterativeDict]:
+    error_structure: gu.ErrorStructure | Mapping[str, gu.ErrorStructure] | None = None,
+    error_predictors: Mapping[str, Mapping[str, Any]] | None = None,
+    sig_ref: NDArrayf | None = None,
+    corr_ref: _CorrelationModel | None = None,
+    sig_tba: NDArrayf | None = None,
+    corr_tba: _CorrelationModel | None = None,
+    force_opti: Literal["ols", "gls", "tls"] | None = None,
+    gls_method: Literal["approximate", "exact", "inducing"] = "approximate",
+    gls_neighbors: int | None = None,
+    gls_rank: int | None = None,
+    tls_method: Literal["spatial", "independent"] | None = None,
+) -> tuple[NDArrayf, tuple[float, float, float], int, OutIterativeDict, NDArrayf | None]:
     """
     Main function for Iterative Closest Point coregistration.
 
@@ -1564,8 +2789,28 @@ def icp(
     The function assumes we have two DEMs, or DEM and an elevation point cloud, in the same CRS.
     The normals for "point-to-plane" are computed on the DEM for speed.
 
-    :return: Affine transform matrix, Centroid, Subsample size.
+    :return: Affine transform matrix, centroid, sample size, iteration metadata and optional covariance.
     """
+
+    models, predictors = _coreg_error_inputs(error_structure, error_predictors)
+    legacy_errors = any(value is not None for value in (sig_ref, corr_ref, sig_tba, corr_tba))
+    tls_method = _check_gls_tls_options(
+        models, legacy_errors, force_opti, gls_method, gls_neighbors, gls_rank, tls_method
+    )
+    has_errors = (bool(models) or legacy_errors) and force_opti != "ols"
+    if has_errors:
+        if method != "point-to-plane" or not linearized or dict(params_fit_or_bin).get("fit_loss_func") != "linear":
+            raise NotImplementedError("Analytical ICP requires linearized point-to-plane fitting with a linear loss.")
+        if (models and params_fit_or_bin.get("trim_residuals", False)) or sampling_strategy == "iterative_same_xy":
+            raise NotImplementedError("Analytical ICP requires a fixed sample without residual trimming.")
+        if force_opti == "ols":
+            raise ValueError("error_structure cannot be combined with force_opti='ols'.")
+        if any(
+            transform.b != 0 or transform.d != 0
+            for transform in (ref_transform, tba_transform)
+            if transform is not None
+        ):
+            raise NotImplementedError("Analytical ICP requires north-up raster grids.")
 
     # Derive centroid and scale ahead of any potential iterative sampling loop, and scale translation tolerance
     centroid, scale = _get_centroid_scale(
@@ -1605,16 +2850,32 @@ def icp(
 
         # Now ref is always the array
         aux_vars = _dem_normals_curvature(ref_elev, ref_transform)
-        aux_tied_to = "ref"
 
     else:
         aux_vars = None
-        aux_tied_to = "ref"
+
+    # Sample each predictor with the elevation input described by its error model
+    if invert_output:
+        models = {"ref" if name == "tba" else "tba": value for name, value in models.items()}
+        predictors = {"ref" if name == "tba" else "tba": value for name, value in predictors.items()}
+        sig_ref, sig_tba, corr_ref, corr_tba = sig_tba, sig_ref, corr_tba, corr_ref
+    auxiliary: dict[str, Any] = dict(aux_vars or {})
+    owners = dict.fromkeys(auxiliary, "ref")
+    for side, sigma in (("ref", sig_ref), ("tba", sig_tba)):
+        if sigma is not None:
+            auxiliary[f"sigma_{side}"] = sigma
+            owners[f"sigma_{side}"] = side
+    for side, values in predictors.items():
+        for name, value in values.items():
+            if np.ndim(value):
+                auxiliary[f"error_{side}_{name}"] = value
+                owners[f"error_{side}_{name}"] = side
+    pixel_size = _res(ref_transform) if ref_transform is not None else 1.0
 
     # If we iterate the sampling, we re-define maximum iterations to be in the outside loop,
     # running a single iteration with every sample
     if sampling_strategy == "iterative_same_xy":
-        in_loop_max_it = max_iterations
+        in_loop_max_it = 1
         out_loop_max_it = max_iterations
         in_loop_sampling_strategy = "same_xy"
     # Otherwise, we run a single iteration of outside loop, as if there was no loop
@@ -1643,15 +2904,42 @@ def icp(
             area_or_point=area_or_point,
             z_name=z_name,
             sampling_strategy=in_loop_sampling_strategy,
-            aux_vars=aux_vars,
-            aux_tied_to=aux_tied_to,
+            aux_vars=auxiliary or None,
+            aux_tied_to=owners,
+            preserve_coordinates=True,
         )
 
         # Re-stack normals if defined
-        if sub_aux is not None:
+        if method == "point-to-plane":
+            assert sub_aux is not None
             norms = np.vstack((sub_aux["nx"], sub_aux["ny"], sub_aux["nz"]))
         else:
             norms = None
+
+        # Preserve only the prepared observations and predictors for error propagation
+        error_samples = (ref_epc.copy(), tba_epc.copy()) if has_errors else None
+        sampled_predictors = {}
+        for side, values in predictors.items():
+            assert sub_aux is not None
+            sampled_predictors[side] = {
+                name: sub_aux[f"error_{side}_{name}"] if np.ndim(value) else value for name, value in values.items()
+            }
+
+        error_fit_options: dict[str, Any] = dict(
+            force_opti=force_opti,
+            gls_method=gls_method,
+            gls_neighbors=gls_neighbors,
+            gls_rank=gls_rank,
+            tls_method=tls_method,
+        )
+        if legacy_errors:
+            assert sub_aux is not None
+            error_fit_options["sampled_errors"] = (
+                sub_aux.get("sigma_tba"),
+                corr_tba,
+                sub_aux.get("sigma_ref"),
+                corr_ref,
+            )
 
         # Remove centroid and standardize to facilitate numerical convergence
         ref_epc, tba_epc = _standardize_epc(ref_epc, tba_epc, centroid=centroid, scale=scale)
@@ -1674,8 +2962,14 @@ def icp(
             picky,
             linearized,
             only_translation,
+            models,
+            sampled_predictors,
+            error_samples,
+            pixel_size,
+            scale,
+            error_fit_options,
         )
-        out_step_matrix, new_stats, output_iterative, _ = _iterate_method(
+        out_step_matrix, new_stats, output_iterative, covariance = _iterate_method(
             method=_icp_iteration_step,
             iterating_input=init_matrix,
             constant_inputs=constant_inputs,
@@ -1718,11 +3012,24 @@ def icp(
     # TODO: Support reporting different number of subsamples when independent?
     subsample_final = min(ref_epc.shape[1], tba_epc.shape[1])
 
+    # Convert local standardized covariance to the reported translations and Euler angles
+    if has_errors:
+        if not output_iterative["converged"]:
+            raise ValueError("Analytical ICP requires a converged fit.")
+        assert covariance is not None
+        dimension = len(covariance)
+        units = np.ones(dimension)
+        units[:3] = scale
+        covariance = covariance * np.outer(units, units)
+        covariance = _transform_parameter_covariance(
+            final_matrix, covariance, local_increments=True, invert_output=invert_output
+        )
+
     # If we solved the inverted problem (fixed surface was originally tba), we invert to keep the external convention
     if method == "point-to-plane" and invert_output:
         final_matrix = invert_matrix(final_matrix)
 
-    return final_matrix, centroid, subsample_final, output_iterative
+    return final_matrix, centroid, subsample_final, output_iterative, covariance
 
 
 #########################
@@ -1764,7 +3071,7 @@ def _cpd_precompute(
     """
     Precompute quantities that can be reused across CPD iterations.
 
-    This is meant to be called once per subsample set (i.e. inside your outer sampling loop),
+    This is meant to be called once per subsample set (i.e. inside the outer sampling loop),
     then passed through `constant_inputs` of _iterate_method to avoid recomputing invariant terms.
 
     :return: Cache dictionary.
@@ -1795,21 +3102,19 @@ def _cpd_precompute(
         "truncation_threshold": float(truncation_threshold),
     }
 
-    # Optional kNN cache: build a KD-tree on X in anisotropically-weighted
-    # coordinates. The E-step queries in the same space (TY * sqrt(w)).
+    # Optional kNN cache: build a KD-tree on X in anisotropically-weighted coordinates
     if estep_knn_k is not None:
         k = int(estep_knn_k)
         if k <= 0:
             raise ValueError("knn_k must be a positive integer when provided.")
 
         # cKDTree uses Euclidean distance, so we fold axis weights into the coordinates:
-        # d^2 = sum_d w[d] * (x_d - y_d)^2  <=>  || sqrt(w) * x - sqrt(w) * y ||^2
         w = cache["classic"]["w"]  # (3,)
         w_sqrt = np.sqrt(np.clip(np.asarray(w, dtype=float).reshape(3), 0.0, None))
 
         Xw = (cache["classic"]["X"] * w_sqrt[None, :]).astype(float, copy=False)  # (N,3)
 
-        # Build tree once; reused across EM iterations
+        # Build tree once, which we later reuse across EM iterations
         tree = cKDTree(Xw)
 
         cache["knn"] = {
@@ -1828,7 +3133,11 @@ def _cpd_precompute(
     V = max(V, 1e-12)
 
     # Normals and curvature
+    # (Fewer than three points cannot measure curvature)
+    if curvature is None and ref_normals is not None and N < 3:
+        curvature = np.zeros(N)
     if ref_normals is None or curvature is None:
+        # Derive PCA surface variation for the LSG plane ratio
         normals_cpu, curv = _epc_normals_curvature(X, neighbours=neighbours)
         if ref_normals is None:
             ref_normals = normals_cpu
@@ -1849,22 +3158,23 @@ def _cpd_precompute(
 
     w = cache["classic"]["w"]  # (3,)
     W = np.diag(w)  # (3,3)
-    Wn = ref_normals * w[None, :]  # (N,3)
-    nWn = np.sum(ref_normals * Wn, axis=1)  # (N,) = n^T W n
-    nWn = np.clip(nWn, 1e-12, None)
 
-    # Precompute invSigma per target point m: invSigma_m = a(m) * n n^T + I
+    # Variance of distances along each normal: n^T W^-1 n
+    normal_variance = np.sum(ref_normals * ref_normals / w[None, :], axis=1)
+    normal_variance = np.clip(normal_variance, 1e-12, None)
+
+    # Precompute invSigma per target point m: invSigma_m = W + a(m) * n n^T / (n^T W^-1 n)
     invSigma = np.empty((N, 3, 3), dtype=float)
     for i in range(N):
-        wn = Wn[i].reshape(3, 1)  # (3,1) = W n
-        invSigma[i] = W + (float(a[i]) / float(nWn[i])) * (wn @ wn.T)
+        normal = ref_normals[i].reshape(3, 1)
+        invSigma[i] = W + (float(a[i]) / float(normal_variance[i])) * (normal @ normal.T)
 
     invSigma_flat = invSigma.reshape(N, 9)  # (N,9)
     x_invSigma = np.einsum("ni,nij->nj", X, invSigma)  # (N,3)
     x_invSigma_x = np.einsum("ni,nij,nj->n", X, invSigma, X)  # (N,)
 
     # Precompute dot(x, n)
-    X_normal = np.sum(X * Wn, axis=1)  # (N,)
+    X_normal = np.sum(X * ref_normals, axis=1)  # (N,)
 
     # Precompute the squared weighted target coordinates used by the E-step
     X_X2 = np.sum((X * X) * w[None, :], axis=1)  # (N,)
@@ -1884,8 +3194,7 @@ def _cpd_precompute(
         "M": M,
         "V": V,
         "w": axis_weights,
-        "Wn": Wn,
-        "nWn": nWn,
+        "normal_variance": normal_variance,
         "ref_normals": ref_normals,  # (N,3)
         "curvature": curvature,  # (N,)
         "a": a,  # (N,)
@@ -1930,7 +3239,7 @@ def _lsg_update_sigma_dependent(cache_lsg: dict[str, Any], sigma2: float, weight
     F_matrix = f_X_scaled[:, None] * f_Y[None, :]  # (N,M)
 
     # E-step constants
-    C_const = float((2.0 * np.pi * sigma2) ** 1.5 * (1.0 / V))
+    C_const = float((2.0 * np.pi * sigma2) ** 1.5 * (1.0 / V)) if weight_cpd > 0 else 0.0
     c_const = float(-1.0 / (2.0 * sigma2))
 
     return {"F_matrix": F_matrix, "C_const": C_const, "c_const": c_const}
@@ -1974,8 +3283,7 @@ def _cpd_estep_classic(
         if knn_k is None:
             raise ValueError("If knn_tree is provided, knn_k must be provided as well.")
 
-        # kNN: query neighbors in anisotropically-weighted space:
-        # d^2 = sum_d w[d] * (x_d - ty_d)^2  <=>  Euclidean in (sqrt(w)*coords)
+        # kNN: query neighbors in anisotropically-weighted space
         w_sqrt = np.sqrt(np.clip(np.asarray(w, dtype=float).reshape(3), 0.0, None))
         TYs = TY * w_sqrt[None, :]
         dists, idx = knn_tree.query(TYs, k=min(int(knn_k), N), workers=int(knn_workers))
@@ -2021,16 +3329,13 @@ def _cpd_mstep_classic_fit_minimizer(
 
     Returns (R, t, s) for the shrink step.
 
-    Notes:
-    - This optimizes the classic CPD M-step objective directly:
-        sum_{m,n} P[m,n] * || X[n] - (s R Y[m] + t) ||^2
-      by returning weighted residuals sqrt(P) * (X - (s R Y + t)).
-    - This is mathematically faithful but can be expensive because it creates N*M residual blocks.
+    This optimizes the classic CPD M-step objective directly. It is mathematically accurate but can be expensive
+    because it creates N*M residual blocks.
     """
     N, D = X.shape
     M, _ = TY.shape
 
-    P = estep["P"]  # (M,N) in your implementation
+    P = estep["P"]  # (M,N)
     Np = float(estep["Np"])
     PX = estep["PX"]  # (N,D) since PX = P @ X
 
@@ -2163,11 +3468,6 @@ def _cpd_mstep_classic_fit_minimizer_fast(
     Minimization step of classic CPD using a generic fit_minimizer (fast collapsed form).
 
     Returns (R, t, s).
-
-    This uses the identity (up to constants):
-        sum_{m,n} P[m,n] ||x_n - (s R y_m + t)||^2
-        ≈ sum_m P1[m] ||xbar_m - (s R y_m + t)||^2
-    where xbar_m = (sum_n P[m,n] x_n) / P1[m].
     """
     N, D = X.shape
     M, _ = TY.shape
@@ -2175,14 +3475,10 @@ def _cpd_mstep_classic_fit_minimizer_fast(
     P = estep["P"]  # (M,N)
     P1 = estep["P1"]  # (M,)
     Np = float(estep["Np"])
-    PX = estep["PX"]  # (M,3) if computed as P @ X; if your PX is (N,3) swap accordingly
+    PX = estep["PX"]  # (M,3)
 
-    # --- IMPORTANT ---
-    # In your current classic CPD code, PX = np.matmul(P, X) where P is (M,N) and X is (N,3),
-    # so PX is (M,3). (This matches the CPD derivation.)
-    # If your actual PX in your dict is transposed, adjust here.
+    # Check cross moment shape
     if PX.shape[0] != M:
-        # If PX is (N,3) we likely have P shaped (N,M) somewhere; fail loudly to avoid silent bugs.
         raise ValueError("estep['PX'] must have shape (M,3) for classic CPD fast M-step.")
 
     # Soft correspondence centroids for each Y_m
@@ -2279,48 +3575,49 @@ def _cpd_shrink_classic(
     Ycur: NDArrayf,
     estep: dict[str, NDArrayf],
     R: NDArrayf,
+    t: NDArrayf,
     s: float,
     w: NDArrayf,
     sigma2: float,
     sigma2_min: float,
 ) -> tuple[float, float]:
-    """
-    Update variance and objective function for classic CPD.
-    """
+    """Update classic CPD variance and objective from the expected squared residual."""
+
     P = estep["P"]  # (M,N)
     Pt1 = estep["Pt1"]  # (N,)
     P1 = estep["P1"]  # (M,)
-    Np = float(estep["Np"])  # scalar
-
-    N, D = X.shape
-    M, Dy = Ycur.shape
-    if Dy != D:
+    Np = max(float(estep["Np"]), 1e-12)  # scalar
+    D = X.shape[1]
+    if Ycur.shape[1] != D:
         raise ValueError("X and Ycur must have the same dimensionality.")
 
     # Weighted means (Fig. 2, Eq. 6)
-    muX = (Pt1 @ X) / max(Np, 1e-12)  # (D,)
-    muY = (P1 @ Ycur) / max(Np, 1e-12)  # (D,)
+    muX = (Pt1 @ X) / Np  # (D,)
+    muY = (P1 @ Ycur) / Np  # (D,)
 
     # Centered clouds
-    X_hat = X - muX[None, :]
-    Y_hat = Ycur - muY[None, :]
-
-    Xh = X_hat * np.sqrt(w[None, :])  # (N,3)
-    Yh = Y_hat * np.sqrt(w[None, :])  # (M,3)
+    # Rotate moving points before applying axis weights
+    X_hat = X - muX
+    Y_hat = s * ((Ycur - muY) @ R.T)
 
     # Terms used in q and sigma2 update
-    xPx = float(Pt1 @ np.sum(Xh * Xh, axis=1))
-    YPY = float(P1 @ np.sum(Yh * Yh, axis=1))
-    A = Xh.T @ (P.T @ Yh)
-    trAR = float(np.trace(A @ R))
+    xPx = float(Pt1 @ np.sum(X_hat * X_hat * w, axis=1))
+    YPY = float(P1 @ np.sum(Y_hat * Y_hat * w, axis=1))
+    cross = float(np.sum((P @ X_hat) * Y_hat * w))
+
+    # Include any remaining difference between transformed means
+    mean_difference = muX - (s * (muY @ R.T) + t)
+    mean_residual = Np * float(np.sum(mean_difference * mean_difference * w))
+    squared_residual = max(xPx + YPY - 2.0 * cross + mean_residual, 0.0)
 
     # Objective (Eq. 7)
-    q = (xPx - 2.0 * s * trAR + (s * s) * YPY) / (2.0 * sigma2) + (D * Np / 2.0) * np.log(sigma2)
+    q = squared_residual / (2.0 * sigma2) + (D * Np / 2.0) * np.log(sigma2)
 
-    # Sigma2 update (Fig. 2)
-    sigma2_new = (xPx - s * trAR) / (max(Np, 1e-12) * D)
-    if sigma2_new <= 0:
-        sigma2_new = float(sigma2_min)
+    # Sigma2 update (Fig. 2, without the free-scale simplification)
+    sigma2_new = squared_residual / (Np * D)
+
+    # If sigma2 gets too small, we use a minimal sigma value instead
+    sigma2_new = max(float(sigma2_new), float(sigma2_min))
 
     return float(sigma2_new), float(q)
 
@@ -2350,9 +3647,9 @@ def _cpd_estep_lsg(
     x_invSigma = cache_lsg["x_invSigma"]  # (N,3)
     x_invSigma_x = cache_lsg["x_invSigma_x"]  # (N,)
     w = cache_lsg["w"]  # (3,)
-    Wn = cache_lsg["Wn"]  # (N,3)
-    nWn = cache_lsg["nWn"]  # (N,)
-    X_normal = cache_lsg["X_normal"]  # (N,) = x^T W n
+    normals = cache_lsg["ref_normals"]  # (N,3)
+    normal_variance = cache_lsg["normal_variance"]  # (N,)
+    X_normal = cache_lsg["X_normal"]  # (N,) = x^T n
     X_X2 = cache_lsg["X_X2"]  # (N,)
 
     F_matrix = sigma_terms["F_matrix"]  # (N,M)
@@ -2370,8 +3667,8 @@ def _cpd_estep_lsg(
 
     if knn_tree is None:
         # Dense: plane term weighted (N,M)
-        dWn = (Wn @ gY.T) - X_normal[:, None]
-        plane_term = (dWn * dWn) / nWn[:, None]
+        normal_distance = (normals @ gY.T) - X_normal[:, None]
+        plane_term = (normal_distance * normal_distance) / normal_variance[:, None]
 
         # Dense: quad term weighted (N,M)
         xWy = (X * w[None, :]) @ gY.T
@@ -2395,15 +3692,15 @@ def _cpd_estep_lsg(
 
         # Gather per-neighbor terms (M,k)
         a_nb = a[idx]
-        nWn_nb = nWn[idx]
+        normal_variance_nb = normal_variance[idx]
         X_normal_nb = X_normal[idx]
         X_X2_nb = X_X2[idx]
-        Wn_nb = Wn[idx]  # (M,k,3)
+        normals_nb = normals[idx]  # (M,k,3)
 
         # Plane term (M,k)
-        Wn_dot_y = np.einsum("mkd,md->mk", Wn_nb, gY)
-        dWn = Wn_dot_y - X_normal_nb
-        plane_term = (dWn * dWn) / np.clip(nWn_nb, 1e-12, None)
+        normal_dot_y = np.einsum("mkd,md->mk", normals_nb, gY)
+        normal_distance = normal_dot_y - X_normal_nb
+        plane_term = (normal_distance * normal_distance) / np.clip(normal_variance_nb, 1e-12, None)
 
         # Quad term (M,k)
         Xw_nb = X[idx] * w[None, None, :]
@@ -2441,8 +3738,7 @@ def _lsg_build_whitened_terms(
     M1: NDArrayf,
 ) -> tuple[NDArrayf, NDArrayf]:
     """
-    Build Cholesky factors L_m and targets mu_m for the whitened least-squares residuals:
-      r_m = L_m ( R y_m + t - mu_m )
+    Build Cholesky factors L_m and targets mu_m for the whitened least-squares residuals.
 
     :param M0: (M,3,3) SPD matrices.
     :param M1: (M,3) vectors.
@@ -2456,9 +3752,9 @@ def _lsg_build_whitened_terms(
         A = M0[m]
         b = M1[m]
 
-        # Stabilize SPD factorization (small jitter)
-        jitter = 1e-12 * float(np.trace(A)) + 1e-15
-        A_stable = A + jitter * np.eye(3)
+        # Scale jitter per axis to preserve unequal weights
+        jitter = 1e-12 * np.maximum(np.diag(A), np.finfo(float).tiny)
+        A_stable = A + np.diag(jitter)
 
         try:
             L = np.linalg.cholesky(A_stable)
@@ -2471,7 +3767,8 @@ def _lsg_build_whitened_terms(
 
         mu = np.linalg.solve(A_stable, b)
 
-        Ls[m] = L
+        # NumPy returns A = L L^T, so residuals must use L^T to reproduce the quadratic
+        Ls[m] = L.T
         mus[m] = mu
 
     return Ls, mus
@@ -2481,17 +3778,12 @@ def _cpd_mstep_lsg_least_squares(
     TY: NDArrayf,
     estep: dict[str, NDArrayf],
     only_translation: bool,
-    params_fit_or_bin: Any,  # InFitOrBinDict in your codebase
+    params_fit_or_bin: Any,
 ) -> tuple[NDArrayf, NDArrayf]:
     """
     Minimization step of LSG-CPD.
 
-    Uses the generic fit_minimizer on a whitened residual:
-      r_m = L_m ( R y_m + t - mu_m )
-    with M0_m = L_m L_m^T and mu_m = M0_m^{-1} M1_m.
-
-    This matches your existing ICP pattern:
-        results = params_fit_or_bin["fit_minimizer"](fit_func, init_offsets, **kwargs, loss=loss_func)
+    Uses the generic fit_minimizer on a whitened residual.
 
     :param TY: Transformed moving points for this iteration (M, 3).
     :param estep: Output of LSG E-step with at least "M0" (M,3,3) and "M1" (M,3).
@@ -2540,11 +3832,8 @@ def _cpd_mstep_lsg_least_squares(
         # Initial offset near zero
         init_offsets = np.zeros(3, dtype=float)
 
-    # Any extra optimizer kwargs can be passed via params_fit_or_bin["fit_func"] in your framework,
-    # but here we mirror your ICP call signature exactly and keep it simple.
     results = fit_minimizer(fit_func, init_offsets, loss=loss_func)
 
-    # Mypy: having results as "None" is impossible, but not understood through overloading of your fit wrapper
     assert results is not None
 
     if not only_translation:
@@ -2586,9 +3875,8 @@ def _cpd_shrink_lsg(
 
     sigma2_new = q / max(3.0 * sum_P, 1e-12)
 
-    # If sigma2 gets negative, we use a minimal sigma value instead
-    if sigma2_new <= 0:
-        sigma2_new = sigma2_min
+    # If sigma2 gets too small, we use a minimal sigma value instead
+    sigma2_new = max(float(sigma2_new), float(sigma2_min))
 
     return float(sigma2_new), float(q)
 
@@ -2610,8 +3898,9 @@ def _cpd_fit(
     """
     Fit step of Coherent Point Drift by expectation-minimization, with variance updating.
 
-    See Myronenko and Song (2010), https://doi.org/10.1109/TPAMI.2010.46, Figure 2, for equations below.
-    See Liu et al. (2021), https://doi.org/10.1109/ICCV48922.2021.01501 for local surface geometry method.
+    See Myronenko and Song (2010), https://doi.org/10.1109/TPAMI.2010.46, Figure 2, for equations below and in
+    subfunctions.
+    See Liu et al. (2021), https://doi.org/10.1109/ICCV48922.2021.01501 for local surface geometry (LSG) method.
 
     Note: CPD often solves for the full absolute transform again at every step with different initialization.
     Here we solve for the step transform instead with no initialization (equivalent), but carry the absolute
@@ -2628,12 +3917,14 @@ def _cpd_fit(
     M, _ = Y.shape
 
     # 0/ Initialize variance if not defined
+    assert cache is not None
     if sigma2 is None:
-        diff2 = (X[None, :, :] - TY[:, None, :]) ** 2
-        sigma2 = float(np.sum(diff2) / (D * N * M))
+        # Match the weighted distances used by the expectation step
+        weights = cache["classic"]["w"]
+        spread = X.var(axis=0) + TY.var(axis=0) + (X.mean(axis=0) - TY.mean(axis=0)) ** 2
+        sigma2 = max(float(np.sum(weights * spread) / D), sigma2_min)
 
     # Get kNN tree if used to accelerate expectation step
-    assert cache is not None
     knn = None if cache is None else cache.get("knn", None)
     knn_tree = None if knn is None else knn["tree"]
     knn_k = None if knn is None else knn["k"]
@@ -2673,7 +3964,7 @@ def _cpd_fit(
 
         # 3/ Update variance and objective function
         sigma2_new, q = _cpd_shrink_classic(
-            X=X, Ycur=TY, estep=estep, R=R, s=s, w=w, sigma2=float(sigma2), sigma2_min=float(sigma2_min)
+            X=X, Ycur=TY, estep=estep, R=R, t=t, s=s, w=w, sigma2=float(sigma2), sigma2_min=float(sigma2_min)
         )
 
     # LSG-CPD
@@ -2846,7 +4137,7 @@ def cpd(
             ref_transform, tba_transform = tba_transform, ref_transform
 
         # Now ref is always the array
-        aux_vars = _dem_normals_curvature(ref_elev, ref_transform, return_curvature=True)
+        aux_vars = _dem_normals_curvature(ref_elev, ref_transform)
         aux_tied_to = "ref"
     else:
         aux_vars = None
@@ -2855,7 +4146,7 @@ def cpd(
     # If we iterate the sampling, we re-define maximum iterations to be in the outside loop,
     # running a single CPD iteration with every sample
     if sampling_strategy == "iterative_same_xy":
-        in_loop_max_it = max_iterations
+        in_loop_max_it = 1
         out_loop_max_it = max_iterations
         in_loop_sampling_strategy = "same_xy"
     # Otherwise, we run a single iteration of outside loop, as if there was no loop
@@ -2888,6 +4179,7 @@ def cpd(
             area_or_point=area_or_point,
             sampling_strategy=in_loop_sampling_strategy,
             z_name=z_name,
+            preserve_coordinates=True,
         )
 
         # Remove centroid and standardize to facilitate numerical convergence
@@ -2899,15 +4191,14 @@ def cpd(
         # Re-stack normals if defined
         if sub_aux is not None:
             norms = np.vstack((sub_aux["nx"], sub_aux["ny"], sub_aux["nz"])).T
-            curv = sub_aux["curv"]
         else:
             norms = None
-            curv = None
 
         # Run rigid CPD registration
         # Iterate through method until tolerance or max number of iterations is reached
         iterating_input = (init_matrix, new_sigma2, new_q)
-        sigma2_min = tolerance_translation / 10 if tolerance_translation is not None else np.finfo(float).eps
+        # Square the tolerance for the variance bound
+        sigma2_min = (tolerance_translation / 10) ** 2 if tolerance_translation is not None else np.finfo(float).eps
         # Pre-compute values reused through iteration for efficiency
         cpd_cache = _cpd_precompute(
             ref_epc=ref_epc,
@@ -2915,7 +4206,6 @@ def cpd(
             weight_cpd=weight_cpd,
             lsg=lsg,
             ref_normals=norms,
-            curvature=curv,
             axis_weights=w_axis,
             estep_knn_k=estep_knn_k,
         )
@@ -2942,16 +4232,9 @@ def cpd(
         new_sigma2 = new_output[1]
         new_q = new_output[2]
 
-        # Prints to help debug
-        # trans_rot = translations_rotations_from_matrix(out_step_matrix)
-        # print(f"Sampling iteration {i}: step translation/rotations: {trans_rot[3]}")
-
         # We invert, destandardize and update the matrix
         out_step_matrix[:3, 3] *= scale
         final_matrix = out_step_matrix @ final_matrix
-
-        # trans_rot = translations_rotations_from_matrix(final_matrix)
-        # print(f"Sampling iteration {i}: full matrix translation/rotations: {trans_rot[3]}")
 
         # If we apply iterative sampling, we need to do additional things each loop
         if sampling_strategy == "iterative_same_xy":
@@ -3061,10 +4344,14 @@ def _lzd_aux_vars(
         # Derive slope and aspect from the raster dataset
         gradient_y, gradient_x = np.gradient(rst_arr)
 
-    # Convert to unitary gradient depending on resolution
-    res = _res(transform)
-    gradient_x = gradient_x / res[0]
-    gradient_y = -gradient_y / res[1]  # Because raster Y axis is inverted, need to add a minus
+    # Convert column/row derivatives to gradients per map X/Y unit
+    # The inverse affine accounts for both pixel size and rotation
+    # For a north-up raster, inverse.e is already negative (because rows increase southward), so matches the gradient
+    inverse = ~transform
+    gradient_x, gradient_y = (
+        inverse.a * gradient_x + inverse.d * gradient_y,
+        inverse.b * gradient_x + inverse.e * gradient_y,
+    )
 
     return gradient_x, gradient_y
 
@@ -3230,109 +4517,220 @@ def _lzd_fit_func(
     return res
 
 
-def _convert_lengthscale_gstools_gpytorch(correlation_range: float) -> float:
-
-    # Divide by 2 because I used rescale=2 in GSTools (to get effective range)
-    gp_lengthscale = correlation_range / 2 / np.sqrt(2)
-
-    return gp_lengthscale
-
-
-def _gls_lazy_gpytorch(
-    xcoord: NDArrayf,
-    ycoord: NDArrayf,
-    X: NDArrayf,
-    Y: NDArrayf,
-    sig_Y: NDArrayf,
-    lengthscale: float = 0.2,
-    outputscale: float = 1.0,
-    cg_tol: float = 1e-3,
-    max_preconditioner_size: int = 100,
-    jitter: float = 1e-3,
-) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
+def _lzd_tls_observation_covariance(
+    inputs: Sequence[NDArray[Any]],
+    errors: _SampledErrors,
+    pixel_size: float | tuple[float, float],
+    only_translation: bool,
+    gradient_variances: tuple[NDArrayf, NDArrayf] | None = None,
+) -> tuple[NDArray[Any], NDArray[Any]]:
     """
-    Perform generalized least squares (GLS) using GPyTorch lazy covariances based on kernels to scale efficiently
-    with a large number of points.
+    Calculate the covariances of height differences and TLS gradient variables.
 
-    This workflow has the benefit of never having to invert the full NxN covariance like for traditional GLS,
-    but instead solves for covariance * vector, as usually done in Gaussian Processes.
-    It also has a more stable inversion than Cholesky methods for kernel-type covariances through conjugate gradients.
+    The results have shapes (N,) and (2 or 5, 2 or 5, N). Complex heights and gradients are supported
+    so the same formulas can be differentiated when propagating native elevation errors.
+    gradient_variances supplies per-observation X/Y variances for mapped correlation components.
     """
-    # This feature requires GPytorch and dependencies (torch, linear_operator)
-    import_optional("gpytorch")
 
-    import gpytorch
-    import torch
+    x, y, z, _, gx, gy = inputs
+    sig_h_other, _, sig_h_grid, corr_h_grid = errors
 
-    # Dependency of GPyTorch (used to live in GPyTorch directly)
-    from linear_operator.operators import (
-        DiagLinearOperator,
-        MatmulLinearOperator,
+    # Transform sigma in variance to simplify writing below
+    # If sig_h_grid is not defined, we simply apply a fraction of sig_h_other
+    if sig_h_grid is not None:
+        var_h_grid = sig_h_grid**2
+    elif sig_h_other is not None:
+        var_h_grid = np.mean(sig_h_other**2) / 1000 * np.ones(len(x))
+    else:
+        raise ValueError("TLS error propagation requires elevation errors for at least one input.")
+
+    # Get amplitude of gradient errors from elevation errors and their correlations
+    spacing_x, spacing_y = pixel_size if isinstance(pixel_size, tuple) else (pixel_size, pixel_size)
+    corr_func = corr_h_grid[0] if corr_h_grid is not None else None
+    if gradient_variances is None:
+        correlation_x = corr_func(2 * spacing_x) if corr_func is not None else 0
+        correlation_y = corr_func(2 * spacing_y) if corr_func is not None else 0
+        var_gx = var_h_grid * (1 - correlation_x) / (2 * spacing_x**2)
+        var_gy = var_h_grid * (1 - correlation_y) / (2 * spacing_y**2)
+    else:
+        var_gx, var_gy = gradient_variances
+    var_dh = var_h_grid + sig_h_other**2 if sig_h_other is not None else var_h_grid
+    var_z = var_h_grid / 10000
+    var_x = var_h_grid / 10000
+    var_y = var_h_grid / 10000
+
+    # 1/ Covariance of dependent variable
+    cov_Y = var_dh
+
+    # 2/ Covariance of independent variable
+    # Build a (2, 2, N) or (5, 5, N) covariance for gradients and optional rotation variables
+    # The intercept constant (z translation) has no input error and is added by the multilinear model
+
+    # Diagonals
+    var_X = np.array(
+        [
+            var_gx,
+            var_gy,
+            z**2 * var_gy + var_z * gy**2 + var_y,
+            z**2 * var_gx + var_z * gx**2 + var_x,
+            y**2 * var_gx + x**2 * var_gy + var_x * gy**2 + var_y * gx**2,
+        ]
     )
 
-    # Convert with from_numpy() to ensure it shares memory with the NumPy array
-    Xt = torch.from_numpy(X)
-    Yt = torch.from_numpy(Y)
+    # For zeros
+    zeros = np.zeros(len(z))
+    # Deactivate black formatting for readability of the matrix
+    # fmt: off
+    cov_XX = np.stack(
+        [
+            [
+                var_X[0], zeros, zeros, z * var_gx, -y * var_gx,
+            ],
+            [
+                zeros, var_X[1], -z * var_gy, zeros, x * var_gy,
+            ],
+            [
+                zeros, -z * var_gy, var_X[2], var_z * gx * gy, -z * x * var_gy + gx * var_y,
+            ],
+            [
+                z * var_gx, zeros, var_z * gx * gy, var_X[3], -z * y * var_gx + gy * var_x,
+            ],
+            [
+                -y * var_gx,
+                x * var_gy,
+                -z * x * var_gy + gx * var_y,
+                -z * y * var_gx + gy * var_x,
+                var_X[4],
+            ],
+        ]
+    )
+    # Reactivate black formatting
+    # fmt: on
 
-    # 1/ Create lazy covariance from kernel
-    coords = torch.stack([torch.from_numpy(xcoord), torch.from_numpy(ycoord)], dim=1)  # N x 2
-    dtype = coords.dtype
+    # Translation fits use only gradient errors, excluding coordinate errors from the rotation variables
+    if only_translation:
+        var_X = var_X[:2]
+        cov_XX = cov_XX[:2, :2]
 
-    # Exponential kernel = RBF
-    base = gpytorch.kernels.RBFKernel(ard_num_dims=2)
-    base.lengthscale = torch.tensor(lengthscale, dtype=dtype)
-    base.raw_lengthscale.requires_grad_(False)
-
-    scale = gpytorch.kernels.ScaleKernel(base)
-    scale.outputscale = torch.tensor(outputscale, dtype=dtype)
-    scale.raw_outputscale.requires_grad_(False)
-
-    # This returns a LazyEvaluatedKernelTensor (not a full NxN covariance matrix)
-    K_lazy = scale(coords, coords)
-
-    # Add jitter (for numerical stability)
-    if jitter != 0:
-        K_lazy = gpytorch.add_jitter(K_lazy, jitter)
-
-    # Multiply the covariance by heteroscedastic noise in an outer product
-    sigma_noise = torch.from_numpy(sig_Y)
-    D = DiagLinearOperator(sigma_noise)  # diag(sigma)
-    DK = MatmulLinearOperator(D, K_lazy)
-    K_lazy = MatmulLinearOperator(DK, D)
-
-    # 2/ Use conjugate-gradient settings for solving inversion
-    with gpytorch.settings.cg_tolerance(cg_tol), gpytorch.settings.max_preconditioner_size(max_preconditioner_size):
-
-        Sinv_y = gpytorch.functions.solve(K_lazy, Yt)  # n×1
-        Sinv_X = gpytorch.functions.solve(K_lazy, Xt)  # n×p
-
-    # We compute the terms required for the GLS
-    XtSinvX = Xt.T @ Sinv_X
-    XtSinvY = Xt.T @ Sinv_y
-    # We ensure full symmetry before final solve
-    XtSinvX = (XtSinvX + XtSinvX.T) * 0.5
-    # Derive coefficients, their covariance, and standard errors
-    beta_hat = torch.linalg.solve(XtSinvX, XtSinvY)
-    cov_beta = torch.linalg.inv(XtSinvX)
-    se_beta = torch.sqrt(torch.diag(cov_beta))
-
-    return beta_hat.numpy(), se_beta.numpy(), cov_beta.numpy()
+    return cov_Y, cov_XX
 
 
-def _lzd_fit_error_propag(
+def _lzd_tls_score(
+    beta: NDArray[Any],
+    inputs: Sequence[NDArray[Any]],
+    errors: _SampledErrors,
+    pixel_size: float | tuple[float, float],
+    gradient_variances: tuple[NDArrayf, NDArrayf] | None = None,
+) -> NDArray[Any]:
+    """
+    Calculate each observation's contribution to the TLS objective derivative.
+
+    This reproduces the weights and regularization in _lzd_fit_gls_tls(). Profiling out the ODR observation
+    adjustments gives sum(residual**2 / variance), where variance depends on the fitted parameters. We also
+    differentiate that variance, including its dependence on heights and gradients. Complex inputs are supported
+    so _lzd_tls_spatial_covariance() can calculate derivatives without subtracting nearly equal values.
+    """
+
+    # 1/ Reproduce the original TLS observation variances
+    variance_y, covariance_x = _lzd_tls_observation_covariance(
+        inputs, errors, pixel_size, len(beta) == 3, gradient_variances
+    )
+    covariance_x = covariance_x.transpose(2, 0, 1)
+
+    # 2/ Build the gradient and rotation variables, in ODR order with the vertical translation first
+    x, y, z, dh, gx, gy = inputs
+    variables = np.stack((-gx, -gy, y + gy * z, -x - gx * z, gx * y - gy * x))
+    if len(beta) == 3:
+        variables = variables[:2]
+
+    return _tls_score(beta, variables, dh, variance_y, covariance_x.transpose(1, 2, 0))
+
+
+def _lzd_tls_observation_jacobians(
+    beta: NDArrayf,
+    inputs: tuple[NDArrayf, NDArrayf, NDArrayf, NDArrayf, NDArrayf, NDArrayf],
+    errors: _SampledErrors,
+    pixel_size: float | tuple[float, float],
+    gradient_variances: tuple[NDArrayf, NDArrayf] | None = None,
+) -> tuple[NDArrayf, NDArrayf, NDArrayf, NDArrayf]:
+    """Differentiate the TLS fit with respect to sampled heights, differences and gradients."""
+
+    # 1/ Differentiate the TLS estimating equation with respect to parameters and measured values
+    order = np.array([1, 2, 0] if len(beta) == 3 else [1, 2, 0, 3, 4, 5])
+    parameters = beta[np.argsort(order)]
+    step = 1e-20
+    hessian = np.empty((len(beta), len(beta)))
+    for column in range(len(beta)):
+        moved = parameters.astype(complex)
+        moved[column] += 1j * step
+        hessian[:, column] = (
+            np.imag(_lzd_tls_score(moved, inputs, errors, pixel_size, gradient_variances).sum(axis=0)) / step
+        )
+    hessian = (hessian + hessian.T) / 2
+
+    # Coordinates are fixed, while other heights, elevation differences and both gradients are uncertain
+    derivatives = []
+    for column in (2, 3, 4, 5):
+        moved_inputs: list[NDArray[Any]] = list(inputs)
+        moved_inputs[column] = inputs[column].astype(complex) + 1j * step
+        derivative = (
+            np.imag(_lzd_tls_score(parameters, tuple(moved_inputs), errors, pixel_size, gradient_variances)) / step
+        )
+        derivatives.append(-np.linalg.solve(hessian, derivative.T)[order])
+
+    return derivatives[0], derivatives[1], derivatives[2], derivatives[3]
+
+
+def _lzd_tls_spatial_covariance(
+    beta: NDArrayf,
+    inputs: tuple[NDArrayf, NDArrayf, NDArrayf, NDArrayf, NDArrayf, NDArrayf],
+    errors: _SampledErrors,
+    pixel_size: float | tuple[float, float],
+    error_structure: tuple[gu.ErrorStructure | None, gu.ErrorStructure | None],
+    error_predictors: tuple[Mapping[str, Any] | None, Mapping[str, Any] | None],
+    gradient_variances: tuple[NDArrayf, NDArrayf] | None = None,
+) -> NDArrayf:
+    """Propagate spatial height and gradient errors through the sampled TLS estimating equation."""
+
+    # Differentiate the fit with respect to the sampled variables
+    height, difference, gradient_x, gradient_y = _lzd_tls_observation_jacobians(
+        beta, inputs, errors, pixel_size, gradient_variances
+    )
+    coordinates = np.column_stack(inputs[:2])
+    covariance = np.zeros((len(beta), len(beta)))
+
+    # Both elevation inputs contribute to differences, while the grid also contributes gradient errors
+    other, grid = error_structure
+    if other is not None:
+        covariance += _propagate_sampled_covariance(coordinates, height - difference, other, error_predictors[0])
+    if grid is not None:
+        covariance += _propagate_sampled_covariance(
+            coordinates, difference, grid, error_predictors[1], (gradient_x, gradient_y), pixel_size
+        )
+    return covariance
+
+
+def _lzd_fit_gls_tls(
     x: NDArrayf,
     y: NDArrayf,
     z: NDArrayf,
     dh: NDArrayf,
     gx: NDArrayf,
     gy: NDArrayf,
-    pixel_size: float,
+    pixel_size: float | tuple[float, float],
     sig_h_other: NDArrayf | None,
     corr_h_other: _CorrelationModel | None,
     sig_h_grid: NDArrayf | None = None,
     corr_h_grid: _CorrelationModel | None = None,
     force_opti: Literal["gls", "tls"] | None = None,
     only_translation: bool = False,
+    gls_method: Literal["approximate", "exact", "inducing"] = "approximate",
+    gls_neighbors: int | None = None,
+    gls_rank: int | None = None,
+    components: Sequence[tuple[NDArrayf, _CorrelationModel | None]] | None = None,
+    error_structure: tuple[gu.ErrorStructure | None, gu.ErrorStructure | None] | None = None,
+    error_predictors: tuple[Mapping[str, Any] | None, Mapping[str, Any] | None] = (None, None),
+    tls_method: Literal["spatial", "independent"] = "independent",
 ) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
     """
     Error-aware LZD using either generalized least-squares (GLS) or total least-squares (TLS), depending on
@@ -3340,6 +4738,9 @@ def _lzd_fit_error_propag(
 
     Fit three translations when only_translation=True, otherwise also fit three rotations. Return parameter
     estimates, standard errors and their covariance in the order tx, ty, tz, followed by rx, ry, rz when fitted.
+
+    GLS approximates the supplied spatial covariance by default. Set gls_method="exact" for the full covariance.
+    TLS uses height and gradient errors at each observation and assumes spatially independent observations.
     """
 
     # Test data
@@ -3370,6 +4771,62 @@ def _lzd_fit_error_propag(
     #     return np.exp(-(d/10)**2)
     # var_gx = np.abs(np.random.normal(size=50))
     # var_gy = np.abs(np.random.normal(size=50))
+
+    component_coordinates = None
+    gradient_variances = None
+
+    # Evaluate the lightweight models on the co-sampled predictors
+    if error_structure is not None:
+        sampled_components = []
+        component_coordinates = []
+        magnitudes = []
+        grid_components: list[tuple[gu.ErrorComponent, NDArrayf]] = []
+        for source_index, (model, predictor) in enumerate(zip(error_structure, error_predictors)):
+            values = []
+            if model is not None:
+                _, component_data = _prepare_source_errors(model, len(x), np.column_stack((x, y)), predictor)
+                if source_index == 1:
+                    grid_components.extend(component_data)
+                for component, magnitude in component_data:
+                    correlation = None if component.correlation is None else (component.predict_correlation, 0.0)
+                    values.append((magnitude, correlation))
+                    locations = np.column_stack((x, y))
+                    dimensions = None if component.correlation is None else component.correlation.active_dims
+                    if dimensions is not None:
+                        locations[:, [axis for axis in range(2) if axis not in dimensions]] = 0
+                    component_coordinates.append(locations)
+            sampled_components.append(values)
+            magnitudes.append(np.sqrt(sum(sigma**2 for sigma, _ in values)) if values else None)
+        sig_h_other, sig_h_grid = magnitudes
+        components = sampled_components[0] + sampled_components[1]
+
+        # Derive each gradient variance from the components that vary along that axis
+        spacing = pixel_size if isinstance(pixel_size, tuple) else (pixel_size, pixel_size)
+        if grid_components:
+            gradient_variances = (np.zeros(len(x)), np.zeros(len(x)))
+            for component, magnitude in grid_components:
+                dimensions = None if component.correlation is None else component.correlation.active_dims
+                for axis, distance in enumerate(spacing):
+                    lag = 2 * distance if dimensions is None or axis in dimensions else 0
+                    gradient_correlation = 0 if component.correlation is None else component.predict_correlation(lag)
+                    gradient_variances[axis][:] += magnitude**2 * (1 - gradient_correlation) / (2 * distance**2)
+
+        # Weight each grid component's gradient correlation by its sampled variance
+        corr_h_other = None
+        corr_h_grid = None
+        if sampled_components[1]:
+
+            def correlation_spacing(distance: Any) -> NDArrayf:
+                """Combine the grid components' correlations at the gradient spacing."""
+
+                assert sig_h_grid is not None
+                variance = sig_h_grid**2
+                numerator = sum(
+                    sigma**2 * (0 if corr is None else corr[0](distance)) for sigma, corr in sampled_components[1]
+                )
+                return np.divide(numerator, variance, out=np.zeros_like(variance), where=variance > 0)
+
+            corr_h_grid = (correlation_spacing, 0.0)
 
     # Linear regression Y = β X
     # Independent variable
@@ -3439,22 +4896,14 @@ def _lzd_fit_error_propag(
         # logging.info(f"Statsmodel GLS beta: {beta}")
         # logging.info(f"Statsmodel GLS SE: {sd_beta}")
 
-        if corr_h_other is not None:
-            gp_ls = _convert_lengthscale_gstools_gpytorch(corr_h_other[1])
-        elif corr_h_grid is not None:
-            gp_ls = _convert_lengthscale_gstools_gpytorch(corr_h_grid[1])
-        else:
-            raise ValueError("GLS error propagation requires a correlation model for at least one elevation input.")
+        # Independent elevation inputs contribute separate covariances to their differences
+        sampled_errors = (sig_h_other, corr_h_other, sig_h_grid, corr_h_grid)
+        beta, sd_beta, cov_beta = _fit_gls(
+            x, y, X2, Y, sampled_errors, gls_method, gls_neighbors, gls_rank, components, component_coordinates
+        )
 
-        # We pass sigma for Y = dh, which can depend on both inputs
-        sig_h_o = sig_h_other if sig_h_other is not None else 0
-        sig_h_g = sig_h_grid if sig_h_grid is not None else 0
-        sig_dh = np.sqrt(sig_h_o**2 + sig_h_g**2)
-        # Perform GLS with GPyTorch
-        beta, sd_beta, cov_beta = _gls_lazy_gpytorch(xcoord=x, ycoord=y, X=X2, Y=Y, sig_Y=sig_dh, lengthscale=gp_ls)
-
-        logging.info(f"GPyTorch-based GLS beta: {beta}")
-        logging.info(f"GPyTorch-based GLS SE: {sd_beta}")
+        logging.info(f"GLS beta: {beta}")
+        logging.info(f"GLS SE: {sd_beta}")
 
     # 2/ TOTAL LEAST SQUARES: Errors in both dependent variable Y and independent variable X
     # In our case, if the gridded elevation and its gradient have significant errors
@@ -3465,127 +4914,23 @@ def _lzd_fit_error_propag(
 
         logging.info("Error passed for gridded elevation, using TLS for LZD error propagation.")
 
-        # Transform sigma in variance to simplify writing below
-        # If sig_h_grid is not defined, we simply apply a fraction of sig_h_other
-        if sig_h_grid is not None:
-            var_h_grid = sig_h_grid**2
-        elif sig_h_other is not None:
-            var_h_grid = np.mean(sig_h_other**2) / 1000 * np.ones(len(x))
-        else:
-            raise ValueError("TLS error propagation requires elevation errors for at least one input.")
-
-        # Get amplitude of gradient errors from elevation errors and their correlations
-        corr_func = corr_h_grid[0] if corr_h_grid is not None else None
-        corr_grad_spacing = corr_func(2 * pixel_size) if corr_func is not None else 0
-
-        logging.info(f"Correlation at gradient spacing: {corr_grad_spacing:.2f}")
-        var_gx = var_h_grid / 2 * (1 - corr_grad_spacing) / (pixel_size**2)
-        var_gy = var_h_grid / 2 * (1 - corr_grad_spacing) / (pixel_size**2)
-        var_dh = var_h_grid + sig_h_other**2 if sig_h_other is not None else var_h_grid
-        var_z = var_h_grid / 10000
-        var_x = var_h_grid / 10000
-        var_y = var_h_grid / 10000
-
-        from scipy.odr import ODR, Data, multilinear
+        spacing_x = pixel_size[0] if isinstance(pixel_size, tuple) else pixel_size
+        corr_grad_spacing = 0 if corr_h_grid is None else corr_h_grid[0](2 * spacing_x)
+        logging.info(f"Mean correlation at gradient spacing: {np.mean(corr_grad_spacing):.2f}")
 
         # CAVEAT: This ODR implementation doesn't support autocorrelation of the variables,
         # only heteroscedasticity and inter-correlation between independent variables
         # Thankfully, both elevation errors and its gradient errors share the same correlation lengths,
         # so we can simply sample sparse points according to the correlation error
         # 1/ Covariance of dependent variable
-        cov_Y = var_dh
-        # Convert to weight, easy for a vector variance
-        w_Y = 1 / cov_Y
-
-        # 2/ Covariance of independent variable
-        # Build a (2, 2, N) or (5, 5, N) covariance for gradients and optional rotation variables
-        # The intercept constant (z translation) has no input error and is added by the multilinear model
-
-        # Diagonals
-        var_X = np.array(
-            [
-                var_gx,
-                var_gy,
-                z**2 * var_gy + var_z * gy**2 + var_y,
-                z**2 * var_gx + var_z * gx**2 + var_x,
-                y**2 * var_gx + x**2 * var_gy + var_x * gy**2 + var_y * gx**2,
-            ]
+        cov_Y, cov_XX = _lzd_tls_observation_covariance(
+            (x, y, z, dh, gx, gy),
+            (sig_h_other, corr_h_other, sig_h_grid, corr_h_grid),
+            pixel_size,
+            only_translation,
+            gradient_variances,
         )
-
-        # For zeros
-        zeros = np.zeros(len(z))
-        # Deactivate black formatting for readability of the matrix
-        # fmt: off
-        cov_XX = np.stack(
-            [
-                [
-                    var_X[0], zeros, zeros, z * var_gx, -y * var_gx,
-                ],
-                [
-                    zeros, var_X[1], -z * var_gy, zeros, x * var_gy,
-                ],
-                [
-                    zeros, -z * var_gy, var_X[2], var_z * gx * gy, -z * x * var_gy + gx * var_y,
-                ],
-                [
-                    z * var_gx, zeros, var_z * gx * gy, var_X[3], -z * y * var_gx + gy * var_x,
-                ],
-                [
-                    -y * var_gx,
-                    x * var_gy,
-                    -z * x * var_gy + gx * var_y,
-                    -z * y * var_gx + gy * var_x,
-                    var_X[4],
-                ],
-            ]
-        )
-        # Reactivate black formatting
-        # fmt: on
-
-        # Translation fits use only gradient errors, excluding coordinate errors from the rotation variables
-        if only_translation:
-            var_X = var_X[:2]
-            cov_XX = cov_XX[:2, :2]
-
-        ratio_X = np.mean(cov_Y) / np.var(Y)
-        logging.info(f"Y error/variance ratio: {ratio_X}")
-        ratio_X = np.mean(var_X, axis=1) / np.var(X, axis=1)
-        logging.info(f"X error/variance ratio: {ratio_X}")
-
-        # TODO: Move those to tests
-        # ind_symmetric = [np.all(np.array_equal(cov_XX[:, :, i], cov_XX[:, :, i].T)) for i in range(cov_XX.shape[-1])]
-        # ind_pos_semidef = np.array([np.all(np.linalg.eigvals(cov_XX[:, :, i]) > 0) for i in range(cov_XX.shape[-1])])
-        #
-        # indices_wrong = np.arange(len(ind_pos_semidef))[ind_pos_semidef]
-        #
-        # for i in range(len(indices_wrong)):
-        #     print(f"Variance: {var_h_grid[indices_wrong[i]]}")
-        #     print(f"Gradient X: {gx[indices_wrong[i]]}")
-        #     print(f"Gradient Y: {gy[indices_wrong[i]]}")
-        #     print(f"X: {x[indices_wrong[i]]}")
-        #     print(f"Y: {y[indices_wrong[i]]}")
-        #     print(f"Z: {z[indices_wrong[i]]}")
-
-        # Invert each observation covariance to obtain weights (observations are assumed uncorrelated)
-        w_XX = np.ones(cov_XX.shape)
-        for i in range(cov_XX.shape[-1]):
-            # Regularize diagonal with 10e-3 term to ensure semi-positiveness
-            reg = 10e-6 * np.eye(cov_XX.shape[0]) * np.mean(np.diag(cov_XX[:, :, i]))
-            w_XX[:, :, i] = np.linalg.inv(cov_XX[:, :, i] + reg)
-
-        # rd = RealData(x=X, y=Y, covx=cov_XX, covy=cov_Y)
-        rd = Data(x=X, y=Y, we=w_Y, wd=w_XX)
-        # Fit one coefficient per input variable and the vertical translation as an intercept
-        odr = ODR(rd, multilinear, beta0=np.zeros(X.shape[0] + 1))
-
-        output = odr.run()
-        # logging.info("TLS summary from scipy.odr:")
-        # logging.info(output.pprint())
-
-        # Get output
-        beta = output.beta
-        sd_beta = output.sd_beta
-        cov_beta = output.cov_beta
+        beta, sd_beta, cov_beta = _fit_tls(X, Y, cov_Y, cov_XX)
 
     # logging.info(beta1)
     # logging.info(beta2)
@@ -3596,6 +4941,23 @@ def _lzd_fit_error_propag(
     sd_beta = sd_beta[ind]
     cov_beta = cov_beta[np.ix_(ind, ind)]
 
+    # Spatial TLS uses the model's covariance between sampled height and gradient errors
+    if (
+        error_structure is not None
+        and tls_method == "spatial"
+        and (force_opti == "tls" or (force_opti is None and sig_h_grid is not None))
+    ):
+        sampled_errors = (sig_h_other, corr_h_other, sig_h_grid, corr_h_grid)
+        cov_beta = _lzd_tls_spatial_covariance(
+            beta,
+            (x, y, z, dh, gx, gy),
+            sampled_errors,
+            pixel_size,
+            error_structure,
+            error_predictors,
+            gradient_variances,
+        )
+        sd_beta = np.sqrt(np.maximum(np.diag(cov_beta), 0))
     return beta, sd_beta, cov_beta
 
 
@@ -3608,13 +4970,23 @@ def _lzd_fit_linearized(
     grady: NDArrayf,
     params_fit_or_bin: InFitOrBinDict,
     only_translation: bool,
-    pixel_size: float,
-    errors: _LzdSampledErrors | None = None,
+    pixel_size: float | tuple[float, float],
+    errors: _SampledErrors | None = None,
     force_opti: Literal["ols", "gls", "tls"] | None = None,
+    gls_method: Literal["approximate", "exact", "inducing"] = "approximate",
+    gls_neighbors: int | None = None,
+    gls_rank: int | None = None,
+    error_structure: tuple[gu.ErrorStructure | None, gu.ErrorStructure | None] | None = None,
+    error_predictors: tuple[Mapping[str, Any] | None, Mapping[str, Any] | None] = (None, None),
+    tls_method: Literal["spatial", "independent"] = "independent",
+    error_output: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> tuple[NDArrayf, NDArrayf | None]:
     """
     Optimization of fit function for Least Z-difference coregistration.
+
+    _lzd_fit_gls_tls() fits the sampled observations and propagates their error structures.
+    The result contains the transformation matrix and parameter standard errors.
 
     :param x: X coordinate as 1D array.
     :param y: Y coordinate as 1D array.
@@ -3696,7 +5068,7 @@ def _lzd_fit_linearized(
         init_offsets = np.zeros(3)
 
     # Run optimizer on function
-    if force_opti == "ols" or (force_opti is None and errors is None):
+    if force_opti == "ols" or (force_opti is None and errors is None and error_structure is None):
 
         if force_opti == "ols":
             logging.info("Forcing method optimization method 'ols' for LZD.")
@@ -3708,8 +5080,8 @@ def _lzd_fit_linearized(
             beta = results.x
         err_beta = None
     else:
-        assert errors is not None
-        beta, err_beta, _ = _lzd_fit_error_propag(
+        errors = (None, None, None, None) if errors is None else errors
+        beta, err_beta, covariance = _lzd_fit_gls_tls(
             x=x,
             y=y,
             z=z,
@@ -3723,7 +5095,16 @@ def _lzd_fit_linearized(
             corr_h_grid=errors[3],
             force_opti=force_opti,
             only_translation=only_translation,
+            gls_method=gls_method,
+            gls_neighbors=gls_neighbors,
+            gls_rank=gls_rank,
+            error_structure=error_structure,
+            error_predictors=error_predictors,
+            tls_method=tls_method,
         )
+
+        if error_output is not None:
+            error_output["fit_pcov"] = covariance
 
     # Mypy: having beta as "None" is impossible, but not understood through overloading of _bin_or_and_fit_nd...
     assert beta is not None
@@ -3742,10 +5123,17 @@ def _lzd_fit(
     sub_grady: Callable[[tuple[NDArrayf, NDArrayf]], NDArrayf],
     params_fit_or_bin: Any,  # InFitOrBinDict
     only_translation: bool,
-    sub_errors: _LzdErrorInterpolators | None,
-    pixel_size: float,
+    sub_errors: _SampledErrors | None,
+    pixel_size: float | tuple[float, float],
     force_opti: Literal["ols", "gls", "tls"] | None = None,
     linearized: bool = True,
+    gls_method: Literal["approximate", "exact", "inducing"] = "approximate",
+    gls_neighbors: int | None = None,
+    gls_rank: int | None = None,
+    error_structure: tuple[gu.ErrorStructure | None, gu.ErrorStructure | None] | None = None,
+    error_predictors: tuple[Mapping[str, Any] | None, Mapping[str, Any] | None] = (None, None),
+    tls_method: Literal["spatial", "independent"] = "independent",
+    error_output: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> tuple[NDArrayf, NDArrayf | None]:
     """
@@ -3764,7 +5152,7 @@ def _lzd_fit(
     :param sub_grady: Interpolator for grid gradient along Y (used only for linearized solver).
     :param params_fit_or_bin: Fit configuration dictionary.
     :param only_translation: Whether to solve only for translation.
-    :param sub_errors: Error inputs (used only for linearized GLS/TLS path).
+    :param sub_errors: Error inputs (used only for linearized GLS/TLS).
     :param pixel_size: Pixel size in meters.
     :param force_opti: Force optimization method in linearized solver ("ols", "gls", "tls").
     :param linearized: Whether solver is "linearized" (R&T 1988 small-rotation) or not (exact vertical residual).
@@ -3777,13 +5165,24 @@ def _lzd_fit(
     if not linearized:
         if sub_errors is not None or force_opti is not None:
             # Nonlinear path currently ignores GLS/TLS error propagation
-            logging.info("Nonlinear LZD does not use GLS/TLS error propagation; using residual+loss only.")
+            logging.info("Nonlinear LZD does not support error propagation; using residual+loss only.")
 
         # Check the same terrain geometry as the linearized solve before nonlinear optimization
         x, y, z = trans_pts_epc
         gradx = sub_gradx((y, x))
         grady = sub_grady((y, x))
         valid = np.isfinite(gradx) & np.isfinite(grady) & np.isfinite(sub_rst((y, x))) & np.isfinite(z)
+        if params_fit_or_bin.get("trim_residuals", False):
+            # Select finite residuals before trimming the current point sample
+            residuals = sub_rst((y[valid], x[valid])) - z[valid]
+            trimmed = index_trimmed(
+                residuals,
+                central_estimator=params_fit_or_bin["trim_central_statistic"],
+                spread_estimator=params_fit_or_bin["trim_spread_statistic"],
+                spread_coverage=params_fit_or_bin["trim_spread_coverage"],
+                iterative=params_fit_or_bin["trim_iterative"],
+            )
+            valid[np.flatnonzero(valid)[trimmed]] = False
         _check_lzd_rank(
             x[valid] - centroid[0],
             y[valid] - centroid[1],
@@ -3794,7 +5193,7 @@ def _lzd_fit(
         )
         step_matrix = _lzd_fit_nonlinear(
             sub_rst=sub_rst,
-            pts_epc=trans_pts_epc,
+            pts_epc=trans_pts_epc[:, valid],
             centroid=centroid,
             params_fit_or_bin=params_fit_or_bin,
             only_translation=only_translation,
@@ -3814,14 +5213,7 @@ def _lzd_fit(
         gradx = sub_gradx((y, x))
         grady = sub_grady((y, x))
 
-        # Resolve and sample errors at the transformed coordinates (if provided)
-        if sub_errors is not None:
-            sub_sig_other, corr_other, sub_sig_grid, corr_grid = sub_errors
-            sig_other = sub_sig_other((y, x)) if sub_sig_other is not None else None
-            sig_grid = sub_sig_grid((y, x)) if sub_sig_grid is not None else None
-            errors = (sig_other, corr_other, sig_grid, corr_grid)
-        else:
-            errors = None
+        errors = sub_errors
 
         # Remove centroid before fit for better numerical conditioning
         x -= centroid[0]
@@ -3843,6 +5235,7 @@ def _lzd_fit(
                 "can be used at any iteration step, use subsample=1."
             )
 
+        # Apply validity mask to all variables potentially loaded
         x = x[valids]
         y = y[valids]
         z = z[valids]
@@ -3855,6 +5248,10 @@ def _lzd_fit(
             err_other = err_other[valids] if err_other is not None else None
             err_grid = err_grid[valids] if err_grid is not None else None
             errors = (err_other, corr_other, err_grid, corr_grid)
+        sampled_predictors = tuple(
+            {name: np.asarray(value)[valids] if np.ndim(value) else value for name, value in (predictors or {}).items()}
+            for predictors in error_predictors
+        )
 
         step_matrix, err_beta = _lzd_fit_linearized(
             x=x,
@@ -3868,6 +5265,13 @@ def _lzd_fit(
             errors=errors,
             pixel_size=pixel_size,
             force_opti=force_opti,
+            gls_method=gls_method,
+            gls_neighbors=gls_neighbors,
+            gls_rank=gls_rank,
+            error_structure=error_structure,
+            error_predictors=(sampled_predictors[0], sampled_predictors[1]),
+            tls_method=tls_method,
+            error_output=error_output,
             **kwargs,
         )
         return step_matrix, err_beta
@@ -3884,8 +5288,8 @@ def _lzd_iteration_step(
     params_fit_or_bin: InFitOrBinDict,
     only_translation: bool,
     linearized: bool,
-    sub_errors: _LzdErrorInterpolators | None,
-    pixel_size: float,
+    sub_errors: _SampledErrors | None,
+    pixel_size: float | tuple[float, float],
     force_opti: Literal["ols", "gls", "tls"] | None = None,
     fit_kwargs: dict[str, Any] | None = None,
 ) -> tuple[NDArrayf, dict[str, float], NDArrayf | None]:
@@ -3971,6 +5375,13 @@ def lzd(
     corr_ref: _CorrelationModel | None = None,
     corr_tba: _CorrelationModel | None = None,
     force_opti: Literal["ols", "gls", "tls"] | None = None,
+    gls_method: Literal["approximate", "exact", "inducing"] = "approximate",
+    gls_neighbors: int | None = None,
+    gls_rank: int | None = None,
+    error_structure: gu.ErrorStructure | Mapping[str, gu.ErrorStructure] | None = None,
+    error_predictors: Mapping[str, Mapping[str, Any]] | None = None,
+    tls_method: Literal["spatial", "independent"] | None = None,
+    error_output: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> tuple[NDArrayf, tuple[float, float, float], int, OutIterativeDict, NDArrayf | None]:
     """
@@ -3984,6 +5395,21 @@ def lzd(
     The function assumes we have two DEMs, or a DEM and an elevation point cloud, in the same CRS.
     """
 
+    models, predictors = _coreg_error_inputs(error_structure, error_predictors)
+    legacy_errors = any(value is not None for value in (sig_ref, sig_tba, corr_ref, corr_tba))
+    tls_method = _check_gls_tls_options(
+        models, legacy_errors, force_opti, gls_method, gls_neighbors, gls_rank, tls_method
+    )
+    if models:
+        if (
+            not linearized
+            or dict(params_fit_or_bin).get("fit_loss_func") != "linear"
+            or params_fit_or_bin.get("trim_residuals", False)
+        ):
+            raise NotImplementedError("LZD error models require a linearized fit with linear loss and no trimming.")
+        if any(t.b != 0 or t.d != 0 for t in (ref_transform, tba_transform) if t is not None):
+            raise NotImplementedError("Analytical LZD requires north-up raster grids.")
+
     logging.info("Running LZD coregistration")
 
     # Estimate centroid to use
@@ -3992,7 +5418,7 @@ def lzd(
         ref_elev=ref_elev if isinstance(ref_elev, np.ndarray) else tba_elev, transform=transform
     )[0]
 
-    pixel_size = _res(transform)[0]
+    pixel_size = _res(transform)
     continuous_grid = "reference" if ref_transform is not None else "to-be-aligned"
     logging.info(f"Using {continuous_grid} as continuous grid for deriving gradients.")
 
@@ -4007,8 +5433,23 @@ def lzd(
     # First, derive auxiliary variables of Nuth and Kääb (slope tangent, and aspect) for any point-raster input
     gradx, grady = _lzd_aux_vars(ref_elev=ref_elev, tba_elev=tba_elev, transform=transform)
 
+    # Bind every auxiliary to the elevation input whose observations it describes
+    grid_name = "ref" if ref_transform is not None else "tba"
+    other_name = "tba" if grid_name == "ref" else "ref"
+    auxiliaries: dict[str, Any] = {"gradient_x": gradx, "gradient_y": grady}
+    owners = dict.fromkeys(auxiliaries, grid_name)
+    for name, values in (("ref", sig_ref), ("tba", sig_tba)):
+        if values is not None:
+            auxiliaries[f"sigma_{name}"] = values
+            owners[f"sigma_{name}"] = name
+    for side, values in predictors.items():
+        for name, values_at_source in values.items():
+            if np.ndim(values_at_source):
+                auxiliaries[f"error_{side}_{name}"] = values_at_source
+                owners[f"error_{side}_{name}"] = side
+
     # Then, perform preprocessing: subsampling and interpolation of inputs and auxiliary vars at same points
-    sub_ref, sub_tba, _ = _subsample_rst_pts(
+    sub_ref, sub_tba, sub_aux = _subsample_rst_pts(
         subsample=params_random["subsample"],
         random_state=params_random["random_state"],
         ref_elev=ref_elev,
@@ -4020,6 +5461,8 @@ def lzd(
         crs=crs,
         area_or_point=area_or_point,
         z_name=z_name,
+        aux_vars=auxiliaries,
+        aux_tied_to=owners,
     )
     # Simplify output given that the X/Y coordinates are the same
     sub_coords = (sub_ref[0, :], sub_ref[1, :])
@@ -4047,28 +5490,24 @@ def lzd(
         grady, src_transform=transform, return_interpolator=True, area_or_point=area_or_point
     )
 
-    # If input errors were defined
-    if any(x is not None for x in [sig_ref, sig_tba, corr_ref, corr_tba]):
-        if sig_ref is not None:
-            sub_sig_ref = _reproject_horizontal_shift_samecrs(
-                sig_ref, src_transform=transform, return_interpolator=True, area_or_point=area_or_point
-            )
-        else:
-            sub_sig_ref = None
-        if sig_tba is not None:
-            sub_sig_tba = _reproject_horizontal_shift_samecrs(
-                sig_tba, src_transform=transform, return_interpolator=True, area_or_point=area_or_point
-            )
-        else:
-            sub_sig_tba = None
-        # We want to pass the errors as "sigma_other", "correlation_other", "sigma_grid", "correlation_grid",
-        # where "grid" is the DEM used for deriving the gradient
-        if ref_transform is not None:
-            sub_errors = (sub_sig_tba, corr_tba, sub_sig_ref, corr_ref)
-        else:
-            sub_errors = (sub_sig_ref, corr_ref, sub_sig_tba, corr_tba)
-    else:
-        sub_errors = None
+    # Read error predictors and magnitudes from the same valid observation sample
+    assert sub_aux is not None
+    sampled_predictors = {}
+    for side, values in predictors.items():
+        sampled_predictors[side] = {
+            name: sub_aux[f"error_{side}_{name}"] if np.ndim(value) else value for name, value in values.items()
+        }
+    sub_errors = None
+    if any(value is not None for value in (sig_ref, sig_tba, corr_ref, corr_tba)):
+        correlations = {"ref": corr_ref, "tba": corr_tba}
+        sub_errors = (
+            sub_aux.get(f"sigma_{other_name}"),
+            correlations[other_name],
+            sub_aux.get(f"sigma_{grid_name}"),
+            correlations[grid_name],
+        )
+    fit_models = (models.get(other_name), models.get(grid_name)) if models else None
+    fit_predictors = (sampled_predictors.get(other_name, {}), sampled_predictors.get(grid_name, {}))
 
     logging.info("Iteratively estimating rigid transformation:")
     # Iterate through method until tolerance or max number of iterations is reached
@@ -4086,7 +5525,16 @@ def lzd(
         sub_errors,
         pixel_size,
         force_opti,
-        kwargs,
+        dict(
+            kwargs,
+            gls_method=gls_method,
+            gls_neighbors=gls_neighbors,
+            gls_rank=gls_rank,
+            error_structure=fit_models,
+            error_predictors=fit_predictors,
+            tls_method=tls_method,
+            error_output=error_output,
+        ),
     )
     final_matrix, _, output_iterative, err_beta = _iterate_method(
         method=_lzd_iteration_step,
@@ -4095,6 +5543,17 @@ def lzd(
         tolerances={"translation": tolerance_translation, "rotation": tolerance_rotation},
         max_iterations=max_iterations,
     )
+
+    # Save the covariance in the original input order
+    if error_output is not None and "fit_pcov" in error_output:
+        if not output_iterative["converged"]:
+            raise ValueError("Analytical LZD requires a converged fit.")
+        count = len(error_output["fit_pcov"])
+        covariance = _transform_parameter_covariance(
+            final_matrix, error_output["fit_pcov"], local_increments=True, invert_output=ref == "pts"
+        )[:count, :count]
+        error_output["fit_pcov"] = covariance
+        err_beta = np.sqrt(np.maximum(np.diag(covariance), 0))
 
     # Invert matrix if reference was the point data
     if ref == "pts":
@@ -4462,6 +5921,7 @@ class VerticalShift(AffineCoreg):
         :param vshift_reduc_func: Reductor function to estimate the central tendency of the vertical shift.
             Defaults to the median.
         :param subsample: Subsample the input for speed-up. <1 is parsed as a fraction. >1 is a pixel count.
+            A value of 1 selects all valid observations.
         :param initial_shift: Tuple containing x, y and z shifts (in georeferenced units).
             These shifts are applied before the fit() part.
         """
@@ -4591,6 +6051,7 @@ class ICP(AffineCoreg):
         :param standardize: Whether to standardize input point clouds to the unit sphere for numerical convergence
             (tolerance is also standardized by the same factor).
         :param subsample: Subsample the input for speed-up. <1 is parsed as a fraction. >1 is a pixel count.
+            A value of 1 selects all valid observations.
         :param initial_shift: Tuple containing x, y and z shifts (in georeferenced units).
             These shifts are applied before the fit() part.
         """
@@ -4628,6 +6089,25 @@ class ICP(AffineCoreg):
 
         super().__init__(subsample=subsample, meta=meta, initial_shift=initial_shift)
 
+    def _check_analytical_uncertainty(self) -> None:
+        """Check ICP settings before fitting with analytical uncertainty."""
+
+        settings = self.meta["inputs"]
+        loss = settings["fitorbin"]["fit_loss_func"]
+        if (
+            settings["specific"]["icp_method"] != "point-to-plane"
+            or not settings["affine"]["linearized"]
+            or not isinstance(loss, str)
+            or loss != "linear"
+        ):
+            raise NotImplementedError("Analytical ICP requires linearized point-to-plane fitting with a linear loss.")
+        if settings["fitorbin"].get("trim_residuals", False):
+            raise NotImplementedError("Analytical ICP does not support residual trimming. Use numerical propagation.")
+        if settings["specific"]["sampling_strategy"] == "iterative_same_xy":
+            raise NotImplementedError(
+                "Analytical ICP requires a fixed sample. Use numerical propagation for iterative sampling."
+            )
+
     def _fit_any_rst_pts(
         self,
         ref_elev: NDArrayf | gpd.GeoDataFrame,
@@ -4643,12 +6123,19 @@ class ICP(AffineCoreg):
         **kwargs: Any,
     ) -> None:
 
+        error_structure = kwargs.get("error_structure")
+        if error_structure is not None:
+            self._check_analytical_uncertainty()
+
+        if {"predictors", "error_applied_to"} & kwargs.keys():
+            raise TypeError("Use error_structure and error_predictors mappings keyed by 'ref' and 'tba'.")
+
         # Get parameters stored in class
         params_random = self._meta["inputs"]["random"]
         params_fit_or_bin = self._meta["inputs"]["fitorbin"]
 
         # Call method
-        matrix, centroid, subsample_final, output_iterative = icp(
+        matrix, centroid, subsample_final, output_iterative, covariance = icp(
             ref_elev=ref_elev,
             tba_elev=tba_elev,
             inlier_mask=inlier_mask,
@@ -4669,6 +6156,17 @@ class ICP(AffineCoreg):
             sampling_strategy=self._meta["inputs"]["specific"]["sampling_strategy"],
             standardize=self._meta["inputs"]["affine"]["standardize"],
             anisotropic=self._meta["inputs"]["affine"]["anisotropic"],
+            error_structure=error_structure,
+            error_predictors=kwargs.get("error_predictors"),
+            sig_ref=kwargs.get("sig_ref"),
+            corr_ref=kwargs.get("corr_ref"),
+            sig_tba=kwargs.get("sig_tba"),
+            corr_tba=kwargs.get("corr_tba"),
+            force_opti=kwargs.get("force_opti"),
+            gls_method=kwargs.get("gls_method", "approximate"),
+            gls_neighbors=kwargs.get("gls_neighbors"),
+            gls_rank=kwargs.get("gls_rank"),
+            tls_method=kwargs.get("tls_method"),
         )
 
         # Write output to class
@@ -4683,6 +6181,12 @@ class ICP(AffineCoreg):
         self._meta["outputs"]["affine"] = output_affine
         self._meta["outputs"]["iterative"] = output_iterative
         self._meta["outputs"]["random"] = {"subsample_final": subsample_final}
+        self._meta["outputs"]["fitorbin"] = {}
+        if covariance is not None:
+            self._meta["outputs"]["fitorbin"] = {
+                "fit_perr": np.sqrt(np.maximum(np.diag(covariance), 0)),
+                "fit_pcov": covariance,
+            }
 
 
 class CPD(AffineCoreg):
@@ -4738,6 +6242,7 @@ class CPD(AffineCoreg):
         :param standardize: Whether to standardize input point clouds to the unit sphere for numerical convergence
             (tolerance is also standardized by the same factor).
         :param subsample: Subsample the input for speed-up. <1 is parsed as a fraction. >1 is a pixel count.
+            A value of 1 selects all valid observations.
         :param initial_shift: Tuple containing x, y and z shifts (in georeferenced units).
             These shifts are applied before the fit() part.
         """
@@ -4863,6 +6368,7 @@ class NuthKaab(AffineCoreg):
         :param bin_sizes: Size (if integer) or edges (if iterable) for binning variables later passed in .fit().
         :param bin_statistic: Statistic of central tendency (e.g., mean) to apply during the binning.
         :param subsample: Subsample the input for speed-up. <1 is parsed as a fraction. >1 is a pixel count.
+            A value of 1 selects all valid observations.
         :param vertical_shift: Whether to apply the vertical shift or not (default is True).
         :param initial_shift: Tuple containing x, y and z shifts (in georeferenced units).
             These shifts are applied before the fit() part.
@@ -5024,6 +6530,7 @@ class LZD(AffineCoreg):
         :param tolerance_rotation: Magnitude of iteration rotation (in degrees) at which to stop the iterations (once
             other tolerances are also reached, if any).
         :param subsample: Subsample the input for speed-up. <1 is parsed as a fraction. >1 is a pixel count.
+            A value of 1 selects all valid observations.
         :param initial_shift: Tuple containing x, y and z shifts (in georeferenced units).
             These shifts are applied before the fit() part.
         """
@@ -5068,11 +6575,15 @@ class LZD(AffineCoreg):
         **kwargs: Any,
     ) -> None:
 
+        if {"predictors", "error_applied_to"} & kwargs.keys():
+            raise TypeError("Use error_structure and error_predictors mappings keyed by 'ref' and 'tba'.")
+
         # Get parameters stored in class
         params_random = self._meta["inputs"]["random"]
         params_fit_or_bin = self._meta["inputs"]["fitorbin"]
 
         # Call method
+        error_output: dict[str, Any] = {}
         matrix, centroid, subsample_final, output_iterative, err_beta = lzd(
             ref_elev=ref_elev,
             tba_elev=tba_elev,
@@ -5089,6 +6600,7 @@ class LZD(AffineCoreg):
             tolerance_rotation=self._meta["inputs"]["iterative"]["tolerance_rotation"],
             only_translation=self._meta["inputs"]["affine"]["only_translation"],
             linearized=self._meta["inputs"]["affine"]["linearized"],
+            error_output=error_output,
             **kwargs,
         )
 
@@ -5104,8 +6616,11 @@ class LZD(AffineCoreg):
         self._meta["outputs"]["affine"] = output_affine
         self._meta["outputs"]["iterative"] = output_iterative
         self._meta["outputs"]["random"] = {"subsample_final": subsample_final}
+        self._meta["outputs"]["fitorbin"] = {}
         if err_beta is not None:
             self._meta["outputs"]["fitorbin"] = {"fit_perr": err_beta}
+            if "fit_pcov" in error_output:
+                self._meta["outputs"]["fitorbin"]["fit_pcov"] = error_output["fit_pcov"]
 
 
 class DhMinimize(AffineCoreg):
@@ -5116,11 +6631,7 @@ class DhMinimize(AffineCoreg):
 
     .. warning::
 
-        DhMinimize is deprecated. Use LZD with linearized=False and only_translation=True.
-        To reproduce its fitting strategy, supply a custom fit_minimizer wrapping scipy.optimize.minimize
-        with method="Nelder-Mead" and fit_loss_func=nmad. The wrapper must minimize NMAD over X/Y shifts
-        and estimate the Z shift separately from the median residual, because NMAD cannot determine a
-        constant vertical offset. See the :ref:`dh-minimize` guide for an example.
+        DhMinimize is deprecated. Use LZD with linearized=False and only_translation=True instead.
 
     The translation parameters are stored in the `self.meta["outputs"]["affine"]` keys "shift_x", "shift_y" and
     "shift_z" (in georeferenced units for horizontal shifts, and unit of the elevation dataset inputs for the
@@ -5140,6 +6651,7 @@ class DhMinimize(AffineCoreg):
         :param fit_minimizer: Minimizer for the coregistration function.
         :param fit_loss_func: Loss function for the minimization of residuals.
         :param subsample: Subsample the input for speed-up. <1 is parsed as a fraction. >1 is a pixel count.
+            A value of 1 selects all valid observations.
         :param initial_shift: Tuple containing x, y and z shifts (in georeferenced units).
             These shifts are applied before the fit() part.
         """

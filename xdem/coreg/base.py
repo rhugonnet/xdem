@@ -92,6 +92,7 @@ dict_key_to_str = {
     "nd": "Number of dimensions of binning and fitting",
     "fit_params": "Optimized function parameters",
     "fit_perr": "Error on optimized function parameters",
+    "fit_pcov": "Covariance of optimized function parameters",
     "bin_dataframe": "Binning output dataframe",
     "max_iterations": "Maximum number of iterations",
     "tolerance_translation": "Tolerance in translation (georeferenced unit)",
@@ -251,8 +252,16 @@ def _preprocess_coreg_fit_raster_raster(
     if isinstance(reference_dem, gu.Raster) and isinstance(dem_to_be_aligned, gu.Raster):
         # Casts pixel interpretation, raises a warning if they differ (can be silenced with global config)
         new_aop = _cast_pixel_interpretation(reference_dem.area_or_point, dem_to_be_aligned.area_or_point)
+        # Preserve native coordinates when sharing one pixel interpretation
+        if gu.config["shift_area_or_point"] and reference_dem.area_or_point != dem_to_be_aligned.area_or_point:
+            if ref_aop == "Point":
+                ref_transform = reference_dem.transform * affine.Affine.translation(-0.5, -0.5)
+            if tba_aop == "Point":
+                tba_transform = dem_to_be_aligned.transform * affine.Affine.translation(-0.5, -0.5)
+            ref_aop = tba_aop = new_aop
         if area_or_point is not None:
             warnings.warn("Pixel interpretation cast from the two input rasters overrides the given 'area_or_point'.")
+        area_or_point = new_aop
         indiv_check = False
 
     # If any input is a Raster, use its transform if 'transform is None'
@@ -540,6 +549,9 @@ def _preprocess_coreg_fit(
         z_name = (
             z_name if isinstance(to_be_aligned_elev, gpd.GeoDataFrame) else to_be_aligned_elev.data_name  # type: ignore
         )
+        if isinstance(reference_elev, PointCloud) and reference_elev.data_name != z_name:
+            ref_elev = ref_elev.copy()
+            ref_elev[z_name] = reference_elev.data
         ref_elev, tba_elev = _preprocess_coreg_fit_point_point(
             reference_elev=ref_elev, to_be_aligned_elev=tba_elev, z_name=z_name
         )
@@ -571,8 +583,9 @@ def _preprocess_coreg_apply(
     # If input is geodataframe or point cloud
     if isinstance(elev, (gpd.GeoDataFrame, PointCloud)):
         if isinstance(elev, PointCloud):
-            elev_out = elev.ds
-            z_name = elev.data_name
+            normalized = _as_eager_elevation(elev)
+            elev_out = normalized.gdf
+            z_name = normalized.data_name
         else:
             elev_out = elev
             z_name = z_name
@@ -615,6 +628,15 @@ def _postprocess_coreg_apply_pts(
     """Post-processing and checks of apply for point input."""
 
     if isinstance(elev, PointCloud):
+        if elev.data_name is None:
+            normalized = _as_eager_elevation(elev)
+            applied_elev.geometry = gpd.points_from_xy(
+                applied_elev.geometry.x,
+                applied_elev.geometry.y,
+                applied_elev[normalized.data_name],
+                crs=applied_elev.crs,
+            )
+            applied_elev = applied_elev.drop(columns=normalized.data_name)
         applied_elev = xdem.EPC(applied_elev, data_column=elev.data_name)
     else:
         applied_elev = applied_elev
@@ -1568,7 +1590,7 @@ def _reproject_horizontal_shift_samecrs(
     """
 
     # Preserve the continuous linear interpolator used by iterative coregistration
-    if return_interpolator and resampling == "linear":
+    if return_interpolator and resampling == "linear" and src_transform.b == 0 and src_transform.d == 0:
         x, y = _coords(transform=src_transform, area_or_point=area_or_point, shape=raster_arr.shape, grid=False)
         values = np.ma.filled(raster_arr, np.nan) if np.ma.isMaskedArray(raster_arr) else raster_arr
         return _interpn_interpolator((np.flip(y), x), values, method="linear")
@@ -1785,6 +1807,7 @@ class OutFitOrBinDict(TypedDict, total=False):
     # Optimized parameters for fitted function, and its error
     fit_params: NDArrayf
     fit_perr: NDArrayf
+    fit_pcov: NDArrayf
     # Binning dataframe
     bin_dataframe: pd.DataFrame
 
@@ -2181,6 +2204,7 @@ class Coreg:
         :param bias_vars: Auxiliary variables for certain bias correction classes, as raster or arrays.
         :param weights: Array of weights for the coregistration.
         :param subsample: Subsample the input to increase performance. <1 is parsed as a fraction. >1 is a pixel count.
+            A value of 1 selects all valid observations.
         :param transform: Transform of the reference elevation, only if provided as 2D array.
         :param crs: CRS of the reference elevation, only if provided as 2D array.
         :param area_or_point: Pixel interpretation of the DEMs, only if provided as 2D arrays.
@@ -2190,6 +2214,11 @@ class Coreg:
 
         if weights is not None:
             raise NotImplementedError("Weights have not yet been implemented")
+
+        if not isinstance(reference_elev, gpd.GeoDataFrame):
+            reference_elev = _as_eager_elevation(reference_elev)
+        if not isinstance(to_be_aligned_elev, gpd.GeoDataFrame):
+            to_be_aligned_elev = _as_eager_elevation(to_be_aligned_elev)
 
         # Override subsample argument of instantiation if passed to fit
         if subsample is not None:
@@ -2221,7 +2250,11 @@ class Coreg:
             shift_y = self._meta["inputs"]["affine"]["initial_shift"][1]  # type: ignore
 
             # shift_z is currently always equal to zero
-            if isinstance(reference_elev, (gu.Raster, gpd.GeoDataFrame, gu.PointCloud)):
+            if isinstance(reference_elev, gpd.GeoDataFrame):
+                reference_elev = reference_elev.copy()
+                reference_elev.geometry = reference_elev.geometry.translate(-shift_x, -shift_y)
+                initial_shift_apply = True
+            elif isinstance(reference_elev, (gu.Raster, gu.PointCloud)):
                 reference_elev = reference_elev.translate(-shift_x, -shift_y)  # type: ignore
                 initial_shift_apply = True
             else:
@@ -2268,6 +2301,9 @@ class Coreg:
 
         # Unapply the shift to the source dem if apply before
         if initial_shift_apply and "outputs" in self.meta and "affine" in self.meta["outputs"]:
+            if "matrix" in self.meta["outputs"]["affine"]:
+                matrix = self.meta["outputs"]["affine"]["matrix"]
+                matrix[:2, 3] += (shift_x, shift_y)
             if "shift_x" in self.meta["outputs"]["affine"]:
                 self.meta["outputs"]["affine"]["shift_x"] += shift_x
                 logging.debug(f"Updated shift_x by {shift_x} in {self}")
@@ -2478,6 +2514,7 @@ class Coreg:
         :param bias_vars: Auxiliary variables for certain bias correction classes, as raster or arrays.
         :param weights: Array of weights for the coregistration.
         :param subsample: Subsample the input to increase performance. <1 is parsed as a fraction. >1 is a pixel count.
+            A value of 1 selects all valid observations.
         :param transform: Transform of the reference elevation, only if provided as 2D array.
         :param crs: CRS of the reference elevation, only if provided as 2D array.
         :param area_or_point: Pixel interpretation of the DEMs, only if provided as 2D arrays.
@@ -2820,8 +2857,9 @@ def _sample_coreg_inputs(
     subsample: int | float,
     random_state: Any,
     aux_vars: Mapping[str, Any] | None,
-    aux_tied_to: str,
+    aux_tied_to: str | Mapping[str, str],
     independent: bool,
+    sample_common_xy: bool = False,
 ) -> list[Any]:
     """Apply coregistration's common or independent sampling policy through GeoUtils."""
 
@@ -2851,10 +2889,13 @@ def _sample_coreg_inputs(
         )
 
     # Bind array auxiliaries to their native grid before GeoUtils interpolates or masks them
-    owner = first if aux_tied_to == "ref" else second
+    owners = dict(aux_tied_to) if isinstance(aux_tied_to, Mapping) else dict.fromkeys(aux_vars or {}, aux_tied_to)
     auxiliary = {}
     for name, values in (aux_vars or {}).items():
-        if np.ndim(values) == 2:
+        owner = first if owners[name] == "ref" else second
+        if isinstance(values, (Raster, PointCloud)):
+            auxiliary[name] = values
+        elif np.ndim(values) == 2:
             grid = owner if isinstance(owner, Raster) else raster
             if grid is None:
                 raise ValueError("A raster auxiliary requires a raster input defining its grid.")
@@ -2879,14 +2920,15 @@ def _sample_coreg_inputs(
         if independent:
             samples = []
             for index, value in enumerate(inputs):
-                tied = (index == 0 and aux_tied_to == "ref") or (index == 1 and aux_tied_to == "tba")
+                side = "ref" if index == 0 else "tba"
+                selected_auxiliary = {name: values for name, values in auxiliary.items() if owners[name] == side}
                 samples.append(
                     value.cosample(
                         value,
-                        auxiliary=auxiliary if tied else None,
+                        auxiliary=selected_auxiliary,
                         auxiliary_at="self",
                         mask=mask,
-                        subsample=subsample,
+                        subsample=1 if sample_common_xy and index == 1 else subsample,
                         random_state=random_state,
                         align="reproject",
                         **({"strategy": "sequential"} if isinstance(value, Raster) else {}),
@@ -2897,7 +2939,7 @@ def _sample_coreg_inputs(
                 first.cosample(
                     second,
                     auxiliary=auxiliary,
-                    auxiliary_at="self" if aux_tied_to == "ref" else "other",
+                    auxiliary_at={name: "self" if owner == "ref" else "other" for name, owner in owners.items()},
                     mask=mask,
                     subsample=subsample,
                     random_state=random_state,
@@ -2922,15 +2964,17 @@ def _subsample_rst_pts(
     random_state: Any = None,
     sampling_strategy: str = "same_xy",
     aux_vars: Mapping[str, Any] | None = None,
-    aux_tied_to: str = "ref",
+    aux_tied_to: str | Mapping[str, str] = "ref",
+    preserve_coordinates: bool = False,
 ) -> tuple[NDArrayf, NDArrayf, dict[str, NDArrayf] | None]:
     """Return the 3-by-N coordinate arrays required by coregistration optimizers."""
 
     # Validate algorithm policy independently of the generic GeoUtils sampling API
     if sampling_strategy not in {"same_xy", "independent"}:
         raise ValueError("sampling_strategy must be 'same_xy' or 'independent'.")
-    if aux_tied_to not in {"ref", "tba"}:
-        raise ValueError("aux_tied_to must be 'ref' or 'tba'.")
+    owners = aux_tied_to.values() if isinstance(aux_tied_to, Mapping) else (aux_tied_to,)
+    if any(owner not in {"ref", "tba"} for owner in owners):
+        raise ValueError("aux_tied_to must select 'ref' or 'tba' for each auxiliary.")
 
     # Delegate alignment, masks and pair selection to the shared GeoUtils sampling interface
     samples = _sample_coreg_inputs(
@@ -2946,7 +2990,8 @@ def _subsample_rst_pts(
         random_state,
         aux_vars,
         aux_tied_to,
-        sampling_strategy == "independent",
+        sampling_strategy == "independent" or preserve_coordinates,
+        sample_common_xy=preserve_coordinates and sampling_strategy == "same_xy",
     )
 
     # Read native spatial outputs in grid or point order, as the original sampling masks did
@@ -2968,13 +3013,18 @@ def _subsample_rst_pts(
         auxiliary_values.append({name: values[name] for name in values if name not in {"self", "other"}})
 
     # Use the same locations for paired fitting or each dataset's own sample for independent fitting
-    if sampling_strategy == "same_xy":
+    if sampling_strategy == "same_xy" and not preserve_coordinates:
         reference, aligned = primary_xyz[0]
         auxiliary = auxiliary_values[0]
     else:
         reference, aligned = primary_xyz[0][0], primary_xyz[1][0]
-        owner = 0 if aux_tied_to == "ref" else 1
-        auxiliary = auxiliary_values[owner]
+        if sampling_strategy == "same_xy" and (subsample != 1 or reference.shape[1] != aligned.shape[1]):
+            # Match nearby native points without replacing their horizontal coordinates
+            tree = scipy.spatial.cKDTree(aligned[:2].T)
+            indexes = tree.query(reference[:2].T)[1]
+            aligned = aligned[:, indexes]
+            auxiliary_values[1] = {name: values[indexes] for name, values in auxiliary_values[1].items()}
+        auxiliary = {**auxiliary_values[0], **auxiliary_values[1]}
     return reference, aligned, auxiliary if aux_vars is not None else None
 
 

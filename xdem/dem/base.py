@@ -366,25 +366,33 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
 
     def estimate_error_structure(
         self,
-        other: DEMLike | EPCLike | NDArrayf,
+        other: DEMLike | EPCLike | NDArrayf | None = None,
         *,
         predictors: Mapping[str, Any] | tuple[str, ...] | None = None,
+        precoreg: bool = True,
+        coreg_method: Coreg | None = None,
         **kwargs: Any,
     ) -> xdem.ErrorStructure:
         """
         Estimate elevation errors with terrain predictors and the GeoUtils error estimator.
 
-        Terrain slope and maximum curvature are used as predictors by default.
-        Pass predictors={} for constant magnitudes.
+        With other supplied, terrain slope and maximum curvature are used as predictors by default.
+        Pass predictors={} for constant magnitudes. With other=None, this dataset is an error proxy
+        and uses constant magnitudes unless predictor values are supplied.
 
         :param other: Comparison elevation dataset, or an array on this dataset's locations.
+            None treats this dataset as an error proxy.
         :param predictors: Named predictors or a tuple of terrain attribute names.
+        :param precoreg: Align paired elevations before estimating errors. Defaults to True.
+        :param coreg_method: Optional Coreg method or pipeline. None uses LZD.
         :param kwargs: Options for xdem.uncertainty.estimate_error_structure(), including mask, other_precision,
             at, align, components, mp_config and random_state.
         :returns: The fitted GeoUtils error structure.
         """
 
-        return xdem.uncertainty.estimate_error_structure(self, other, predictors=predictors, **kwargs)
+        return xdem.uncertainty.estimate_error_structure(
+            self, other, predictors=predictors, precoreg=precoreg, coreg_method=coreg_method, **kwargs
+        )
 
     @deprecate(
         details=(
@@ -478,6 +486,7 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
         structure = estimate_error_structure(
             self,
             other=other_elev,
+            precoreg=False,
             mask=stable_terrain,
             predictors=variables,
             components=components,

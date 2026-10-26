@@ -274,6 +274,9 @@ translation by minimizing any statistic on the elevation differences, typically 
 
 
 ```{code-cell} ipython3
+:mystnb:
+:  output_stderr: show
+
 # Define a coregistration based on the dh minimization approach
 dh_minimize = xdem.coreg.DhMinimize()
 # Fit to data and apply

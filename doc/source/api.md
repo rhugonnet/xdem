@@ -143,6 +143,8 @@ See the full list of vector methods in [GeoUtils' documentation](https://geoutil
 .. autosummary::
     :toctree: gen_modules/
 
+    DEM.stats
+    EPC.stats
     DEM.get_stats
 ```
 

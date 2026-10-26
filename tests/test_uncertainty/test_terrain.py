@@ -17,17 +17,20 @@ import xdem
 class TestTerrainPropagation:
     """Test module for terrain filter derivatives and analytical uncertainty at flat terrain."""
 
-    @pytest.mark.parametrize("surface_fit", ["Horn", "ZevenbergThorne", "Florinsky"])
+    @pytest.mark.parametrize("surface_fit", [None, "Horn", "ZevenbergThorne", "Florinsky"])
     @pytest.mark.parametrize("attribute", ["slope", "aspect"])
     @pytest.mark.parametrize("degrees", [False, True])
     @pytest.mark.parametrize("correlated", [False, True])
     def test_propagate_uncertainty__finite_differences(
-        self, surface_fit: str, attribute: str, degrees: bool, correlated: bool
+        self, surface_fit: str | None, attribute: str, degrees: bool, correlated: bool
     ) -> None:
         """Checks that analytical terrain uncertainty matches finite differences."""
 
+        if correlated:
+            pytest.importorskip("skgstat")
+
         # 1/ Run analytical propagation
-        # Create curved terrain with defined slope and aspect derivatives
+        # Create curved terrain to have proper slope and aspect derivatives
         rows, columns = np.indices((11, 13))
         values = columns / 2 + rows / 3 + np.sin(columns / 4)
         raster = gu.Raster.from_array(values, Affine(2, 0, 0, 0, -2, 22), 32632)
@@ -35,10 +38,11 @@ class TestTerrainPropagation:
         errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.02, correlation=model)])
         options: dict[str, Any] = {
             "attribute": attribute,
-            "surface_fit": surface_fit,
             "degrees": degrees,
             "engine": "scipy",
         }
+        if surface_fit is not None:
+            options["surface_fit"] = surface_fit
 
         # Select an interior pixel for comparison
         summary = xdem.uncertainty.propagate_uncertainty(
@@ -52,7 +56,7 @@ class TestTerrainPropagation:
 
         # 2/ Calculate finite differences
         # Use 3 x 3 windows, or 5 x 5 for Florinsky
-        radius = 2 if surface_fit == "Florinsky" else 1
+        radius = 2 if surface_fit in {None, "Florinsky"} else 1
         locations = [(row, col) for row in range(5 - radius, 6 + radius) for col in range(6 - radius, 7 + radius)]
         derivatives = []
         epsilon = 1e-4
@@ -64,7 +68,8 @@ class TestTerrainPropagation:
             lower = xdem.terrain.get_terrain_attribute(raster.copy(new_array=minus), out_dtype=np.float64, **options)
             derivatives.append((upper.data[5, 6] - lower.data[5, 6]) / (2 * epsilon))
 
-        # 3/ Compare uncertainties
+        # 3/ Compare uncertainties to what we expect by computing them manually
+
         # Combine finite differences with observation covariance
         x, y = raster.ij2xy(*np.asarray(locations).T)
         covariance = errors.to_covariance_matrix(np.column_stack((x, y)))
@@ -79,7 +84,7 @@ class TestTerrainPropagation:
     def test_propagate_uncertainty__flat(self) -> None:
         """Checks that flat slope has undefined analytical uncertainty and positive numerical uncertainty."""
 
-        # Create flat terrain where the slope derivative is undefined
+        # Create flat terrain (slope undefined)
         raster = gu.Raster.from_array(np.ones((7, 9)), Affine(2, 0, 0, 0, -2, 14), 32632)
         errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.1)])
         options = {"attribute": "slope", "engine": "scipy"}

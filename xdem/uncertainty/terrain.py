@@ -82,7 +82,7 @@ def _propagate_terrain(
         "ZevenbergThorne": ("zt_h", "zt_g"),
         "Florinsky": ("fl_p", "fl_q"),
     }
-    filter_names = names[options.get("surface_fit", "Horn")]
+    filter_names = names[options.get("surface_fit", "Florinsky")]
     filters = [np.flip(all_coefs[name]) / _divider_method_coef(source.res[0], name) for name in filter_names]
     radius = filters[0].shape[0] // 2
     values = _numeric_values(source)
@@ -98,6 +98,10 @@ def _propagate_terrain(
         window = np.s_[row - radius : row + radius + 1, col - radius : col + radius + 1]
         patch = values[window]
         if patch.shape != filters[0].shape or not np.all(np.isfinite(patch)):
+            continue
+
+        # Constant elevations are flat even when filter sums have floating point residuals
+        if np.ptp(patch) == 0:
             continue
         gx, gy = (float(np.sum(kernel * patch)) for kernel in filters)
         squared_gradient = gx**2 + gy**2

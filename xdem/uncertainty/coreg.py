@@ -28,11 +28,13 @@ import numpy as np
 import pandas as pd
 from geoutils._misc import import_optional
 from geoutils.uncertainty import PropagationSummary as GeoUtilsPropagationSummary
+from geoutils.uncertainty.propagation import simulate
+from pyproj import CRS
 
 from xdem.coreg import Coreg
-from xdem.coreg.affine import LZD
+from xdem.coreg.affine import ICP, LZD, _coreg_error_inputs
 from xdem.coreg.base import _as_eager_elevation, translations_rotations_from_matrix
-from xdem.uncertainty.propagation import _select_outputs, _simulate
+from xdem.uncertainty.propagation import _select_outputs
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -50,7 +52,7 @@ class PropagationSummary(GeoUtilsPropagationSummary):  # type: ignore[misc]
     standard deviation. For example::
 
         summary = xdem.uncertainty.propagate_uncertainty_coreg(
-            reference, moving, xdem.coreg.LZD(), error_structure=errors, return_coregs=True,
+            reference, moving, xdem.coreg.LZD(), error_structure={"tba": errors}, return_coregs=True,
         )
         summary.plot()
         for number, fitted in summary.coregs.items():
@@ -100,14 +102,12 @@ def propagate_uncertainty_coreg(
     to_be_aligned_elev: Any,
     coreg_method: Coreg,
     *,
-    error_structure: gu.ErrorStructure,
-    predictors: Mapping[str, Any] | None = None,
+    error_structure: gu.ErrorStructure | Mapping[str, gu.ErrorStructure],
+    error_predictors: Mapping[str, Mapping[str, Any]] | None = None,
     method: Literal["analytical", "numerical"] = "numerical",
-    error_applied_to: Literal["ref", "tba"] = "tba",
     inlier_mask: Any = None,
     weights: Any = None,
     subsample: int | float | None = None,
-    precoreg: bool = False,
     random_state: int | np.random.Generator | None = None,
     fit_kwargs: Mapping[str, Any] | None = None,
     return_coregs: bool = False,
@@ -116,26 +116,24 @@ def propagate_uncertainty_coreg(
     """
     Propagate and summarize uncertainties on translations and rotations from coregistration.
 
-    Analytical propagation is currently only supported for LZD.
-
     Numerical propagation adds source errors over many simulations, repeating fit() with a fixed sampling seed.
-    Analytical propagation reads LZD error output with GLS/TLS.
+    Analytical propagation supports linearized LZD and point-to-plane ICP.
 
     :param reference_elev: Reference raster or point cloud.
     :param to_be_aligned_elev: Raster or point cloud to align.
     :param coreg_method: Coregistration method, copied before fitting.
-    :param error_structure: GeoUtils error model used for numerical draws and recorded with the result.
-    :param predictors: Source variables controlling error magnitude.
-    :param method: Repeated numerical fits, or the uncertainties already returned by GLS/TLS LZD.
-    :param error_applied_to: Dataset receiving numerical errors, "ref" or "tba".
+    :param error_structure: Independent models keyed by "ref" and/or "tba". A single model describes tba.
+    :param error_predictors: Magnitude predictors keyed by the same input names.
+    :param method: Repeated numerical fits, LZD fit uncertainties, or analytical point-to-plane ICP uncertainty.
     :param inlier_mask: Stable observations passed to fit().
     :param weights: Observation weights passed to fit().
     :param subsample: Optional replacement for the method's sample size.
-    :param precoreg: Align the original moving dataset before repeating fits.
     :param random_state: Seed controlling error draws and the fixed fit sample.
     :param fit_kwargs: Additional arguments passed unchanged to fit().
     :param return_coregs: Store each successful numerical fit as a Coreg, including its fit metadata.
     :param kwargs: GeoUtils simulation options, including n_samples, at, return_samples and quantiles.
+        random_field_options passes options to generate_random_field(), which approximates correlated fields by
+        default. Pass {"gpytorch_inducing_points": None} for exact in-memory draws.
 
     :returns: A propagation summary with six labelled parameters and optional fitted Coregs.
     """
@@ -147,8 +145,15 @@ def propagate_uncertainty_coreg(
         raise ValueError("Analytical propagation cannot return simulation samples.")
     if method == "analytical" and return_coregs:
         raise ValueError("Analytical propagation cannot return simulated Coreg objects.")
-    if error_applied_to not in {"ref", "tba"}:
-        raise ValueError("error_applied_to must be 'ref' or 'tba'.")
+    models, predictor_inputs = _coreg_error_inputs(error_structure, error_predictors)
+    if not models:
+        raise TypeError("Supply at least one coregistration error model.")
+    if "error_applied_to" in kwargs or "predictors" in kwargs:
+        raise TypeError("Use error_structure and error_predictors mappings keyed by 'ref' and 'tba'.")
+
+    # Check unsupported ICP estimators before reading elevations or running a fit
+    if method == "analytical" and isinstance(coreg_method, ICP):
+        coreg_method._check_analytical_uncertainty()
 
     # 2/ Prepare elevations and fitting options
     reference = _as_eager_elevation(reference_elev)
@@ -157,6 +162,33 @@ def propagate_uncertainty_coreg(
     options.update(inlier_mask=inlier_mask, weights=weights)
     if subsample is not None:
         options["subsample"] = subsample
+    # Resolve terrain predictors separately on each uncertain DEM
+    from xdem import terrain
+
+    sources = {"ref": reference, "tba": aligned}
+    resolved = {}
+    for name, values in predictor_inputs.items():
+        resolved[name] = {
+            key: (
+                terrain.get_terrain_attribute(sources[name], value)
+                if isinstance(value, str)
+                and isinstance(sources[name], gu.Raster)
+                and value in terrain.available_attributes
+                else value
+            )
+            for key, value in values.items()
+        }
+    legacy_errors = any(key in options for key in ("sig_ref", "sig_tba", "corr_ref", "corr_tba"))
+    error_aware = isinstance(coreg_method, LZD)
+    if isinstance(coreg_method, ICP):
+        try:
+            coreg_method._check_analytical_uncertainty()
+        except NotImplementedError:
+            pass
+        else:
+            error_aware = True
+    if error_aware and not legacy_errors:
+        options.update(error_structure=models, error_predictors=resolved)
     operation_seed = int(np.random.default_rng(random_state).integers(0, 2**32))
 
     def fit(ref: Any, tba: Any) -> Coreg:
@@ -164,11 +196,11 @@ def propagate_uncertainty_coreg(
 
         return coreg_method.copy().fit(ref, tba, random_state=operation_seed, **options)
 
-    # 3/ Fit or reuse the original transformation
-    original = coreg_method.copy() if method == "analytical" and coreg_method._fit_called else fit(reference, aligned)
-    if precoreg:
-        aligned = original.apply(aligned, resample=True)
-        original = fit(reference, aligned)
+    # 3/ Fit the supplied inputs and errors
+    if method == "analytical" and isinstance(coreg_method, ICP):
+        if reference.crs != aligned.crs:
+            raise ValueError("Analytical ICP requires inputs in the same CRS.")
+    original = fit(reference, aligned)
 
     # 4/ Extract transformation parameters and metadata
     centroid = getattr(original, "centroid", lambda: None)()
@@ -188,9 +220,9 @@ def propagate_uncertainty_coreg(
         )
 
     estimate = parameters(original)
-    translation_units = (
-        reference.crs.axis_info[0].unit_name if reference.crs and reference.crs.is_projected else "coordinate units"
-    )
+    # Read coordinate units from either Rasterio or PyProj CRS objects
+    crs = None if reference.crs is None else CRS.from_user_input(reference.crs)
+    translation_units = crs.axis_info[0].unit_name if crs is not None and crs.is_projected else "coordinate units"
     output = {
         "centroid": centroid,
         "crs": reference.crs,
@@ -200,8 +232,17 @@ def propagate_uncertainty_coreg(
 
     # 5/ Return analytical uncertainty
     if method == "analytical":
-        if not isinstance(original, LZD) or "fit_perr" not in original.meta["outputs"].get("fitorbin", {}):
+        if isinstance(original, ICP):
+            covariance = original.meta["outputs"]["fitorbin"]["fit_pcov"]
+            output["parameter_covariance"] = pd.DataFrame(covariance, index=labels, columns=labels)
+            output["fixed_correspondences"] = True
+        elif not isinstance(original, LZD) or "fit_perr" not in original.meta["outputs"].get("fitorbin", {}):
             raise ValueError("Analytical coregistration uncertainty requires an LZD fit with GLS/TLS uncertainties.")
+        if isinstance(original, LZD) and "fit_pcov" in original.meta["outputs"]["fitorbin"]:
+            native_covariance = original.meta["outputs"]["fitorbin"]["fit_pcov"]
+            covariance = np.zeros((6, 6))
+            covariance[: len(native_covariance), : len(native_covariance)] = native_covariance
+            output["parameter_covariance"] = pd.DataFrame(covariance, index=labels, columns=labels)
         standard_errors = np.zeros(6)
         errors = original.meta["outputs"]["fitorbin"]["fit_perr"]
         standard_errors[: len(errors)] = errors
@@ -218,10 +259,10 @@ def propagate_uncertainty_coreg(
     # 6/ Simulate numerical uncertainty
     fitted_coregs: list[Coreg] | None = [] if return_coregs else None
 
-    def calculate(value: Any) -> pd.Series:
-        """Refit the perturbed dataset and extract the six native parameters."""
+    def calculate(values: Mapping[str, Any]) -> pd.Series:
+        """Refit the perturbed inputs and extract the six native parameters."""
 
-        fitted = fit(value, aligned) if error_applied_to == "ref" else fit(reference, value)
+        fitted = fit(values.get("ref", reference), values.get("tba", aligned))
         result = parameters(fitted)
 
         # Save fits that GeoUtils includes in its parameter summaries
@@ -229,16 +270,33 @@ def propagate_uncertainty_coreg(
             fitted_coregs.append(fitted)
         return result
 
-    source = reference if error_applied_to == "ref" else aligned
+    field_options = dict(kwargs.pop("random_field_options", {}) or {})
+
+    def draw_error(generator: np.random.Generator) -> dict[str, Any]:
+        """Draw independent native fields for the named elevation inputs."""
+
+        values = {}
+        for name, model in models.items():
+            source = sources[name]
+            error = model.generate_random_field(
+                like=source, predictors=resolved.get(name), random_state=generator, **field_options
+            )
+            values[name] = source.copy(new_array=source.data + error.data)
+        return values
+
+    selection = _select_outputs(estimate, kwargs.pop("at", None))
+    if (kwargs.get("return_samples", False) or kwargs.get("quantiles")) and selection.empty:
+        raise ValueError("Select outputs with at when requesting samples or quantiles.")
     kwargs.setdefault("on_error", "warn")
-    summary = _simulate(
-        source,
-        calculate,
+    kwargs.setdefault("n_samples", 100)
+    summary = simulate(
+        estimate=estimate,
+        draw_error=draw_error,
+        calculate=calculate,
         error_structure=error_structure,
-        predictors=predictors,
+        selection=selection,
         random_state=random_state,
         output=output,
-        estimate=estimate,
         **kwargs,
     )
 

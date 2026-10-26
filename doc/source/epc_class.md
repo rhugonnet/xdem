@@ -138,11 +138,11 @@ For more details on vertical referencing, see the {ref}`vertical-ref` page.
 ```
 
 ## Statistics
-The {func}`~xdem.EPC.get_stats` method allows to extract statistical information from a point cloud in a dictionary.
+The {func}`~xdem.EPC.stats` method allows to extract statistical information from a point cloud in a dictionary.
 
 - Get all statistics in a dict:
 ```{code-cell} ipython3
-epc.get_stats()
+epc.stats()
 ```
 
 The point cloud statistics functionalities in xDEM are based on those in GeoUtils.
