@@ -429,6 +429,9 @@ def _build_vertical_transformer(crs_from: CRS, crs_to: CRS) -> pyproj.Transforme
     # Download grid if best available is not on disk, then re-initialize
     if not trans_group.best_available:
         trans_group.download_grids()
+
+        # Refresh PROJ's cached grid availability after downloading
+        pyproj.datadir.set_data_dir(pyproj.datadir.get_data_dir())
         trans_group = TransformerGroup(crs_from=crs_from, crs_to=crs_to, always_xy=True)
 
     # If the best available grid is still not there, raise a warning
