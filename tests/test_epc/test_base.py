@@ -356,7 +356,7 @@ class TestEPCCoregistration:
 
     This class tests:
     - ``coregister_3d`` with elevations in a column or in 3D point geometry,
-    - Raster references supplied as DEM objects or Xarray accessors.
+    - DEM objects or Xarray accessors as raster reference inputs.
     """
 
     @pytest.mark.parametrize("use_z", [False, True])
@@ -371,7 +371,7 @@ class TestEPCCoregistration:
         # 1/ Shift every point by exactly 8 metres so the correct result is known in advance
         values = epc_frame.height.to_numpy().reshape((5, 7))
         reference = DEM.from_array(values, Affine(20, 0, 499990, 0, -20, 8600010), epc_frame.crs, nodata=-9999)
-        points = reference.to_pointcloud(data_column_name="height", force_pixel_offset="ul")
+        points = reference.to_pointcloud(data_column_name="height")
         shifted = points.copy(new_array=points.data + 8)
         frame = shifted.ds.copy()
         frame["intensity"] = epc_frame.intensity.to_numpy()

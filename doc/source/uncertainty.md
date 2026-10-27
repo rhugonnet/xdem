@@ -469,7 +469,7 @@ Use `errors.refit()` to change correlation models without resampling pairs, or c
 ### Numerical propagation
 
 Numerical propagation draws **spatially correlated error fields**, adds each to the elevations, repeats the operation,
-and summarizes the results. `n_samples` controls the number of repeats.
+and summarizes the results. `n_simulations` controls the number of repeats.
 
 For a controlled comparison, we define a **1 m error magnitude and a Gaussian correlation with a 150 m effective
 range**. This separates the propagation calculation from uncertainty in fitting the error model:
@@ -492,7 +492,7 @@ numerical_slope = xdem.uncertainty.propagate_uncertainty(
     method="numerical",
     operation_options={"attribute": "slope", "surface_fit": "Florinsky"},
     random_field_options={"backend": "gstools"},
-    n_samples=200,
+    n_simulations=200,
     random_state=42,
     at=[(15, 15)],
     return_samples=True,

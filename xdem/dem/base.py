@@ -376,9 +376,9 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
         """
         Estimate elevation errors with terrain predictors and the GeoUtils error estimator.
 
-        With other supplied, terrain slope and maximum curvature are used as predictors by default.
+        With two inputs, terrain slope and maximum curvature are used as predictors by default.
         Pass predictors={} for constant magnitudes. With other=None, this dataset is an error proxy
-        and uses constant magnitudes unless predictor values are supplied.
+        and uses constant magnitudes without predictor inputs.
 
         :param other: Comparison elevation dataset, or an array on this dataset's locations.
             None treats this dataset as an error proxy.
@@ -397,7 +397,7 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
     @deprecate(
         details=(
             "Use DEM.estimate_error_structure. "
-            "Migration: https://xdem.readthedocs.io/en/stable/uncertainty_migration.html"
+            "Migration: https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration"
         )
     )
     def estimate_uncertainty(
@@ -477,7 +477,7 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
         if precision_of_other not in {"finer", "same"}:
             raise ValueError("precision_of_other must be 'finer' or 'same'.")
 
-        # Read the active point attribute unless a custom legacy column is supplied
+        # Read the active point attribute unless a custom legacy column is input
         if isinstance(other_elev, gpd.GeoDataFrame):
             data_name = other_elev.attrs.get("data_name", z_name) if z_name == "z" else z_name
             other_elev = gu.PointCloud(other_elev, data_name=data_name)
@@ -511,7 +511,7 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
         skip_nodata: bool = True,
         as_array: bool = False,
         random_state: int | np.random.Generator | None = None,
-        force_pixel_offset: Literal["center", "ul", "ur", "ll", "lr"] = "ul",
+        force_pixel_offset: Literal["center", "ul", "ur", "ll", "lr"] = "center",
         mp_config: MultiprocConfig | None = None,
         force_output_to_memory: bool = False,
         pointcloud_return_type: Literal["dataarray", "dataset", "geodataframe"] | None = None,
@@ -527,7 +527,7 @@ class DEMBase(RasterBase, _VerticalReference):  # type: ignore[misc]
         :param skip_nodata: Whether to exclude cells with missing elevations.
         :param as_array: Return an N x (2 + band count) array of coordinates and values.
         :param random_state: Seed or generator for reproducible subsampling.
-        :param force_pixel_offset: Position within each cell used for the point coordinates.
+        :param force_pixel_offset: Position within each cell used for the point coordinates. Defaults to the center.
         :param mp_config: Optional multiprocessing configuration for native DEM inputs.
         :param force_output_to_memory: Whether to calculate the complete result in memory.
         :param pointcloud_return_type: Explicit point representation. None returns an EPC for DEM inputs or a

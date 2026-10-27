@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 from geoutils._misc import import_optional
 from geoutils.uncertainty import PropagationSummary as GeoUtilsPropagationSummary
+from geoutils.uncertainty.predictors import _spatial_predictors
 from geoutils.uncertainty.propagation import simulate
 from pyproj import CRS
 
@@ -131,9 +132,9 @@ def propagate_uncertainty_coreg(
     :param random_state: Seed controlling error draws and the fixed fit sample.
     :param fit_kwargs: Additional arguments passed unchanged to fit().
     :param return_coregs: Store each successful numerical fit as a Coreg, including its fit metadata.
-    :param kwargs: GeoUtils simulation options, including n_samples, at, return_samples and quantiles.
+    :param kwargs: GeoUtils simulation options, including n_simulations, at, return_samples and quantiles.
         random_field_options passes options to generate_random_field(), which approximates correlated fields by
-        default. Pass {"gpytorch_inducing_points": None} for exact in-memory draws.
+        default.
 
     :returns: A propagation summary with six labelled parameters and optional fitted Coregs.
     """
@@ -150,10 +151,6 @@ def propagate_uncertainty_coreg(
         raise TypeError("Supply at least one coregistration error model.")
     if "error_applied_to" in kwargs or "predictors" in kwargs:
         raise TypeError("Use error_structure and error_predictors mappings keyed by 'ref' and 'tba'.")
-
-    # Check unsupported ICP estimators before reading elevations or running a fit
-    if method == "analytical" and isinstance(coreg_method, ICP):
-        coreg_method._check_analytical_uncertainty()
 
     # 2/ Prepare elevations and fitting options
     reference = _as_eager_elevation(reference_elev)
@@ -178,17 +175,36 @@ def propagate_uncertainty_coreg(
             )
             for key, value in values.items()
         }
-    legacy_errors = any(key in options for key in ("sig_ref", "sig_tba", "corr_ref", "corr_tba"))
-    error_aware = isinstance(coreg_method, LZD)
-    if isinstance(coreg_method, ICP):
-        try:
-            coreg_method._check_analytical_uncertainty()
-        except NotImplementedError:
-            pass
-        else:
-            error_aware = True
-    if error_aware and not legacy_errors:
-        options.update(error_structure=models, error_predictors=resolved)
+
+    if method == "analytical":
+        # Fit with the error models and filter missing predictors during co-sampling
+        legacy_errors = any(key in options for key in ("sig_ref", "sig_tba", "corr_ref", "corr_tba"))
+        if isinstance(coreg_method, (LZD, ICP)) and not legacy_errors:
+            options.update(error_structure=models, error_predictors=resolved)
+        if isinstance(coreg_method, ICP) and reference.crs != aligned.crs:
+            raise ValueError("Analytical ICP requires inputs in the same CRS.")
+    else:
+        # Select the same finite observations for the unperturbed fit and every numerical draw
+        draw_predictors = {}
+        for name, values in resolved.items():
+            source = sources[name]
+            aligned_values = _spatial_predictors(source, values, size=source.data.size)
+            assert aligned_values is not None
+            valid = np.isfinite(np.ma.asarray(source.data, dtype=float).filled(np.nan)).reshape(-1)
+            for value in aligned_values.values():
+                valid &= np.isfinite(value)
+            if not np.any(valid):
+                raise ValueError(f"Input {name!r} has no finite elevations and error predictors.")
+
+            # Fill masked values to pass input checks
+            # The elevation mask excludes these cells from fitting
+            draw_predictors[name] = {
+                key: value if np.isscalar(value) else np.where(valid, value, value[valid][0])
+                for key, value in aligned_values.items()
+            }
+            sources[name] = source.copy(new_array=np.ma.masked_where(~valid.reshape(source.data.shape), source.data))
+        reference, aligned = sources["ref"], sources["tba"]
+
     operation_seed = int(np.random.default_rng(random_state).integers(0, 2**32))
 
     def fit(ref: Any, tba: Any) -> Coreg:
@@ -196,10 +212,7 @@ def propagate_uncertainty_coreg(
 
         return coreg_method.copy().fit(ref, tba, random_state=operation_seed, **options)
 
-    # 3/ Fit the supplied inputs and errors
-    if method == "analytical" and isinstance(coreg_method, ICP):
-        if reference.crs != aligned.crs:
-            raise ValueError("Analytical ICP requires inputs in the same CRS.")
+    # 3/ Fit unperturbed inputs for the output "estimate" (base output value of PropagationSummary)
     original = fit(reference, aligned)
 
     # 4/ Extract transformation parameters and metadata
@@ -279,7 +292,7 @@ def propagate_uncertainty_coreg(
         for name, model in models.items():
             source = sources[name]
             error = model.generate_random_field(
-                like=source, predictors=resolved.get(name), random_state=generator, **field_options
+                like=source, predictors=draw_predictors.get(name), random_state=generator, **field_options
             )
             values[name] = source.copy(new_array=source.data + error.data)
         return values
@@ -288,7 +301,7 @@ def propagate_uncertainty_coreg(
     if (kwargs.get("return_samples", False) or kwargs.get("quantiles")) and selection.empty:
         raise ValueError("Select outputs with at when requesting samples or quantiles.")
     kwargs.setdefault("on_error", "warn")
-    kwargs.setdefault("n_samples", 100)
+    kwargs.setdefault("n_simulations", 100)
     summary = simulate(
         estimate=estimate,
         draw_error=draw_error,
@@ -303,8 +316,8 @@ def propagate_uncertainty_coreg(
     # Match saved fits to successful simulation numbers, including gaps after failed draws
     stored_coregs = None
     if fitted_coregs is not None:
-        assert summary.n_samples is not None
-        numbers = [number for number in range(1, summary.n_samples + 1) if number not in summary.failures]
+        assert summary.n_simulations is not None
+        numbers = [number for number in range(1, summary.n_simulations + 1) if number not in summary.failures]
         stored_coregs = dict(zip(numbers, fitted_coregs, strict=True))
     return PropagationSummary(
         **{item.name: getattr(summary, item.name) for item in fields(summary)}, coregs=stored_coregs

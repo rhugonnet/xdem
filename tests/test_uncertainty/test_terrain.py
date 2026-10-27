@@ -102,7 +102,7 @@ class TestTerrainPropagation:
             "terrain",
             error_structure=errors,
             operation_options=options,
-            n_samples=4,
+            n_simulations=4,
             random_state=2,
         )
 
@@ -126,7 +126,7 @@ class TestTerrainPropagation:
             "terrain",
             error_structure=structure,
             operation_options={"attribute": "slope", "engine": "scipy"},
-            n_samples=4,
+            n_simulations=4,
             random_state=3,
             at="all",
             return_samples=True,

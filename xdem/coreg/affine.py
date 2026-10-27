@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import warnings
 from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Literal, Sequence, TypedDict, TypeVar
@@ -254,7 +255,7 @@ def _subsample_on_mask_interpolator(
 
         # Derive coordinates and interpolator
         assert ref_transform is not None and tba_transform is not None
-        coords = _coords(transform=ref_transform, shape=ref_elev.shape, area_or_point=area_or_point, grid=True)
+        coords = _coords(transform=ref_transform, shape=ref_elev.shape, grid=True)
         tba_elev_interpolator = _reproject_horizontal_shift_samecrs(
             tba_elev, src_transform=tba_transform, return_interpolator=True, area_or_point=area_or_point
         )
@@ -301,7 +302,6 @@ def _subsample_on_mask_interpolator(
         rst_elev_interpolator = _interp_points_base(
             array=rst_elev,
             transform=rst_transform,
-            area_or_point=area_or_point,
             points=sub_coords,
             return_interpolator=True,
         )
@@ -327,7 +327,7 @@ def _subsample_on_mask_interpolator(
             sub_bias_vars = {}
             for var in aux_vars.keys():
                 sub_bias_vars[var] = _interp_points_base(
-                    array=aux_vars[var], transform=rst_transform, points=sub_coords, area_or_point=area_or_point
+                    array=aux_vars[var], transform=rst_transform, points=sub_coords
                 )
         else:
             sub_bias_vars = None
@@ -799,7 +799,10 @@ def _propagate_sampled_covariance(
             rows = np.arange(start, min(start + 512, len(coordinates)))
             for stop in range(start, len(coordinates), 512):
                 columns = np.arange(stop, min(stop + 512, len(coordinates)))
-                block = _source_covariance_matrix(source_ids, coordinates, component_data, rows, columns)
+                # Select the row/column block from the covariance of their combined observations
+                indexes = np.union1d(rows, columns)
+                combined = _source_covariance_matrix(source_ids, coordinates, component_data, indexes)
+                block = combined[: len(rows), -len(columns) :]
                 product = jacobian[:, rows] @ block @ jacobian[:, columns].T
                 covariance += product if start == stop else product + product.T
     return (covariance + covariance.T) / 2
@@ -833,7 +836,7 @@ def _check_gls_tls_options(
     if tls_method not in (None, "spatial", "independent"):
         raise ValueError("tls_method must be 'spatial' or 'independent'.")
     if tls_method == "spatial" and not models:
-        raise ValueError("tls_method='spatial' requires native models supplied through error_structure.")
+        raise ValueError("tls_method='spatial' requires input models through error_structure.")
     if gls_method not in ("approximate", "exact", "inducing"):
         raise ValueError("gls_method must be 'approximate', 'exact' or 'inducing'.")
     for name, value, minimum in (("gls_neighbors", gls_neighbors, 1), ("gls_rank", gls_rank, 0)):
@@ -850,7 +853,7 @@ def _gls_covariance_operator(
     correlations: tuple[Callable[..., NDArrayf], ...],
     block_size: int,
 ) -> Any:
-    """Build a linear_operator (library below GPyTorch) covariance from the supplied spatial error components."""
+    """Build a linear_operator (library below GPyTorch) covariance from the input spatial error components."""
 
     import_optional("linear_operator")
 
@@ -944,7 +947,7 @@ def _gls_fit_coefficients(
     design: NDArrayf, residuals: NDArrayf, initial_beta: NDArrayf, covariance: Any
 ) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
     """
-    Solve GLS normal equations with the supplied observation covariance.
+    Solve GLS normal equations with the input observation covariance.
 
     residuals contains the response after subtracting design @ initial_beta. Solve for a correction and
     add it back to initial_beta. Known observation errors set the parameter covariance without residual scaling.
@@ -1239,7 +1242,7 @@ def _gls_inducing_factor(
     At inducing locations U, L L.T = D K_XU K_UU^-1 K_UX D, where D = diag(magnitude).
     This is the Nystrom approximation in Rasmussen and Williams (2006), Eq. (8.4):
     https://gaussianprocess.org/gpml/chapters/RW8.pdf#page=2
-    K-means selects the locations geometrically, with the supplied kernel parameters fixed.
+    K-means selects the locations geometrically, with the input kernel parameters fixed.
     """
 
     if rank == 0:
@@ -1250,16 +1253,20 @@ def _gls_inducing_factor(
     import gpytorch
     import torch
     from sklearn.cluster import MiniBatchKMeans
+    from threadpoolctl import threadpool_limits
 
     # Spread inducing points across the observed area
-    centers = (
-        MiniBatchKMeans(n_clusters=rank, n_init=1, max_iter=20, batch_size=4096, random_state=0)
-        .fit(coordinates)
-        .cluster_centers_
-    )
+    # We use one thread on Windows to avoid MKL memory leak
+    clustering_threads = 1 if sys.platform == "win32" else None
+    with threadpool_limits(limits=clustering_threads, user_api="openmp"):
+        centers = (
+            MiniBatchKMeans(n_clusters=rank, n_init=1, max_iter=20, batch_size=4096, random_state=0)
+            .fit(coordinates)
+            .cluster_centers_
+        )
 
-    class SuppliedKernel(gpytorch.kernels.Kernel):  # type: ignore[misc]
-        """Evaluate the supplied correlation without changing its covariance model."""
+    class InputKernel(gpytorch.kernels.Kernel):  # type: ignore[misc]
+        """Evaluate the input correlation without changing its covariance model."""
 
         def forward(self, x1: torch.Tensor, x2: torch.Tensor, diag: bool = False, **kwargs: Any) -> torch.Tensor:
             """Calculate correlations for all requested pairs or corresponding observations."""
@@ -1271,7 +1278,7 @@ def _gls_inducing_factor(
     # Use only the global factor, since Vecchia conditioning accounts for C - L L.T separately
     # Disabling GPyTorch's diagonal correction avoids counting residual variance twice
     kernel = gpytorch.kernels.InducingPointKernel(
-        SuppliedKernel().double(),
+        InputKernel().double(),
         torch.from_numpy(centers),
         gpytorch.likelihoods.GaussianLikelihood().double(),
     ).double()
@@ -1432,7 +1439,7 @@ def _fit_gls(
     component_coordinates: Sequence[NDArrayf] | None = None,
 ) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
     """
-    Fit the supplied linear design with the selected spatial GLS solver.
+    Fit the input linear design with the selected spatial GLS solver.
 
     component_coordinates supplies one (N, 2) coordinate array per covariance component to describe each input's
     native locations. The solvers return coefficients, standard errors and their covariance.
@@ -2541,7 +2548,7 @@ def _icp_fit(
         design = design * row_scale[:, None]
         _check_fit_rank(design, names, "ICP")
 
-    # Fit the supplied observation errors with GLS or TLS before constructing the step transform
+    # Fit the input observation errors with GLS or TLS before constructing the step transform
     if error_structure or (sampled_errors is not None and force_opti != "ols"):
         if method != "point-to-plane" or not linearized or dict(params_fit_or_bin).get("fit_loss_func") != "linear":
             raise NotImplementedError("ICP error models require linearized point-to-plane fitting with a linear loss.")
@@ -2867,7 +2874,7 @@ def icp(
             owners[f"sigma_{side}"] = side
     for side, values in predictors.items():
         for name, value in values.items():
-            if np.ndim(value):
+            if isinstance(value, (gu.Raster, gu.PointCloud)) or np.ndim(value):
                 auxiliary[f"error_{side}_{name}"] = value
                 owners[f"error_{side}_{name}"] = side
     pixel_size = _res(ref_transform) if ref_transform is not None else 1.0
@@ -2922,7 +2929,7 @@ def icp(
         for side, values in predictors.items():
             assert sub_aux is not None
             sampled_predictors[side] = {
-                name: sub_aux[f"error_{side}_{name}"] if np.ndim(value) else value for name, value in values.items()
+                name: sub_aux.get(f"error_{side}_{name}", value) for name, value in values.items()
             }
 
         error_fit_options: dict[str, Any] = dict(
@@ -4743,7 +4750,7 @@ def _lzd_fit_gls_tls(
     Fit three translations when only_translation=True, otherwise also fit three rotations. Return parameter
     estimates, standard errors and their covariance in the order tx, ty, tz, followed by rx, ry, rz when fitted.
 
-    GLS approximates the supplied spatial covariance by default. Set gls_method="exact" for the full covariance.
+    GLS approximates the input spatial covariance by default. Set gls_method="exact" for the full covariance.
     TLS uses height and gradient errors at each observation and assumes spatially independent observations.
     """
 
@@ -5448,7 +5455,7 @@ def lzd(
             owners[f"sigma_{name}"] = name
     for side, values in predictors.items():
         for name, values_at_source in values.items():
-            if np.ndim(values_at_source):
+            if isinstance(values_at_source, (gu.Raster, gu.PointCloud)) or np.ndim(values_at_source):
                 auxiliaries[f"error_{side}_{name}"] = values_at_source
                 owners[f"error_{side}_{name}"] = side
 
@@ -5498,9 +5505,7 @@ def lzd(
     assert sub_aux is not None
     sampled_predictors = {}
     for side, values in predictors.items():
-        sampled_predictors[side] = {
-            name: sub_aux[f"error_{side}_{name}"] if np.ndim(value) else value for name, value in values.items()
-        }
+        sampled_predictors[side] = {name: sub_aux.get(f"error_{side}_{name}", value) for name, value in values.items()}
     sub_errors = None
     if any(value is not None for value in (sig_ref, sig_tba, corr_ref, corr_tba)):
         correlations = {"ref": corr_ref, "tba": corr_tba}

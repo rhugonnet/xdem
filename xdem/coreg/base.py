@@ -252,13 +252,6 @@ def _preprocess_coreg_fit_raster_raster(
     if isinstance(reference_dem, gu.Raster) and isinstance(dem_to_be_aligned, gu.Raster):
         # Casts pixel interpretation, raises a warning if they differ (can be silenced with global config)
         new_aop = _cast_pixel_interpretation(reference_dem.area_or_point, dem_to_be_aligned.area_or_point)
-        # Preserve native coordinates when sharing one pixel interpretation
-        if gu.config["shift_area_or_point"] and reference_dem.area_or_point != dem_to_be_aligned.area_or_point:
-            if ref_aop == "Point":
-                ref_transform = reference_dem.transform * affine.Affine.translation(-0.5, -0.5)
-            if tba_aop == "Point":
-                tba_transform = dem_to_be_aligned.transform * affine.Affine.translation(-0.5, -0.5)
-            ref_aop = tba_aop = new_aop
         if area_or_point is not None:
             warnings.warn("Pixel interpretation cast from the two input rasters overrides the given 'area_or_point'.")
         area_or_point = new_aop
@@ -1591,13 +1584,13 @@ def _reproject_horizontal_shift_samecrs(
 
     # Preserve the continuous linear interpolator used by iterative coregistration
     if return_interpolator and resampling == "linear" and src_transform.b == 0 and src_transform.d == 0:
-        x, y = _coords(transform=src_transform, area_or_point=area_or_point, shape=raster_arr.shape, grid=False)
+        x, y = _coords(transform=src_transform, shape=raster_arr.shape, grid=False)
         values = np.ma.filled(raster_arr, np.nan) if np.ma.isMaskedArray(raster_arr) else raster_arr
         return _interpn_interpolator((np.flip(y), x), values, method="linear")
 
-    # Reproject the raster relative to itself using the same pixel interpretation
+    # Reproject the raster relative to its pixel centers
     if not return_interpolator:
-        coords_dst = _coords(transform=dst_transform, area_or_point=area_or_point, shape=raster_arr.shape)
+        coords_dst = _coords(transform=dst_transform, shape=raster_arr.shape)
         # Flatten the arrays (only 1D supported in rowcol/xy after Rasterio 1.4)
         coords_dst = (coords_dst[0].ravel(), coords_dst[1].ravel())
     # If we just want the interpolator, we don't need to coordinates of destination points
@@ -1606,7 +1599,6 @@ def _reproject_horizontal_shift_samecrs(
 
     output = _interp_points_base(
         array=raster_arr,
-        area_or_point=area_or_point,
         transform=src_transform,
         points=coords_dst,
         method=resampling,

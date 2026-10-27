@@ -37,6 +37,7 @@ from geoutils._dispatch import (
     _is_raster,
 )
 from geoutils.uncertainty import PropagationSummary
+from geoutils.uncertainty.estimation import _difference_proxy
 from geoutils.uncertainty.propagation import (
     _numeric_values,
     _output_selection,
@@ -45,7 +46,8 @@ from geoutils.uncertainty.propagation import (
 
 from xdem import terrain
 from xdem._typing import NDArrayb, NDArrayf
-from xdem.coreg.base import Coreg, _as_eager_elevation
+from xdem.coreg.base import Coreg, _as_eager_elevation, apply_matrix
+from xdem.coreg.pipeline import CoregPipeline
 from xdem.uncertainty.error_structure import ErrorStructure
 
 if TYPE_CHECKING:
@@ -98,6 +100,52 @@ def _estimation_input_family(values: Sequence[Any]) -> list[Any]:
     return result
 
 
+def _prepare_estimation_predictors(
+    source: DEMLike | EPCLike,
+    other: DEMLike | EPCLike | NDArrayf | None,
+    predictors: Mapping[str, Any] | tuple[str, ...] | None,
+    mp_config: MultiprocConfig | None,
+    temporary_files: ExitStack,
+) -> dict[str, Any]:
+    """
+    We prepare input predictors, either as array and/or terrain attributes.
+
+    We use the source DEM when available, otherwise the reference DEM. With a raster reference, precoregistration
+    calls this function before transforming source so predictors can be sampled at their original locations.
+    """
+
+    # Choose the DEM for slope/curv
+    source_raster = _get_raster_interface(source)
+    other_raster = _get_raster_interface(other)
+    terrain_source = None
+    if other is not None:
+        terrain_source = source_raster if source_raster is not None else other_raster
+    if predictors is None:
+        predictors = ("slope", "max_curvature") if terrain_source is not None else ()
+    predictor_specs = dict(predictors) if isinstance(predictors, Mapping) else {name: name for name in predictors}
+
+    # Identify terrain attributes among input arrays, rasters and point columns
+    terrain_names = []
+    for value in predictor_specs.values():
+        if other is None and source_raster is not None and isinstance(value, str):
+            raise ValueError("Terrain predictors for an error proxy must be input as arrays or rasters.")
+        if isinstance(value, str) and terrain_source is not None and value in terrain.available_attributes:
+            if value not in terrain_names:
+                terrain_names.append(value)
+
+    # Derive terrain attributes
+    if terrain_names:
+        terrain_config = temporary_files.enter_context(mp_config.temporary()) if mp_config is not None else None
+        attributes = terrain.get_terrain_attribute(terrain_source, terrain_names, mp_config=terrain_config)
+        attributes = [attributes] if len(terrain_names) == 1 else attributes
+        terrain_predictors = dict(zip(terrain_names, attributes))
+        predictor_specs = {
+            name: terrain_predictors.get(value, value) if isinstance(value, str) else value
+            for name, value in predictor_specs.items()
+        }
+    return predictor_specs
+
+
 def estimate_error_structure(
     source: DEMLike | EPCLike,
     other: DEMLike | EPCLike | NDArrayf | None = None,
@@ -122,6 +170,11 @@ def estimate_error_structure(
     With two inputs, we align ``source`` to ``other`` with LZD by default before estimating errors from their
     residual differences. Pass ``precoreg=False`` for data that are already aligned.
 
+    With a raster reference, we transform source pixels or points and interpolate the reference at their new
+    coordinates by default, preserving source noise. With a point cloud reference, we apply the inverse affine
+    transform to its points and interpolate the unchanged source DEM. This applies rotations exactly to points
+    without regridding a DEM, although interpolation can still smooth noise in the sampled DEM.
+
     Pass predictor values explicitly for variable magnitudes.
 
     :param source: Raster or point cloud containing elevations, or an error proxy when other is None.
@@ -130,13 +183,14 @@ def estimate_error_structure(
     :param predictors: Named predictor values or, for paired inputs, a tuple of terrain attribute names.
         None uses terrain defaults for paired elevations and constant magnitudes for a proxy.
     :param mask: Spatial or Boolean mask selecting stable terrain where differences represent error.
-    :param precoreg: Align the source when other is supplied. Coregistration requires eager inputs.
+    :param precoreg: Align the source when the other input is present. Coregistration requires eager inputs.
     :param coreg_method: Optional Coreg method or pipeline, copied before fitting. None uses LZD.
         Ignored when precoreg=False or other is None.
     :param other_precision: "negligible" assigns difference errors to the source. "same" assumes independent errors
         with the same magnitude and correlation in both datasets, dividing differences by the square root of
-        two. Only used when other is supplied.
+        two. Only used with two inputs.
     :param at: Comparison locations: "self", "other", or None to prefer point locations when present.
+        Choosing "other" can interpolate source elevations and smooth their noise.
     :param align: "raise" reports mismatched grids or coordinate systems; "reproject" aligns them for comparison.
     :param mp_config: Worker and tile settings for multiprocessing estimation.
     :param kwargs: Additional options for GeoUtils ErrorStructure.estimate(), such as components, bins and
@@ -145,7 +199,7 @@ def estimate_error_structure(
     :returns: Error structure, with magnitudes in elevation units.
     """
 
-    # 1/ Prepare the mask and align elevations
+    # 1/ Prepare the mask
     source_raster = _get_raster_interface(source)
     other_raster = _get_raster_interface(other)
 
@@ -157,66 +211,123 @@ def estimate_error_structure(
                 )
                 break
 
-    # Default to LZD for precoreg
-    if other is not None and precoreg:
-        from xdem.coreg import LZD
-
-        if coreg_method is None:
-            coreg_method = LZD()
-        if not isinstance(coreg_method, Coreg):
-            raise TypeError("coreg_method must be a Coreg instance or None.")
-
-        # Give a bare reference array the source coordinates
-        if isinstance(other, np.ndarray):
-            other = _as_eager_elevation(source).copy(new_array=other)
-
-        # Copy the method so estimating errors leaves a supplied fit unchanged
-        fitted = coreg_method.copy().fit(
-            other, source, inlier_mask=_as_eager_elevation(mask), random_state=kwargs.get("random_state")
-        )
-        source = fitted.apply(_as_eager_elevation(source), resample=True)
-
-    # 2/ Prepare terrain predictors
-    # Choose the DEM for slope/curv
-    source_raster = _get_raster_interface(source)
-    other_raster = _get_raster_interface(other)
-    terrain_source = None
-    if other is not None:
-        terrain_source = source_raster if source_raster is not None else other_raster
-    if predictors is None:
-        predictors = ("slope", "max_curvature") if terrain_source is not None else ()
-    predictor_specs = dict(predictors) if isinstance(predictors, Mapping) else {name: name for name in predictors}
-    terrain_names = []
-    for value in predictor_specs.values():
-        if other is None and source_raster is not None and isinstance(value, str):
-            raise ValueError("Terrain predictors for an error proxy must be supplied as arrays or rasters.")
-        if isinstance(value, str) and terrain_source is not None and value in terrain.available_attributes:
-            if value not in terrain_names:
-                terrain_names.append(value)
-
-    # 3/ Estimate the error structure
     # Leave multiprocessing files available until fitting finishes
     with ExitStack() as temporary_files:
-        if terrain_names:
-            terrain_config = temporary_files.enter_context(mp_config.temporary()) if mp_config is not None else None
-            attributes = terrain.get_terrain_attribute(terrain_source, terrain_names, mp_config=terrain_config)
-            attributes = [attributes] if len(terrain_names) == 1 else attributes
-            terrain_predictors = dict(zip(terrain_names, attributes))
-            predictor_specs = {
-                name: terrain_predictors.get(value, value) if isinstance(value, str) else value
-                for name, value in predictor_specs.items()
-            }
+        # 2/ Precoregister elevations
+        predictor_specs = None
+        if other is not None and precoreg:
+            # Default to LZD for precoreg
+            from xdem.coreg import LZD
 
+            if coreg_method is None:
+                coreg_method = LZD()
+            if not isinstance(coreg_method, Coreg):
+                raise TypeError("coreg_method must be a Coreg instance or None.")
+
+            # Give a bare reference array the source coordinates
+            if isinstance(other, np.ndarray):
+                other = _as_eager_elevation(source).copy(new_array=other)
+
+            # Copy the method so estimating errors leaves the input fit unchanged
+            fitted = coreg_method.copy().fit(
+                other, source, inlier_mask=_as_eager_elevation(mask), random_state=kwargs.get("random_state")
+            )
+            other_raster = _get_raster_interface(other)
+
+            # Avoid resampling the source after precoregistration (which would smooth white or short-range noise)
+            if other_raster is not None:
+                predictor_specs = _prepare_estimation_predictors(source, other, predictors, mp_config, temporary_files)
+                source = _as_eager_elevation(source)
+                auxiliary = {}
+                for index, value in enumerate(predictor_specs.values()):
+                    value = _as_eager_elevation(value)
+                    auxiliary[f"_xdem_predictor_{index}"] = (source, value) if isinstance(value, str) else value
+
+                # Attach predictors at the original source pixels or points
+                sampled = source.cosample(source, auxiliary=auxiliary, auxiliary_at="self", at="self", align=align)
+
+                # Convert all valid pixels to points and apply the forward fit without resampling
+                # The reference DEM is interpolated at these transformed points below
+                if isinstance(sampled, gu.Raster):
+                    bands = {"self": 1, **{name: index + 3 for index, name in enumerate(auxiliary)}}
+                    sampled = sampled.subsample(1, bands=bands)
+                source = fitted.apply(sampled)
+                predictor_specs = dict(zip(predictor_specs, auxiliary))
+
+            # Move reference points into the source DEM frame with the inverse affine fit
+            # We interpolate the unchanged DEM there to avoid raster resampling, even for rotations
+            elif source_raster is not None and fitted.is_affine:
+                # Use the fit CRS, then apply the mask before the inverse transform changes point locations
+                reference_points = _as_eager_elevation(other)
+                if reference_points.crs != source_raster.crs:
+                    reference_points = reference_points.reproject(crs=source_raster.crs)
+                reference_points = reference_points.cosample(
+                    reference_points, mask=_as_eager_elevation(mask), at="self", align=align
+                )
+                frame = reference_points.gdf
+
+                # Invert pipeline steps in reverse order, using each fitted rotation centroid
+                steps = fitted.pipeline if isinstance(fitted, CoregPipeline) else [fitted]
+                for step in reversed(steps):
+                    frame = apply_matrix(
+                        frame,
+                        matrix=step.to_matrix(),
+                        invert=True,
+                        centroid=step.meta["outputs"]["affine"].get("centroid"),
+                        z_name=reference_points.data_name,
+                    )
+                other = gu.PointCloud(frame, data_name=reference_points.data_name)
+                mask = None
+            else:
+                # Apply methods without an affine inverse to the source, or transform a source point cloud
+                source = fitted.apply(_as_eager_elevation(source))
+
+        # 3/ Prepare terrain predictors
+        # With a raster reference, precoregistration already attached predictors before transforming the source
+        if predictor_specs is None:
+            predictor_specs = _prepare_estimation_predictors(source, other, predictors, mp_config, temporary_files)
+
+        # 4/ Compare elevations
         source, other, mask, *predictor_values = _estimation_input_family(
             [source, other, mask, *predictor_specs.values()]
         )
+        predictor_specs = dict(zip(predictor_specs, predictor_values))
+
+        # Compare at the selected coordinates and derive residuals for error estimation
+        if other is not None:
+            if other_precision not in ("same", "negligible"):
+                raise ValueError("other_precision must be 'same' or 'negligible'.")
+            raster = _get_raster_interface(source)
+            points = _get_pointcloud_interface(source) if raster is None else None
+            sampler = raster if raster is not None else points
+            if sampler is None:
+                raise TypeError("source must be a raster or point cloud.")
+            auxiliary = {
+                f"_xdem_predictor_{index}": (source, value) if isinstance(value, str) else value
+                for index, value in enumerate(predictor_specs.values())
+            }
+            sampling_config = temporary_files.enter_context(mp_config.temporary()) if mp_config is not None else None
+            sampled = sampler.cosample(
+                other,
+                auxiliary=auxiliary,
+                auxiliary_at="self",
+                at=at,
+                mask=mask,
+                align=align,
+                mp_config=sampling_config,
+            )
+            scale = np.sqrt(2.0) if other_precision == "same" else 1.0
+            source = _difference_proxy(sampled, scale, mp_config, temporary_files)
+            if _get_raster_interface(source) is not None:
+                predictor_specs = {name: (source, index + 3) for index, name in enumerate(predictor_specs)}
+            else:
+                predictor_specs = dict(zip(predictor_specs, auxiliary))
+            mask = None
+
+        # 5/ Estimate the error structure
         return ErrorStructure.estimate(
             source,
-            other=other,
-            other_precision=other_precision,
-            at=at,
-            align=align,
-            predictors=dict(zip(predictor_specs, predictor_values)),
+            predictors=predictor_specs,
             mask=mask,
             mp_config=mp_config,
             **kwargs,
@@ -271,7 +382,7 @@ def _simulate(
     error_structure: gu.ErrorStructure,
     predictors: Mapping[str, Any] | None = None,
     random_field_options: Mapping[str, Any] | None = None,
-    n_samples: int = 100,
+    n_simulations: int = 100,
     random_state: int | np.random.Generator | None = None,
     at: Literal["all"] | Sequence[Hashable] | None = None,
     return_samples: bool = False,
@@ -281,12 +392,7 @@ def _simulate(
     output: Mapping[str, Any] | None = None,
     estimate: Any = None,
 ) -> PropagationSummary:
-    """
-    Repeat an elevation operation with random fields and return GeoUtils' simulation summary.
-
-    generate_random_field() handles the error components and their spatial correlation. simulate() accumulates
-    moments, handles failed calculations and optionally stores selected draws or quantiles.
-    """
+    """Repeat an elevation operation with random fields and return GeoUtils propagation summary."""
 
     estimate = operation(source) if estimate is None else estimate
     selection = _select_outputs(estimate, at)
@@ -313,7 +419,7 @@ def _simulate(
         calculate=calculate,
         error_structure=error_structure,
         selection=selection,
-        n_samples=n_samples,
+        n_simulations=n_simulations,
         random_state=random_state,
         output=output,
         return_samples=return_samples,
@@ -356,7 +462,7 @@ def propagate_uncertainty(
 
     :param data: Original raster, point cloud or supported elevation accessor.
     :param operation: "terrain", "spatial", "coreg", a callable, or None to summarize the source errors.
-        A callable receives the perturbed elevation object and the supplied operation arguments.
+        A callable receives the perturbed elevation object and the input operation arguments.
     :param error_structure: GeoUtils error model, or models keyed by "ref" and "tba" for coregistration.
     :param error_predictors: Coregistration magnitude predictors keyed by "ref" and "tba".
     :param predictors: Source magnitude predictors, including terrain attribute names for raster inputs.
@@ -365,7 +471,7 @@ def propagate_uncertainty(
     :param operation_options: Operation arguments, such as attribute for terrain, statistic for area means or
         integrals, and coreg_method for coregistration. Spatial integrals on point clouds require area weights.
     :param method: "numerical" for repeated calculations or "analytical" for existing propagation formulas.
-    :param kwargs: GeoUtils propagation/simulation options, including n_samples, random_state, at,
+    :param kwargs: GeoUtils propagation/simulation options, including n_simulations, random_state, at,
         return_samples, quantiles, max_sample_bytes and on_error. Spatial outputs require at to save draws.
         random_field_options passes options to generate_random_field(), which approximates correlated fields by
         default. Pass {"gpytorch_inducing_points": None} for exact in-memory draws.

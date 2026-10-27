@@ -19,7 +19,7 @@
 """Deprecated spatial statistical tools to estimate uncertainties related to DEMs.
 
 The original implementations remain available during deprecation. Each public function warns when called and
-links to https://xdem.readthedocs.io/en/stable/uncertainty_migration.html for its replacement.
+links to https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration for its replacement.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ from xdem._typing import NDArrayb, NDArrayf
 
 _DEPRECATION_DETAILS = (
     "All of xdem.spatialstats is deprecated. "
-    "See https://xdem.readthedocs.io/en/stable/uncertainty_migration.html for migration guidance."
+    "See https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration for migration guidance."
 )
 
 if TYPE_CHECKING:
@@ -92,7 +92,8 @@ def nmad(data: NDArrayf, nfact: float = 1.4826) -> np.floating[Any]:
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param data: Input array or raster
     :param nfact: Normalization factor for the data
@@ -120,7 +121,8 @@ def nd_binning(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param values: Values array of size (N,)
     :param list_var: List of size (L) of explanatory variables array of size (N,)
@@ -267,7 +269,8 @@ def interp_nd_binning(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     First, interpolates nodata values of the irregular N-D binning grid with scipy.griddata.
     Then, extrapolates nodata values on the N-D binning grid with scipy.griddata with "nearest neighbour"
@@ -459,7 +462,8 @@ def get_perbin_nd_binning(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     For example, get a 2D array of elevation uncertainty based on 2D arrays of slope and curvature and a related binning
     (for uncertainty analysis) or get a 2D array of elevation bias based on 2D arrays of rotated X coordinates (for
@@ -570,7 +574,8 @@ def two_step_standardization(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param dvalues: Proxy values as array of size (N,) (i.e., differenced values where signal should be zero such as
         elevation differences on stable terrain)
@@ -856,7 +861,8 @@ def infer_heteroscedasticity_from_stable(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     This function returns an error map, a dataframe of spread values and the error function with explanatory variables.
     It is a convenience wrapper for `estimate_model_heteroscedasticity` to work on either Raster or array, compute the
@@ -1358,7 +1364,8 @@ def sample_empirical_variogram(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     If values are provided as a Raster subclass, nothing else is required.
     If values are provided as a 2D array (M,N), a ground sampling distance is sufficient to derive the pairwise
@@ -1642,7 +1649,8 @@ def get_variogram_model_func(params_variogram_model: pd.DataFrame) -> Callable[[
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param params_variogram_model: Dataframe of variogram models to sum with three to four columns, "model" for the
         model types (e.g., ["spherical", "matern"]), "range" for the correlation ranges (e.g., [2, 100]), "psill" for
@@ -1689,7 +1697,8 @@ def covariance_from_variogram(params_variogram_model: pd.DataFrame) -> Callable[
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param params_variogram_model: Dataframe of variogram models to sum with three to four columns, "model" for the
         model types (e.g., ["spherical", "matern"]), "range" for the correlation ranges (e.g., [2, 100]), "psill" for
@@ -1722,7 +1731,8 @@ def correlation_from_variogram(params_variogram_model: pd.DataFrame) -> Callable
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param params_variogram_model: Dataframe of variogram models to sum with three to four columns, "model" for the
         model types (e.g., ["spherical", "matern"]), "range" for the correlation ranges (e.g., [2, 100]), "psill" for
@@ -1761,7 +1771,8 @@ def fit_sum_model_variogram(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param list_models: List of K variogram models to sum for the fit in order from short to long ranges. Can either be
         a 3-letter string, full string of the variogram name or SciKit-GStat model function (e.g., for a
@@ -1992,7 +2003,8 @@ def infer_spatial_correlation_from_stable(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     This function returns a dataframe of the empirical variogram, a dataframe of optimized model parameters, and a
     spatial correlation function. The spatial correlation is returned as a function of spatial lags
@@ -2119,7 +2131,8 @@ def neff_circular_approx_theoretical(area: float, params_variogram_model: pd.Dat
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     This function contains the exact integrated formulas and is mostly used for testing the numerical integration
     of any number and forms of variograms provided by the function `neff_circular_approx_numerical`.
@@ -2242,7 +2255,8 @@ def neff_circular_approx_numerical(area: float | int, params_variogram_model: pd
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     The number of effective samples N_eff serves to convert between standard deviation and standard error
     over the area: SE = SD / sqrt(N_eff) if SE is the standard error, SD the standard deviation.
@@ -2291,7 +2305,8 @@ def neff_exact(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param coords: Center coordinates with size (N,2) for each spatial support (typically, pixel)
     :param errors: Errors at the coordinates with size (N,) for each spatial support (typically, pixel)
@@ -2366,7 +2381,8 @@ def neff_hugonnet_approx(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param coords: Center coordinates with size (N,2) for each spatial support (typically, pixel)
     :param errors: Errors at the coordinates with size (N,) for each spatial support (typically, pixel)
@@ -2440,7 +2456,8 @@ def number_effective_samples(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     This function wraps two methods:
 
@@ -2538,7 +2555,8 @@ def spatial_error_propagation(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     This function is based on the `number_effective_samples` function to estimate uncorrelated samples. If given a
     vector area, it uses Equation 18 of Hugonnet et al. (2022), https://doi.org/10.1109/jstars.2022.3188922. If given
@@ -2694,7 +2712,8 @@ def convolution(imgs: NDArrayf, filters: NDArrayf, method: str = "scipy") -> NDA
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param imgs: Input array of size (n_N, N1, N2) with n_N images of size N1 x N2
     :param filters: Input array of filters of size (n_M, M1, M2) with n_M filters of size M1 x M2
@@ -2737,7 +2756,8 @@ def mean_filter_nan(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param img: Input array of size (N1, N2)
     :param kernel_size: Size M of kernel, which will be a symmetrical (M, M) kernel
@@ -3082,7 +3102,8 @@ def patches_method(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     The function returns the exact areas of the patches, which might differ from the input due to rasterization of the
     shapes.
@@ -3212,7 +3233,8 @@ def plot_variogram(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param df: Empirical variogram, formatted as a dataframe with count (pairwise sample count), lags
         (upper bound of spatial lag bin), exp (experimental variance), and err_exp (error on experimental variance)
@@ -3404,7 +3426,8 @@ def plot_1d_binning(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param df: Output dataframe of nd_binning
     :param var_name: Name of binning variable to plot
@@ -3535,7 +3558,8 @@ def plot_2d_binning(
 
     .. note::
         Deprecated. See the
-        `uncertainty migration guide <https://xdem.readthedocs.io/en/stable/uncertainty_migration.html>`_.
+        `uncertainty migration guide
+        <https://xdem.readthedocs.io/en/stable/release_notes.html#uncertainty-module-migration>`_.
 
     :param df: Output dataframe of nd_binning
     :param var_name_1: Name of first binning variable to plot

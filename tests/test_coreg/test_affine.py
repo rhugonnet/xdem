@@ -129,15 +129,9 @@ def small_dem(request: pytest.FixtureRequest) -> Raster:
 
 
 def _point_samples(dem: Raster, count: int | None = 900) -> geoutils.PointCloud:
-    """Convert DEM to point cloud, accounting for pixel interpretation."""
+    """Convert a DEM to points at its pixel centers."""
 
-    # Shift to Point coordinates along both affine axes before using the upper-left offset
-    if dem.area_or_point == "Point" and geoutils.config["shift_area_or_point"]:
-        dem = dem.edit(transform=dem.transform * rio.Affine.translation(-0.5, -0.5))
-
-    return dem.to_pointcloud(
-        data_name="z", subsample=1 if count is None else count, random_state=3, force_pixel_offset="ul"
-    )
+    return dem.to_pointcloud(data_name="z", subsample=1 if count is None else count, random_state=3)
 
 
 def _dense_gls(
@@ -149,7 +143,7 @@ def _dense_gls(
 ) -> tuple[NDArrayf, NDArrayf, NDArrayf]:
     """Solve GLS with a dense covariance, as a reference against the optional GPyTorch backend."""
 
-    # Combine independent input covariances using the supplied correlation functions
+    # Combine independent input covariances using the input correlation functions
     distances = np.sqrt((xcoord[:, None] - xcoord) ** 2 + (ycoord[:, None] - ycoord) ** 2)
     covariance = np.zeros((len(Y), len(Y)))
     for sigma, correlation in ((errors[0], errors[1]), (errors[2], errors[3])):
@@ -302,21 +296,17 @@ class TestAffineCoreg:
 
     @pytest.mark.parametrize("method", [coreg.NuthKaab, coreg.LZD, coreg.ICP])
     @pytest.mark.parametrize("area_or_point", [None, "Area", "Point"])
-    @pytest.mark.parametrize("shift_interpretation", [False, True])
     def test_fit__identity(
         self,
         curved_dem: Raster,
         method: Callable[..., AffineCoreg],
         area_or_point: Literal["Area", "Point"] | None,
-        shift_interpretation: bool,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Checks that fitting a DEM to itself gives zero shifts, for every pixel interpretation and coreg method."""
 
         # Set the interpretation
         reference = curved_dem.copy()
-        reference.set_area_or_point(area_or_point, shift_area_or_point=False)
-        monkeypatch.setitem(geoutils.config, "shift_area_or_point", shift_interpretation)
+        reference.set_area_or_point(area_or_point)
 
         # Fit the same finite surface at a fixed sample of its locations
         fitted = method(subsample=600).fit(reference, reference, random_state=42)
@@ -488,7 +478,7 @@ class TestAffineCoreg:
 
         # Translate the same terrain in map coordinates and height without resampling its elevations
         reference = curved_dem.copy()
-        reference.set_area_or_point(area_or_point, shift_area_or_point=False)
+        reference.set_area_or_point(area_or_point)
         shifted = reference.translate(1.2, -0.8) + 2.5
         reference_input: Any = reference
         shifted_input: Any = shifted
@@ -538,9 +528,9 @@ class TestAffineCoreg:
     ) -> None:
         """Checks that applying a fitted transform preserves a raster pixel interpretation."""
 
-        # We use Point interpretation, as losing its metadata would change future sample coordinates
+        # Use Point interpretation to check that fit() and apply() preserve its metadata
         reference = curved_dem.copy()
-        reference.set_area_or_point("Point", shift_area_or_point=False)
+        reference.set_area_or_point("Point")
         shifted = reference.translate(1.2, -0.8) + 2.5
 
         # Fit and apply, with/without resampling onto the input grid
@@ -548,7 +538,7 @@ class TestAffineCoreg:
         fitted = method(subsample=1, **options).fit(reference, shifted, random_state=42)
         aligned = fitted.apply(shifted, resample=resample)
 
-        # Further raster/point comparisons must use the same interpretation as the original data
+        # Check the pixel interpretation of the input and applied rasters
         assert aligned.area_or_point == "Point"
         assert shifted.area_or_point == "Point"
 
@@ -695,7 +685,6 @@ class TestAffineCoreg:
 
     @pytest.mark.parametrize("small_dem", ["waves", "smooth"], indirect=True)
     @pytest.mark.parametrize("only_translation", [True, False])
-    @pytest.mark.parametrize("area_or_point", ["Area", "Point"])
     @pytest.mark.parametrize(
         "method, options, fit_kwargs",
         [
@@ -743,12 +732,10 @@ class TestAffineCoreg:
         options: dict[str, Any],
         fit_kwargs: dict[str, Any],
         only_translation: bool,
-        area_or_point: Literal["Area", "Point"],
     ) -> None:
         """Checks that all affine coregistration with main options recover a translation+rotation on DEM/EPC."""
 
         # Cnovert DEM to points (to avoid any interpolation and loss of info), and transform
-        small_dem.set_area_or_point(area_or_point, shift_area_or_point=False)
         points = _point_samples(small_dem, count=None)
         angles = (0, 0, 0) if only_translation else (0.4, -0.3, 0.5)
         matrix = matrix_from_translations_rotations(0.6, -0.4, 0.8, *angles)
@@ -1131,7 +1118,7 @@ class TestAffineCoreg:
             monkeypatch.setitem(sys.modules, "tqdm.auto", None)
 
         def iteration_step(matrix: NDArrayf) -> tuple[NDArrayf, dict[str, float], None]:
-            """Return the supplied offsets without changing the matrix."""
+            """Return the input offsets without changing the matrix."""
 
             return matrix, {"translation": value, "rotation": 0.0}, None
 
@@ -1798,6 +1785,7 @@ class TestAffineCoreg:
             (coreg.ICP, {"sampling_strategy": "independent"}),
         ],
     )
+    @pytest.mark.parametrize("predictor_kind", ["array", "raster"])
     @pytest.mark.parametrize("point_input", [False, True])
     def test_fit__cosampled_predictors(
         self,
@@ -1806,6 +1794,7 @@ class TestAffineCoreg:
         solver: Callable[..., AffineCoreg],
         options: dict[str, Any],
         point_input: bool,
+        predictor_kind: str,
     ) -> None:
         """Checks that both inputs' predictors follow the same sampled rows as their elevations."""
 
@@ -1827,7 +1816,10 @@ class TestAffineCoreg:
         )
         magnitude = geoutils.ErrorMagnitude.variable_from_grouped_stats(statistics)
         model = geoutils.ErrorStructure([geoutils.ErrorComponent("measurement", magnitude)])
-        predictors = {"ref": {"quality": first_quality}, "tba": {"quality": second_quality}}
+        predictors: dict[str, dict[str, Any]] = {"ref": {"quality": first_quality}, "tba": {"quality": second_quality}}
+        if predictor_kind == "raster":
+            for values in predictors.values():
+                values["quality"] = reference.copy(new_array=values["quality"].reshape(reference.shape))
         mask = np.zeros(reference.shape, dtype=bool)
         mask[2:-2, 2:-2] = True
 
@@ -2080,10 +2072,10 @@ class TestAffineCoregErrors:
     ) -> None:
         """Checks that equivalent "Area" and "Point" rasters align without introducing a half pixel shift."""
 
-        # Change interpretation, and adjust transform to preserve coordinates (set with shift_area_or_point=True)
-        monkeypatch.setitem(geoutils.config, "shift_area_or_point", True)
+        # Change only the interpretation and enable warnings for differing metadata
+        monkeypatch.setitem(geoutils.config, "warn_area_or_point", True)
         point_dem = curved_dem.copy()
-        point_dem.set_area_or_point("Point", shift_area_or_point=True)
+        point_dem.set_area_or_point("Point")
         np.testing.assert_array_equal(point_dem.coords(grid=True), curved_dem.coords(grid=True))
         reference, moving = (point_dem, curved_dem) if reverse else (curved_dem, point_dem)
 
@@ -2258,7 +2250,7 @@ class TestAffineCoregErrors:
             ({"force_opti": "gls"}, False, ValueError, "requires observation errors"),
             ({"force_opti": "tls"}, False, ValueError, "requires observation errors"),
             ({"tls_method": "unknown"}, True, ValueError, "tls_method"),
-            ({"tls_method": "spatial"}, False, ValueError, "requires native models"),
+            ({"tls_method": "spatial"}, False, ValueError, "requires input models"),
             ({"predictors": {}}, True, TypeError, "mappings keyed"),
             ({"error_applied_to": "tba"}, True, TypeError, "mappings keyed"),
         ],
@@ -2487,7 +2479,7 @@ class TestNuthKaab:
         assert fitted_c == pytest.approx(c, abs=1e-6)
 
     def test_nuth_kaab__fit_optimizer_selection(self) -> None:
-        """Checks that default OLS and a supplied curve_fit optimizer produce consistent X, Y and Z shifts."""
+        """Checks that default OLS and an input curve_fit optimizer produce consistent X, Y and Z shifts."""
 
         # Instantiate both optimizer paths without fitting
         coreg_ols = coreg.NuthKaab(max_iterations=1)
@@ -3242,23 +3234,23 @@ class TestLZD:
 
         # 2/ Simulate independent error fields from the model covariances
         rng = np.random.default_rng(43)
-        n_samples = 20
+        n_simulations = 20
         draws = []
         for model, coordinates in ((grid, case["field_coordinates"]), (other, case["coordinates"])):
             if model is None:
-                draws.append(np.zeros((len(coordinates), n_samples)))
+                draws.append(np.zeros((len(coordinates), n_simulations)))
             else:
                 field_covariance = model.to_covariance_matrix(coordinates)
                 values, vectors = np.linalg.eigh(field_covariance)
                 assert values.min() >= -1e-12
-                draws.append((vectors * np.sqrt(np.maximum(values, 0))) @ rng.normal(size=(len(values), n_samples)))
-        estimates = np.array([case["fit"](draws[0][:, index], draws[1][:, index])[0] for index in range(n_samples)])
+                draws.append((vectors * np.sqrt(np.maximum(values, 0))) @ rng.normal(size=(len(values), n_simulations)))
+        estimates = np.array([case["fit"](draws[0][:, index], draws[1][:, index])[0] for index in range(n_simulations)])
 
         # 3/ Compare standard deviations with joint Monte Carlo intervals
         predicted_std = np.sqrt(np.diag(covariance))
         empirical_std = estimates.std(axis=0, ddof=1)
         tail = 0.001 / (2 * len(case["expected"]))
-        bounds = np.sqrt(chi2.ppf([tail, 1 - tail], n_samples - 1) / (n_samples - 1))
+        bounds = np.sqrt(chi2.ppf([tail, 1 - tail], n_simulations - 1) / (n_simulations - 1))
         np.testing.assert_allclose(options["beta"], case["expected"], rtol=0, atol=1e-7)
         np.testing.assert_allclose(covariance, covariance.T, rtol=0, atol=1e-15)
         assert np.linalg.eigvalsh(covariance).min() > 0
@@ -3438,14 +3430,14 @@ class TestLZD:
         # Simulate errors from the full covariance
         distances = scipy.spatial.distance.cdist(np.column_stack((x, y)), np.column_stack((x, y)))
         covariance = (correlation[0](distances) + 1e-3 * np.eye(len(x))) * np.outer(sigma, sigma)
-        n_samples = 20
-        draws = np.linalg.cholesky(covariance) @ rng.normal(size=(len(x), n_samples))
+        n_simulations = 20
+        draws = np.linalg.cholesky(covariance) @ rng.normal(size=(len(x), n_simulations))
 
         # 2/ Fit each simulation through LZD
         # Use small blocks with default neighbor count and rank
         monkeypatch.setattr("xdem.coreg.affine._gls_approximate", partial(_gls_approximate, block_size=32))
         estimates = []
-        for index in range(n_samples):
+        for index in range(n_simulations):
             values = design @ expected + draws[:, index]
             beta, standard_errors, _ = _lzd_fit_gls_tls(
                 x, y, z, values, gx, gy, 2, *errors, force_opti="gls", gls_method="approximate"
@@ -3455,7 +3447,7 @@ class TestLZD:
         # Compare standard deviations with joint 0.1% chi-square bounds
         parameter_count = len(expected)
         tail_probability = 0.001 / (2 * parameter_count)
-        bounds = np.sqrt(chi2.ppf([tail_probability, 1 - tail_probability], n_samples - 1) / (n_samples - 1))
+        bounds = np.sqrt(chi2.ppf([tail_probability, 1 - tail_probability], n_simulations - 1) / (n_simulations - 1))
         ratios = np.std(estimates, axis=0, ddof=1) / standard_errors
         assert np.all((bounds[0] <= ratios) & (ratios <= bounds[1])), ratios
 

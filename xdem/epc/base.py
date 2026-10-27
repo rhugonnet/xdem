@@ -270,7 +270,7 @@ class EPCBase(PointCloudBase, _VerticalReference):  # type: ignore[misc]
         Point column names are passed to GeoUtils. When other is a raster, slope and maximum curvature are
         derived from its grid by default.
         Pass predictors={} for constant magnitudes. With other=None, this dataset is an error proxy
-        and uses constant magnitudes unless predictor values are supplied.
+        and uses constant magnitudes without predictor inputs.
 
         :param other: Comparison elevation dataset, or an array on this dataset's locations.
             None treats this dataset as an error proxy.

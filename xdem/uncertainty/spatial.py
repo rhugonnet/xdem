@@ -857,7 +857,7 @@ def patches_method(
         mask_mode = "inside" if stable_mask is not None else unstable_mode
         sampled = values.cosample(values, mask=selected_mask, mask_mode=mask_mode)
 
-        # Apply an additional exclusion when stable and unstable masks were both supplied
+        # Apply an additional exclusion when both stable and unstable masks are input
         if stable_mask is not None and unstable_mask is not None:
             sampled = sampled.cosample(
                 sampled,
@@ -879,16 +879,16 @@ def patches_method(
 
         # Combine the optional inclusion and exclusion masks on the unchanged array grid
         selected = np.ones(values_arr.shape, dtype=bool)
-        for name, supplied_mask, keep_inside in (
+        for name, input_mask, keep_inside in (
             ("stable", stable_mask, True),
             ("unstable", unstable_mask, False),
         ):
-            if supplied_mask is None:
+            if input_mask is None:
                 continue
-            if isinstance(supplied_mask, Raster):
-                mask_values = supplied_mask.data
-            elif isinstance(supplied_mask, np.ndarray):
-                mask_values = supplied_mask
+            if isinstance(input_mask, Raster):
+                mask_values = input_mask.data
+            elif isinstance(input_mask, np.ndarray):
+                mask_values = input_mask
             else:
                 raise ValueError(f"The {name} mask must be a Raster or NumPy array when values is an array.")
 

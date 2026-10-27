@@ -30,11 +30,11 @@ class TestSpatialstatsDeprecation:
         # Check migration guidance and signature preservation for each legacy entry point
         for name, function in functions.items():
             doc = inspect.getdoc(function)
-            assert doc is not None and "uncertainty_migration.html" in doc
+            assert doc is not None and "release_notes.html#uncertainty-module-migration" in doc
             assert inspect.signature(function) == inspect.signature(function.__wrapped__)
 
             # Check migration guidance even when the legacy call is missing required arguments
-            with pytest.warns(DeprecationWarning, match=f"{name}.*uncertainty_migration.html"):
+            with pytest.warns(DeprecationWarning, match=f"{name}.*release_notes.html#uncertainty-module-migration"):
                 with pytest.raises(TypeError):
                     function()
 
@@ -43,12 +43,12 @@ class TestSpatialstatsDeprecation:
 
         # Create simple increasing values with two perfectly related predictors
         values = np.arange(100, dtype=float)
-        with pytest.warns(DeprecationWarning, match="uncertainty_migration.html"):
+        with pytest.warns(DeprecationWarning, match="release_notes.html#uncertainty-module-migration"):
             table = xdem.spatialstats.nd_binning(values, [values, values / 10], ["x", "y"], list_var_bins=3)
 
         # Check that the original table still includes marginal and joint groups
         assert set(table.nd) == {1, 2}
-        with pytest.warns(DeprecationWarning, match="uncertainty_migration.html"):
+        with pytest.warns(DeprecationWarning, match="release_notes.html#uncertainty-module-migration"):
             interpolator = xdem.spatialstats.interp_nd_binning(table, ["x"], statistic="nanmedian", min_count=1)
 
         # Evaluate interpolation with the original positional predictor interface
@@ -79,7 +79,7 @@ class TestSpatialstatsDeprecation:
         with pytest.warns(DeprecationWarning):
             covariance = xdem.spatialstats.covariance_from_variogram(params)
 
-        # The zero-distance covariance must equal the supplied partial sill
+        # The zero-distance covariance must equal the input partial sill
         assert covariance(0) == pytest.approx(4)
         with pytest.warns(DeprecationWarning):
             value = xdem.spatialstats.number_effective_samples(100, params)
@@ -112,7 +112,7 @@ class TestSpatialstatsDeprecation:
         empirical = pd.DataFrame({"exp": [1, 2, 3], "lags": [10, 20, 30], "count": [50, 60, 70], "err_exp": np.nan})
 
         # Plot a fitted curve across split distance ranges while checking migration guidance
-        with pytest.warns(DeprecationWarning, match="uncertainty_migration.html"):
+        with pytest.warns(DeprecationWarning, match="release_notes.html#uncertainty-module-migration"):
             xdem.spatialstats.plot_variogram(
                 empirical,
                 [lambda distance: distance / 10],

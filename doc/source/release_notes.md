@@ -3,6 +3,13 @@
 
 Below, the release notes for all minor versions and our roadmap to a first major version.
 
+## 0.3.0 (unreleased)
+
+(uncertainty-module-migration)=
+### Uncertainty module migration
+
+Guidance for migrating from `xdem.spatialstats` to `xdem.uncertainty` will be added here.
+
 ## 0.2.0
 
 xDEM version 0.2 is the **second minor release**, notably marked by the merge in efforts with [demcompare](https://github.com/CNES/demcompare) (no longer maintained) to build a unified tool!

@@ -295,17 +295,20 @@ class TestDEM:
 
     @pytest.mark.parametrize("grid_shifts", [egm08_chile, egm08_chile, geoid96_alaska, isn93_iceland])
     def test_to_vcrs__grids(self, grid_shifts: dict[str, Any]) -> None:
-        """Tests grids to convert vertical CRS."""
+        """Checks that grid-based vertical transformations match known geoid shifts at pixel centers."""
 
         # Most grids aren't going to be downloaded, so this warning can be raised
         warnings.filterwarnings("ignore", category=UserWarning, message="Grid .*")
 
         # Using an arbitrary elevation of 100 m (no influence on the transformation)
+        # Place the first pixel center at the longitude and latitude checked above
+        pixel_size = 0.01
+        transform = rio.transform.from_origin(
+            grid_shifts["lon"] - pixel_size / 2, grid_shifts["lat"] + pixel_size / 2, pixel_size, pixel_size
+        )
         dem = DEM.from_array(
             data=np.array([[100, 100]]),
-            transform=rio.transform.from_bounds(
-                grid_shifts["lon"], grid_shifts["lat"], grid_shifts["lon"] + 0.01, grid_shifts["lat"] + 0.01, 0.01, 0.01
-            ),
+            transform=transform,
             crs=CRS.from_epsg(4326),
             nodata=None,
         )

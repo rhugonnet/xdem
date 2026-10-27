@@ -203,15 +203,17 @@ class TestElevationErrorEstimation:
 
         # 2/ Estimate and compare magnitudes
         # Run GeoUtils with slope values and xDEM with the predictor name
-        expected = gu.ErrorStructure.estimate(
-            source,
-            other=reference,
-            other_precision=other_precision,
-            at=None,
-            align="reproject",
-            predictors={"slope": terrain_source.slope()},
-            **options,
-        )
+        sampled = source.cosample(reference, auxiliary={"slope": terrain_source.slope()}, align="reproject")
+        scale = np.sqrt(2) if other_precision == "same" else 1
+        expected_predictors: dict[str, Any]
+        if isinstance(sampled, gu.Raster):
+            residuals = sampled.copy(new_array=(sampled.data[0] - sampled.data[1]) / scale)
+            expected_predictors = {"slope": (sampled, 3)}
+        else:
+            difference = (sampled.gdf["self"].to_numpy() - sampled.gdf["other"].to_numpy()) / scale
+            residuals = sampled.copy(new_array=difference)
+            expected_predictors = {"slope": "slope"}
+        expected = gu.ErrorStructure.estimate(residuals, predictors=expected_predictors, **options)
         actual = xdem.uncertainty.estimate_error_structure(
             source, reference, predictors=("slope",), other_precision=other_precision, precoreg=False, **options
         )
@@ -236,7 +238,7 @@ class TestElevationErrorEstimation:
         # Check the deprecation warning links to the migration guide
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            with pytest.warns(DeprecationWarning, match="uncertainty_migration.html"):
+            with pytest.warns(DeprecationWarning, match="release_notes.html#uncertainty-module-migration"):
                 magnitude, correlation = source.estimate_uncertainty(reference, random_state=42)
 
         # Check the magnitude grid and correlation at zero distance
@@ -263,7 +265,10 @@ class TestElevationErrorEstimation:
         }
 
         # Compare a raster mask in GeoUtils with an array mask in xDEM
-        expected = gu.ErrorStructure.estimate(source, other=reference, mask=source.copy(new_array=mask), **options)
+        sampled = source.cosample(reference, mask=source.copy(new_array=mask), at=at, align="reproject")
+        expected = gu.ErrorStructure.estimate(
+            sampled, predictors={}, components=options["components"], spread_estimator=np.std
+        )
         actual = source.estimate_error_structure(other=reference, mask=mask, precoreg=False, **options)
 
         # Check magnitude and selected observations
@@ -347,6 +352,70 @@ class TestElevationErrorEstimationPrecoreg:
         assert actual.predict_magnitude() == expected.predict_magnitude()
         assert actual.fit_diagnostics == expected.fit_diagnostics
 
+    @pytest.mark.parametrize("shift", [(10, -10), (3.7, -2.4), (5, -5)])
+    @pytest.mark.parametrize(
+        "rotation, point_input",
+        [(0, None), (0.2, None), (0, "ref"), (0, "tba")],
+        ids=["dem-dem", "dem-dem-rotation", "dem-epc", "epc-dem"],
+    )
+    def test_estimate_error_structure__resampling_noise(
+        self, shift: tuple[float, float], rotation: float, point_input: str | None
+    ) -> None:
+        """Checks that precoreg with DEM/EPC references does not resample, to preserve source measurement noise."""
+
+        # Create curved terrain and 0.5 m white noise on 10 m pixels
+        rows, columns = np.mgrid[:64, :70]
+        values = 0.02 * columns**2 + 0.03 * rows**2 + 0.01 * rows * columns
+        noise = np.random.default_rng(42).normal(0, 0.5, values.shape)
+        grid = Affine(10, 0, 500_000, 0, -10, 7_000_000)
+        reference: Any = xdem.DEM.from_array(values, grid, 32632, nodata=-9999)
+
+        # Rotate the source grid about its center and add the known horizontal and vertical offsets
+        center = (values.shape[1] / 2, values.shape[0] / 2)
+        rotation_grid = (
+            Affine.translation(*center) * Affine.rotation(rotation) * Affine.translation(-center[0], -center[1])
+        )
+        source_grid = Affine.translation(*shift) * grid * rotation_grid
+        source: Any = xdem.DEM.from_array(values + noise + 1, source_grid, 32632, nodata=-9999)
+
+        # Store the mask on the source grid so it also selects source points
+        mask = np.zeros(values.shape, dtype=bool)
+        mask[5:-5, 5:-5] = True
+        comparison_mask = source.copy(new_array=mask)
+        method: xdem.coreg.AffineCoreg = xdem.coreg.LZD(only_translation=rotation == 0, subsample=1)
+        if point_input == "ref":
+            reference = reference.to_pointcloud(force_pixel_offset="center")
+
+            # Start ICP at the known translation to isolate the effect of raster resampling
+            method = xdem.coreg.ICP(only_translation=True, initial_shift=(-shift[0], -shift[1]), subsample=1)
+        elif point_input == "tba":
+            # Convert source pixels to points with the same measurement noise
+            source = source.to_pointcloud(force_pixel_offset="center")
+        original_source = source.copy()
+
+        # Estimate residual noise without interpolating the noisy source onto a raster grid
+        errors = source.estimate_error_structure(
+            reference,
+            coreg_method=method,
+            mask=comparison_mask,
+            predictors={},
+            random_state=12,
+            components={"measurement": {"magnitude": "constant", "correlation": None}},
+            spread_estimator=np.std,
+        )
+
+        # Allow 2% for the fitted transformation and pixels selected near the mask boundary
+        expected = np.std(noise[mask])
+        assert errors.predict_magnitude() == pytest.approx(expected, rel=0.02)
+
+        # Check unchanged source values, coordinates and method
+        assert not method._fit_called
+        np.testing.assert_array_equal(source.data, original_source.data)
+        if point_input == "tba":
+            assert source.georeferenced_coords_equal(original_source)
+        else:
+            assert source.transform == source_grid
+
     @pytest.mark.parametrize("point_input", [None, "ref", "tba"])
     def test_estimate_error_structure__precoreg(
         self,
@@ -366,9 +435,9 @@ class TestElevationErrorEstimationPrecoreg:
         )
         mask = reference.copy(new_array=np.indices(reference.shape)[0] < 14)
         if point_input == "ref":
-            reference = reference.to_pointcloud()
+            reference = reference.to_pointcloud(force_pixel_offset="center")
         elif point_input == "tba":
-            source = source.to_pointcloud()
+            source = source.to_pointcloud(force_pixel_offset="center")
         original_source, original_reference = source.copy(), reference.copy()
 
         # 2/ Compare automatic and manual alignment
@@ -380,19 +449,42 @@ class TestElevationErrorEstimationPrecoreg:
             "spread_estimator": np.std,
             "random_state": 4,
         }
-        aligned = source
+        aligned, comparison, comparison_mask = source, reference, mask
         if precoreg:
             fitted = coreg_method.copy().fit(reference, source, inlier_mask=mask, random_state=4)
-            aligned = fitted.apply(source, resample=True)
+            if point_input == "ref":
+                # Transform reference points back to the unchanged source DEM after applying the mask
+                observations = reference.subsample(1, mask=mask)
+                frame = xdem.coreg.apply_matrix(
+                    observations.gdf,
+                    fitted.to_matrix(),
+                    invert=True,
+                    centroid=fitted.centroid(),
+                    z_name=observations.data_name,
+                )
+                comparison = gu.PointCloud(frame, data_name=observations.data_name)
+                comparison_mask = None
+            else:
+                observations = (
+                    source.to_pointcloud(force_pixel_offset="center") if isinstance(source, gu.Raster) else source
+                )
+                aligned = fitted.apply(observations)
         else:
 
             def fail_fit(*args: Any, **kwargs: Any) -> None:
-                """Fail if disabled prealignment attempts a fit."""
+                """Fail if precoreg=False actually calls Coreg.fit."""
 
-                pytest.fail("Disabled prealignment must not call fit().")
+                pytest.fail("Disabled precoreg must not call fit().")
 
             monkeypatch.setattr(type(coreg_method), "fit", fail_fit)
-        expected = gu.ErrorStructure.estimate(aligned, other=reference, other_precision="negligible", **options)
+        sampled = aligned.cosample(comparison, mask=comparison_mask, align="reproject")
+        if isinstance(sampled, gu.Raster):
+            residuals = sampled.copy(new_array=sampled.data[0] - sampled.data[1])
+        else:
+            residuals = sampled.copy(new_array=sampled.gdf["self"].to_numpy() - sampled.gdf["other"].to_numpy())
+        expected = gu.ErrorStructure.estimate(
+            residuals, **{key: value for key, value in options.items() if key != "mask"}
+        )
 
         # Run the function, method or accessor with the same alignment options
         if entrypoint == "function":
@@ -416,6 +508,95 @@ class TestElevationErrorEstimationPrecoreg:
                 assert elevation.georeferenced_grid_equal(original)
             else:
                 assert elevation.georeferenced_coords_equal(original)
+
+    @pytest.mark.parametrize("reference_crs", [32632, 4326])
+    @pytest.mark.parametrize("pipeline", [False, True])
+    @pytest.mark.parametrize("variable", [False, True])
+    @pytest.mark.parametrize("entrypoint", ["function", "accessor"])
+    def test_estimate_error_structure__inverse_rotation(
+        self,
+        curved_dem: xdem.DEM,
+        reference_crs: int,
+        pipeline: bool,
+        variable: bool,
+        entrypoint: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Checks that inverse rotations preserve point errors, masks and source terrain predictors."""
+
+        # 1/ Create reference points with known errors and rotations
+        # Exclude raster edges so roundoff in transformed coordinates cannot select missing terrain derivatives
+        source = curved_dem
+        interior = np.zeros(source.shape, dtype=bool)
+        interior[2:-2, 2:-2] = True
+        observations = source.to_pointcloud(force_pixel_offset="center").subsample(
+            1, mask=source.copy(new_array=interior)
+        )
+        noise = np.random.default_rng(42).normal(0, 0.5, len(observations.data))
+        reference = observations.copy(new_array=observations.data + noise)
+
+        # Use rotations about all three axes and different centroids to check inverse pipeline order
+        matrix = xdem.coreg.matrix_from_translations_rotations(0.7, -0.4, 1.3, 1.0, -2.0, 3.0)
+        first = xdem.coreg.AffineCoreg.from_matrix(matrix)
+        first.meta["outputs"]["affine"]["centroid"] = (500_020.0, 6_999_982.0, 0.0)
+        steps: list[xdem.coreg.Coreg] = [first]
+        if pipeline:
+            second = xdem.coreg.AffineCoreg.from_rotations(0.4, -0.6, 1.2)
+            second.meta["outputs"]["affine"]["centroid"] = (500_027.0, 6_999_977.0, 2.0)
+            steps.append(second)
+        method = xdem.coreg.CoregPipeline(steps) if pipeline else first
+        for step in steps:
+            reference = step.apply(reference)
+        original_values = source.data.copy()
+
+        # Return the known transform so fitting error cannot hide interpolation of the point errors
+        def use_prescribed_fit(self: xdem.coreg.Coreg, *args: Any, **kwargs: Any) -> xdem.coreg.Coreg:
+            """Return the prescribed transform to isolate residual calculation from fitting errors."""
+
+            return self
+
+        monkeypatch.setattr(type(method), "fit", use_prescribed_fit)
+
+        # 2/ Estimate errors with a mask defined in the reference frame
+        # Select the right half of the raster before inverse transformation moves the reference points
+        mask = source.copy(new_array=np.indices(source.shape)[1] >= source.shape[1] // 2)
+        cutoff = source.bounds.left + source.res[0] * (source.shape[1] // 2)
+        selected = reference.gdf.geometry.x.to_numpy() >= cutoff
+
+        # Reproject the reference to check that inverse transforms use the DEM CRS
+        reference = reference.reproject(crs=reference_crs)
+        original_reference = reference.copy()
+        options: dict[str, Any] = {
+            "components": {
+                "measurement": {"magnitude": "heteroscedastic" if variable else "constant", "correlation": None}
+            },
+            "spread_estimator": np.std,
+            "bins": {"slope": np.array([0.0, 20.0, 40.0, 60.0, 90.0])} if variable else None,
+            "min_count": 3,
+        }
+        target = source.to_xarray().dem if entrypoint == "accessor" else source
+        actual = target.estimate_error_structure(
+            reference, coreg_method=method, mask=mask, predictors=("slope",) if variable else {}, **options
+        )
+
+        # 3/ Compare with the original errors and predictors at source pixel centers
+        residuals = observations.copy(new_array=-noise).subsample(1, mask=selected)
+        expected_predictors = {"slope": source.slope()} if variable else {}
+        expected = gu.ErrorStructure.estimate(residuals, predictors=expected_predictors, **options)
+
+        # Allow roundoff from rotations, CRS conversion and predictor interpolation
+        if variable:
+            actual_magnitude = actual.components["measurement"].magnitude
+            expected_magnitude = expected.components["measurement"].magnitude
+            pd.testing.assert_frame_equal(
+                actual_magnitude.grouped_statistics, expected_magnitude.grouped_statistics, rtol=1e-7, atol=1e-8
+            )
+        else:
+            assert actual.predict_magnitude() == pytest.approx(np.std(noise[selected]), rel=1e-8)
+        assert actual.fit_diagnostics == expected.fit_diagnostics
+        np.testing.assert_array_equal(source.data, original_values)
+        pd.testing.assert_frame_equal(reference.gdf, original_reference.gdf)
+        assert not method._fit_called
 
     @pytest.mark.parametrize("case", ["array", "terrain_predictors"])
     def test_estimate_error_structure__precoreg_inputs(
@@ -445,10 +626,14 @@ class TestElevationErrorEstimationPrecoreg:
         }
 
         # 2/ Compare automatic and manual estimation
-        # Derive the expected slope from the aligned DEM
+        # Derive slope at the source pixels and transform those observations without resampling
         fitted = coreg_method.copy().fit(reference, source, random_state=4)
-        aligned = fitted.apply(source, resample=True)
-        expected_predictors = {"slope": xdem.terrain.slope(aligned)} if variable else {}
+        observations = source.to_pointcloud(force_pixel_offset="center")
+        expected_predictors = {}
+        if variable:
+            observations.gdf["slope"] = source.slope().data.filled(np.nan).ravel()
+            expected_predictors = {"slope": "slope"}
+        aligned = fitted.apply(observations)
         expected = gu.ErrorStructure.estimate(
             aligned, other=reference, other_precision="negligible", predictors=expected_predictors, **options
         )
@@ -485,9 +670,9 @@ class TestPropagation:
         reference: Any = curved_dem
         source: Any = reference + 5
         if point_input == "ref":
-            reference = reference.to_pointcloud()
+            reference = reference.to_pointcloud(force_pixel_offset="center")
         elif point_input == "tba":
-            source = source.to_pointcloud()
+            source = source.to_pointcloud(force_pixel_offset="center")
 
         # Copy inputs to check for changes after fitting
         original_reference = reference.data.copy()
@@ -502,7 +687,7 @@ class TestPropagation:
                 source,
                 "coreg",
                 error_structure={error_applied_to: structure},
-                n_samples=3,
+                n_simulations=3,
                 random_state=4,
                 return_samples=True,
                 return_coregs=True,
@@ -531,7 +716,7 @@ class TestPropagation:
         pd.testing.assert_series_equal(result.std, repeated.std)
 
         # Check all three fits contribute to summaries and samples
-        assert result.n_success == result.n_samples == 3
+        assert result.n_success == result.n_simulations == 3
         assert result.n_valid.eq(3).all()
         assert result.samples is not None
         assert result.samples.index.tolist() == [1, 2, 3]
@@ -584,7 +769,7 @@ class TestPropagation:
         # 2/ Propagate on the original pair
         options: dict[str, Any] = {
             "error_structure": {error_applied_to: errors},
-            "n_samples": 3,
+            "n_simulations": 3,
             "random_state": 42,
             "return_samples": True,
             "return_coregs": True,
@@ -804,14 +989,14 @@ class TestElevationErrorEstimationErrors:
 
     @pytest.mark.parametrize("predictors", [("slope",), {"slope": "slope"}])
     def test_estimate_error_structure__error_proxy_predictors(self, predictors: Any) -> None:
-        """Checks an error is raised for terrain attribute names supplied without elevations."""
+        """Checks an error is raised for terrain attribute names without elevation inputs."""
 
         # Create a proxy whose values describe errors, not terrain
         proxy = xdem.DEM.from_array(np.ones((5, 7)), Affine(2, 0, 0, 0, -2, 10), 32632, nodata=-9999)
 
         # Require predictor values derived from actual elevations
         with pytest.raises(
-            ValueError, match="Terrain predictors for an error proxy must be supplied as arrays or rasters"
+            ValueError, match="Terrain predictors for an error proxy must be input as arrays or rasters"
         ):
             proxy.estimate_error_structure(predictors=predictors)
 

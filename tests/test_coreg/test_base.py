@@ -724,7 +724,7 @@ class TestAffineManipulation:
             nodata_propagation="propagate",
         )
         # Exclude partial interpolation windows, where edge clamping cannot reproduce an inclined plane
-        cols, rows = ~trans_dem.transform * (trans_epc.geometry.x.values, trans_epc.geometry.y.values)
+        rows, cols = trans_dem.xy2ij(trans_epc.geometry.x.values, trans_epc.geometry.y.values, op=np.float64)
         interior = (cols >= 1) & (cols <= trans_dem.width - 2) & (rows >= 1) & (rows <= trans_dem.height - 2)
         valids = np.isfinite(z_points) & interior
         assert np.count_nonzero(valids) > 0

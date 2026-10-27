@@ -257,7 +257,7 @@ class TestSpatialErrorPropagation:
             "spatial",
             error_structure=structure,
             inputs={"spatial": {"areas": {"area": mask}}},
-            n_samples=200,
+            n_simulations=200,
             random_state=42,
             return_samples=True,
         )
@@ -267,7 +267,7 @@ class TestSpatialErrorPropagation:
             dem,
             lambda value: np.ma.mean(value.data[mask]),
             error_structure=structure,
-            n_samples=200,
+            n_simulations=200,
             random_state=42,
         )
 

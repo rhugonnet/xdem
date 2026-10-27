@@ -488,9 +488,9 @@ def _to_vcrs_2d_pyproj(
     cols = np.arange(col_start, col_start + data.shape[1])
 
     # 2/ Transform elevations at the same coordinates as the full raster
-    # GeoUtils applies the shared Area/Point convention before the original affine transform
-    xx, _ = _ij2xy(i=0, j=cols, transform=transform, area_or_point=area_or_point)
-    _, yy = _ij2xy(i=rows, j=0, transform=transform, area_or_point=area_or_point)
+    # GeoUtils locates pixel centers with the original affine transform
+    xx, _ = _ij2xy(i=0, j=cols, transform=transform)
+    _, yy = _ij2xy(i=rows, j=0, transform=transform)
     xx, yy = np.meshgrid(xx, yy)
     zz_trans = _transform_zz(
         transformer=transformer,

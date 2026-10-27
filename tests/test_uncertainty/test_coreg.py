@@ -36,49 +36,56 @@ def _compare_simulated_uncertainty(
     options: dict[str, Any],
     only_translation: bool,
     *,
-    n_samples: int = 20,
+    n_simulations: int = 20,
     check_mean: bool = False,
 ) -> xdem.uncertainty.PropagationSummary:
     """Compare analytical parameter uncertainties with repeated fits under the same source errors."""
 
     # Propagate identical errors and fitting options analytically and numerically
     analytical = xdem.uncertainty.propagate_uncertainty_coreg(reference, moving, method, method="analytical", **options)
+
+    # Request the same GLS/TLS fit explicitly for the numerical comparison
+    numerical_options = dict(options)
+    fit_options = dict(options.get("fit_kwargs", {}))
+    if not any(name in fit_options for name in ("sig_ref", "sig_tba", "corr_ref", "corr_tba")):
+        fit_options.update(error_structure=options["error_structure"], error_predictors=options.get("error_predictors"))
+    numerical_options["fit_kwargs"] = fit_options
     numerical = xdem.uncertainty.propagate_uncertainty_coreg(
         reference,
         moving,
         method,
-        n_samples=n_samples,
+        n_simulations=n_simulations,
         on_error="raise",
         random_field_options={"backend": "gpytorch", "gpytorch_inducing_points": None},
-        **options,
+        **numerical_options,
     )
 
     # We use a chi-square interval to quantitatively constrain the allowed variation due to small number of simulations,
     # with an additional 0.1% error across parameters
     count = 3 if only_translation else 6
     probability = 0.001 / (2 * count)
-    bounds = np.sqrt(chi2.ppf([probability, 1 - probability], n_samples - 1) / (n_samples - 1))
+    bounds = np.sqrt(chi2.ppf([probability, 1 - probability], n_simulations - 1) / (n_simulations - 1))
     ratios = numerical.std.iloc[:count] / analytical.std.iloc[:count]
     assert np.all((bounds[0] <= ratios) & (ratios <= bounds[1])), ratios
 
     # Check that every draw contributes
-    assert numerical.n_success == n_samples
-    assert numerical.n_valid.eq(n_samples).all()
+    assert numerical.n_success == n_simulations
+    assert numerical.n_valid.eq(n_simulations).all()
     if only_translation:
         np.testing.assert_array_equal(numerical.std.iloc[3:], 0)
 
     # Check simulated means against the original fit within 4.5 standard errors
     if check_mean:
         mean_error = (numerical.mean.iloc[:count] - analytical.estimate.iloc[:count]) / analytical.std.iloc[:count]
-        np.testing.assert_allclose(mean_error, 0, rtol=0, atol=4.5 / np.sqrt(n_samples))
+        np.testing.assert_allclose(mean_error, 0, rtol=0, atol=4.5 / np.sqrt(n_simulations))
     return analytical
 
 
 class TestCoregistrationPropagationSummary:
     """Test module for the PropagationSummary subclass adapted to coreg."""
 
-    @pytest.mark.parametrize("supplied_axes", [False, True])
-    def test_plot(self, supplied_axes: bool) -> None:
+    @pytest.mark.parametrize("input_axes", [False, True])
+    def test_plot(self, input_axes: bool) -> None:
         """Checks that plot show the right data."""
 
         import matplotlib.pyplot as plt
@@ -100,7 +107,7 @@ class TestCoregistrationPropagationSummary:
         )
 
         # THen create or reuse plot axes
-        axes = tuple(plt.subplots(1, 2)[1]) if supplied_axes else None
+        axes = tuple(plt.subplots(1, 2)[1]) if input_axes else None
         plotted_axes = summary.plot(axes=axes)
         if axes is not None:
             assert plotted_axes == axes
@@ -150,7 +157,7 @@ class TestPropagateUncertaintyCoreg:
             source,
             method,
             error_structure=errors,
-            n_samples=4,
+            n_simulations=4,
             random_state=2,
             return_coregs=return_coregs,
             return_samples=return_samples,
@@ -200,6 +207,111 @@ class TestPropagateUncertaintyCoreg:
         np.testing.assert_allclose(parameters.std(), summary.std)
         if summary.samples is not None:
             np.testing.assert_array_equal(parameters.loc[:, summary.samples.columns], summary.samples)
+
+    @pytest.mark.parametrize(
+        "solver, options",
+        [
+            (xdem.coreg.LZD, {}),
+            (xdem.coreg.ICP, {}),
+            (xdem.coreg.LZD, {"trim_residuals": True}),
+            (xdem.coreg.ICP, {"trim_residuals": True}),
+            (xdem.coreg.LZD, {"linearized": False}),
+            (xdem.coreg.ICP, {"linearized": False}),
+            (xdem.coreg.LZD, {"fit_loss_func": "soft_l1"}),
+            (xdem.coreg.ICP, {"fit_loss_func": "soft_l1"}),
+            (xdem.coreg.ICP, {"method": "point-to-point"}),
+            (xdem.coreg.ICP, {"sampling_strategy": "iterative_same_xy"}),
+        ],
+    )
+    def test_propagate_uncertainty_coreg__numerical_estimators(
+        self, icp_dem: gu.Raster, solver: type[xdem.coreg.AffineCoreg], options: dict[str, Any]
+    ) -> None:
+        """Checks that numerical propagation works with any coreg setup (linear or not, custom funcs, etc)."""
+
+        # Create a vertical offset and small independent measurement errors
+        source = icp_dem + 0.2
+        method = solver(only_translation=True, subsample=1, **options)
+        errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.01)])
+
+        # Run fit and 3 random draws
+        summary = xdem.uncertainty.propagate_uncertainty_coreg(
+            icp_dem,
+            source,
+            method,
+            error_structure=errors,
+            n_simulations=3,
+            random_state=12,
+            on_error="raise",
+        )
+
+        # Check the known correction and successful draws
+        np.testing.assert_allclose(summary.estimate.iloc[:3], (0, 0, -0.2), rtol=0, atol=1e-7)
+        assert summary.n_success == 3
+        assert summary.std["tz"] > 0
+
+    @pytest.mark.parametrize("solver", [xdem.coreg.LZD, xdem.coreg.ICP])
+    @pytest.mark.parametrize("side", ["ref", "tba"])
+    @pytest.mark.parametrize("predictor_kind", ["array", "raster", "terrain_name"])
+    @pytest.mark.parametrize("propagation_method", ["analytical", "numerical"])
+    def test_propagate_uncertainty_coreg__nan_predictors(
+        self,
+        curved_dem: xdem.DEM,
+        solver: type[xdem.coreg.AffineCoreg],
+        side: str,
+        predictor_kind: str,
+        propagation_method: Literal["analytical", "numerical"],
+    ) -> None:
+        """Checks that predictors with NaNs still provide proper fits and numerical simulations."""
+
+        # Add a NaN in the DEM, which will propagate to slope
+        reference = curved_dem.copy()
+        reference.data[4, 5] = np.ma.masked
+        source = reference + 0.2
+        slope = (reference if side == "ref" else source).slope()
+
+        # Define small slope-dependent errors across the possible range of slopes in degrees
+        statistics = pd.DataFrame(
+            {"std": [0.001, 0.002], "count": [100, 100]}, index=pd.Index([0.0, 90.0], name="slope")
+        )
+        magnitude = gu.ErrorMagnitude.variable_from_grouped_stats(statistics)
+        errors = gu.ErrorStructure([gu.ErrorComponent("measurement", magnitude)])
+        predictor = {"array": slope.data, "raster": slope, "terrain_name": "slope"}[predictor_kind]
+        original_reference, original_source = reference.copy(), source.copy()
+
+        # Select analytical covariance or three numerical draws using the input predictor representation
+        propagation_options: dict[str, Any] = {"method": propagation_method, "random_state": 12}
+        if propagation_method == "numerical":
+            propagation_options.update(n_simulations=3, on_error="raise")
+        summary = xdem.uncertainty.propagate_uncertainty_coreg(
+            reference,
+            source,
+            solver(only_translation=True, subsample=1),
+            error_structure={side: errors},
+            error_predictors={side: {"slope": predictor}},
+            **propagation_options,
+        )
+
+        # Check the correction and uncertainty from the finite slope observations
+        np.testing.assert_allclose(summary.estimate.iloc[:3], (0, 0, -0.2), rtol=0, atol=1e-7)
+        assert np.all(summary.std.iloc[:3] > 0)
+        if propagation_method == "numerical":
+            assert summary.n_success == 3
+        else:
+            # Analytical uncertainty matches a direct fit, without the mask used to prepare numerical fields
+            expected = solver(only_translation=True, subsample=1).fit(
+                reference,
+                source,
+                error_structure={side: errors},
+                error_predictors={side: {"slope": slope}},
+                random_state=12,
+            )
+            expected_errors = expected.meta["outputs"]["fitorbin"]["fit_perr"][:3]
+            np.testing.assert_allclose(summary.std.iloc[:3], expected_errors, rtol=1e-12)
+
+        # Check unchanged input elevations and slope values
+        np.testing.assert_array_equal(reference.data, original_reference.data)
+        np.testing.assert_array_equal(source.data, original_source.data)
+        np.testing.assert_array_equal(slope.data, (reference if side == "ref" else source).slope().data)
 
     @pytest.mark.parametrize("only_translation", [True, False])
     @pytest.mark.parametrize(
@@ -258,7 +370,7 @@ class TestPropagateUncertaintyCoreg:
         expected = xdem.uncertainty.propagate_uncertainty_coreg(reference, changed_source, fresh, **arguments)
         summary = xdem.uncertainty.propagate_uncertainty_coreg(reference, changed_source, fitted, **arguments)
 
-        # 3/ Compare the saved method's summary with a fresh fit using the supplied errors
+        # 3/ Compare the saved method's summary with a fresh fit using the input errors
         labels = ["tx", "ty", "tz", "rx", "ry", "rz"]
         expected_covariance = expected.output["parameter_covariance"]
         expected_std = expected.std
@@ -287,7 +399,7 @@ class TestPropagateUncertaintyCoreg:
     def test_propagate_uncertainty_coreg__refit_without_saved_errors(
         self, icp_dem: gu.Raster, solver: type[xdem.coreg.AffineCoreg]
     ) -> None:
-        """Checks that a fit without saved uncertainty is refitted with the supplied error model."""
+        """Checks that a fit without saved uncertainty is refitted with the input error model."""
 
         # Fit without an error model and mark the old convergence result as unsuitable for reuse
         fitted = solver(only_translation=True, subsample=60).fit(icp_dem, icp_dem + 0.2, random_state=12)
@@ -295,7 +407,7 @@ class TestPropagateUncertaintyCoreg:
         original_matrix = fitted.to_matrix().copy()
         errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.1)])
 
-        # Calculate analytical uncertainty from a new fit to the supplied inputs
+        # Calculate analytical uncertainty from a new fit to the inputs
         summary = xdem.uncertainty.propagate_uncertainty_coreg(
             icp_dem, icp_dem + 0.2, fitted, error_structure=errors, method="analytical", random_state=12
         )
@@ -341,7 +453,7 @@ class TestPropagateUncertaintyCoreg:
             error_structure={error_applied_to: errors},
             method="numerical",
             random_state=2,
-            n_samples=3,
+            n_simulations=3,
             return_samples=True,
             inlier_mask=mask,
         )
@@ -367,7 +479,7 @@ class TestPropagateUncertaintyCoreg:
     def test_propagate_uncertainty_coreg__file_crs_units(self, tmp_path: Path, crs: int, unit: str) -> None:
         """Checks that a file-backed raster gives a parameter summary with its projected coordinate units."""
 
-        # Write a projected raster and reopen it with the CRS supplied by Rasterio
+        # Write a projected raster and reopen it with the CRS read by Rasterio
         values = np.arange(48.0).reshape(6, 8)
         raster = gu.Raster.from_array(values, Affine(2, 0, 0, 0, -2, 12), crs)
         filename = tmp_path / "reference.tif"
@@ -381,7 +493,7 @@ class TestPropagateUncertaintyCoreg:
             reference + 5,
             xdem.coreg.VerticalShift(vshift_reduc_func=np.mean),
             error_structure=errors,
-            n_samples=4,
+            n_simulations=4,
             random_state=2,
         )
 
@@ -464,7 +576,7 @@ class TestCoregUncertaintyAnalyticalVsNumerical:
 
         # 2/ Compare fitted standard errors with exact native Gaussian simulations
         _compare_simulated_uncertainty(
-            reference, source, method, options, only_translation, n_samples=20, check_mean=True
+            reference, source, method, options, only_translation, n_simulations=20, check_mean=True
         )
 
     @pytest.mark.parametrize("solver", [xdem.coreg.LZD, xdem.coreg.ICP])
@@ -633,14 +745,14 @@ class TestPropagateUncertaintyCoregErrors:
                 reference + 5,
                 xdem.coreg.VerticalShift(vshift_reduc_func=np.mean),
                 error_structure=errors,
-                n_samples=3,
+                n_simulations=3,
                 random_state=2,
                 return_coregs=True,
                 return_samples=True,
             )
 
         # 3/ Compare saved Coregs, sample rows and uncertainty from successful fits
-        assert summary.n_samples == 3
+        assert summary.n_simulations == 3
         assert summary.n_success == 2
         assert summary.failures == {1: message}
         assert summary.samples is not None
@@ -662,17 +774,31 @@ class TestPropagateUncertaintyCoregErrors:
             {"sampling_strategy": "iterative_same_xy"},
         ],
     )
-    def test_propagate_uncertainty_coreg__error_icp_options(self, options: dict[str, Any]) -> None:
-        """Checks an error is raised for unsupported ICP uncertainty options before reading elevations."""
+    def test_propagate_uncertainty_coreg__error_icp_options(self, icp_dem: gu.Raster, options: dict[str, Any]) -> None:
+        """Checks an error is raised for unsupported analytical ICP settings during fitting."""
 
         # Create a supported error model and an ICP option that changes the analytical estimator
         method = xdem.coreg.ICP(**options)
         errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.1)])
 
-        # Request analytical uncertainty before supplying any elevations
+        # Fit the input elevations with analytical uncertainty
         with pytest.raises(NotImplementedError, match="Analytical ICP"):
             xdem.uncertainty.propagate_uncertainty_coreg(
-                None, None, method, error_structure=errors, method="analytical"
+                icp_dem, icp_dem + 0.2, method, error_structure=errors, method="analytical"
+            )
+
+    @pytest.mark.parametrize("options", [{"trim_residuals": True}, {"linearized": False}, {"fit_loss_func": "soft_l1"}])
+    def test_propagate_uncertainty_coreg__error_lzd_options(self, icp_dem: gu.Raster, options: dict[str, Any]) -> None:
+        """Checks an error is raised for unsupported analytical LZD settings during fitting."""
+
+        # Create an LZD estimator requiring numerical propagation
+        method = xdem.coreg.LZD(**options)
+        errors = gu.ErrorStructure([gu.ErrorComponent("measurement", 0.1)])
+
+        # Request analytical uncertainty and use the existing LZD validation
+        with pytest.raises(NotImplementedError, match="LZD error models require"):
+            xdem.uncertainty.propagate_uncertainty_coreg(
+                icp_dem, icp_dem + 0.2, method, error_structure=errors, method="analytical"
             )
 
     @pytest.mark.parametrize(
