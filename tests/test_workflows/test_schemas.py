@@ -311,3 +311,46 @@ def test_topo_without_terrain_attributes_in_config(get_topo_config_test):
     topo_config["terrain_attributes"] = ["hillshade", "slope", "max_curvature"]
     doc = schemas.validate_configuration(topo_config, schemas.TOPO_SCHEMA)
     assert doc["terrain_attributes"] == ["hillshade", "slope", "max_curvature"]
+
+
+@pytest.mark.parametrize(
+    "scalability, error",
+    [
+        (None, None),
+        ({"multiprocess": None}, None),
+        ({"multiprocess": {"chunk_size": 10}}, None),
+        ({"multiprocess": {"chunk_size": None}}, "null value not allowed"),
+        ({"multiprocess": {"chunk_size": 0}}, "min value is 1"),
+        ({"multiprocess": {"chunk_size": "aaa"}}, "must be of integer type"),
+        ({"multiprocess": {"xxx": 10}}, "unknown field"),
+        ({"multiprocess": {"chunk_size": 10, "nb_workers": None}}, None),
+        ({"multiprocess": {"chunk_size": 10, "nb_workers": 4}}, None),
+        ({"multiprocess": {"chunk_size": 10, "nb_workers": 0}}, "min value is 1"),
+        ({"multiprocess": {"chunk_size": 10, "nb_workers": "aaaa"}}, "must be of integer type"),
+        ({"multiprocess": {"nb_workers": 4}}, "required field"),
+        ({"dask": None}, None),
+        ({"dask": {"chunks": None}}, None),
+        ({"dask": {"chunks": {"x": 1, "y": 1}}}, None),
+        ({"dask": {"chunks": {"x": None, "y": 1}}}, "null value not allowed"),
+        ({"dask": {"chunks": {"x": 0, "y": 1}}}, "min value is 1"),
+        ({"dask": {"chunks": {"x": "aaa", "y": 1}}}, "must be of integer type"),
+        ({"dask": {"chunks": {"x": 1, "y": None}}}, "null value not allowed"),
+        ({"dask": {"chunks": {"x": 1, "y": 0}}}, "min value is 1"),
+        ({"dask": {"chunks": {"x": 1, "y": "aaa"}}}, "must be of integer type"),
+        ({"dask": {"chunks": {"x": 1, "y": 1, "xxx": None}}}, "unknown field"),
+        ({"dask": {"xxx": None}}, "unknown field"),
+        ({"multiprocess": {"chunk_size": 10}, "dask": {"chunks": None}}, "Cannot use Multiprocessing"),
+        # test import dask
+    ],
+)
+def test_scalability(get_topo_inputs_config_list, scalability, error, caplog, assert_and_allow_log):
+
+    topo_conf = dict()
+    topo_conf["inputs"] = get_topo_inputs_config_list[0]
+    topo_conf["scalability"] = scalability
+
+    if error is None:
+        _ = schemas.validate_configuration(topo_conf, schemas.TOPO_SCHEMA)
+    else:
+        with pytest.raises(ValueError, match=error):
+            _ = schemas.validate_configuration(topo_conf, schemas.TOPO_SCHEMA)
