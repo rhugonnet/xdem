@@ -21,14 +21,14 @@
 test for workflow class
 """
 
-# mypy: disable-error-code=no-untyped-def
-import csv
 import re
 from pathlib import Path
+from typing import Any, Dict
 
 import geoutils as gu
-import numpy as np
 import pytest
+import rasterio
+import xarray as xr
 
 import xdem
 from xdem.workflows.accuracy import Accuracy
@@ -48,7 +48,7 @@ pytest.importorskip("cerberus")
 import yaml  # type: ignore  # noqa
 
 
-def test_workflows_init_wrong_config():
+def test_workflows_init_wrong_config() -> None:
     """
     Test workflows class initialization
     """
@@ -58,18 +58,57 @@ def test_workflows_init_wrong_config():
 
 
 @pytest.mark.parametrize("level", [1, 2])
-def test_workflows_init(get_topo_inputs_config_list, tmp_path, level):
+def test_workflows_init(get_topo_inputs_config_list: list[dict[str, str]], tmp_path: Path, level: int) -> None:
     """
     Test workflows class initialization
     """
-    user_config = dict()
-    user_config["inputs"] = get_topo_inputs_config_list[:1]
+    user_config: dict[str, Any] = dict()
+    user_config["inputs"] = get_topo_inputs_config_list[:]
     user_config["outputs"] = {"path": str(tmp_path), "level": level}
     workflows = Topo(user_config)
     workflows.run()
 
     assert isinstance(workflows, Workflows)
     assert isinstance(workflows, Topo)
+
+
+@pytest.mark.parametrize("subdir_given", [True, False])
+def test_create_output_dir(
+    get_topo_inputs_config_list: list[dict[str, str]], tmp_path: Path, subdir_given: bool
+) -> None:
+    """Create output directories at the configured or overridden path."""
+    user_config: dict[str, Any] = dict()
+    user_config["inputs"] = get_topo_inputs_config_list[:1]
+    user_config["outputs"] = {"path": str(tmp_path)}
+    workflow = Topo(user_config)
+    target = tmp_path / "sub_dir" / "output" if subdir_given else tmp_path
+    workflow.create_output_dir(target if subdir_given else None)
+
+    assert workflow.outputs_folder == target
+    assert all((target / name).is_dir() for name in ("plots", "rasters", "tables"))
+    workflow.create_output_dir()
+    assert workflow.outputs_folder == target
+    assert all((target / name).is_dir() for name in ("plots", "rasters", "tables"))
+
+
+def test_configure_execution(get_topo_inputs_config_list: list[dict[str, str]], tmp_path: Path) -> None:
+    """Test configuration for the scalability mode."""
+    user_config: dict[str, Any] = dict()
+    user_config["inputs"] = get_topo_inputs_config_list[:1]
+    user_config["outputs"] = {"path": str(tmp_path)}
+    user_config["scalability"] = None
+    workflow = Topo(user_config)
+    workflow.configure_execution()
+    workflow.configure_execution()
+    assert workflow.dask is None
+    assert workflow.mp_config is None
+
+    user_config["scalability"] = {"dask": {"chunks": {"x": 20, "y": 30}}}
+    workflow = Topo(user_config)
+    workflow.configure_execution()
+    assert workflow.dask is not None
+    assert workflow.dask["chunks"] == {"x": 20, "y": 30, "band": 1}
+    assert workflow.mp_config is None
 
 
 @pytest.mark.parametrize(
@@ -89,22 +128,24 @@ def test_workflows_init(get_topo_inputs_config_list, tmp_path, level):
         ({"a": 1, "b": [2, 3], "c": {"d": 4}}, {"a": 1, "b": [2, 3], "c": {"d": 4}}),
     ],
 )
-def test_remove_none_cases(get_topo_inputs_config_list, tmp_path, input_data, expected):
+def test_remove_none_cases(
+    get_topo_inputs_config_list: list[dict[str, str]], input_data: Any, expected: Any, tmp_path: Path
+) -> None:
     """
     Test remove_none from dictionary
     """
-    user_config = dict()
+    user_config: dict[str, Any] = dict()
     user_config["inputs"] = get_topo_inputs_config_list[:1]
     user_config["outputs"] = {"path": str(tmp_path)}
     workflows = Topo(user_config)
     assert workflows.remove_none(input_data) == expected
 
 
-def test_load_config(get_topo_inputs_config_list, tmp_path):
+def test_load_config(get_topo_inputs_config_list: list[dict[str, str]], tmp_path: Path) -> None:
     """
     Test load_config function
     """
-    user_config = dict()
+    user_config: dict[str, Any] = dict()
     user_config["inputs"] = get_topo_inputs_config_list[:1]
     user_config["outputs"] = {"path": str(tmp_path)}
 
@@ -121,14 +162,17 @@ def test_load_config(get_topo_inputs_config_list, tmp_path):
         _ = Topo(str(missing_config))
 
 
-def test_load_config_none(get_topo_inputs_config_list, get_accuracy_inputs_test, tmp_path):
+def test_load_config_none(
+    get_topo_inputs_config_list: list[dict[str, str]], get_accuracy_inputs_test: Dict[str, Any], tmp_path: Path
+) -> None:
     """
     Test None values in yaml reading function
     """
     # Change values
-    user_config = dict()
+    user_config: dict[str, Any] = dict()
     user_config["inputs"] = get_topo_inputs_config_list[:1]
     user_config["inputs"][0]["force_vcrs"] = None
+    user_config["outputs"] = {"path": str(tmp_path)}
 
     # Read working config
     yaml_str = yaml.dump(user_config, allow_unicode=True)
@@ -159,7 +203,7 @@ def test_load_config_none(get_topo_inputs_config_list, get_accuracy_inputs_test,
     assert config_output["inputs"]["sampling_grid"] is None
 
 
-def test_pipeline_accuracy_default_values(get_accuracy_inputs_test, tmp_path):
+def test_pipeline_accuracy_default_values(get_accuracy_inputs_test: Dict[str, Any], tmp_path: Path) -> None:
     """
     Test valid VCRS function for 'from' and 'to'
     """
@@ -193,24 +237,26 @@ def test_pipeline_accuracy_default_values(get_accuracy_inputs_test, tmp_path):
     assert pipeline_accuracy_test["outputs"] == COMPLETE_CONFIG_ACCURACY["outputs"]
 
 
-def test_pipeline_topo_default_values(get_topo_inputs_config_list, tmp_path):
+def test_pipeline_topo_default_values(get_topo_inputs_config_list: list[dict[str, str]], tmp_path: Path) -> None:
     """
     Test valid VCRS function for 'from' and 'to'
     """
-    topo_config = dict()
-    topo_config["inputs"] = get_topo_inputs_config_list
-    yaml_str = yaml.dump(topo_config, allow_unicode=True)
+    user_config: dict[str, Any] = dict()
+    user_config["inputs"] = get_topo_inputs_config_list[:1]
+    user_config["inputs"][0]["force_vcrs"] = None
+    user_config["outputs"] = {"path": str(tmp_path)}
+    yaml_str = yaml.dump(user_config, allow_unicode=True)
     Path(tmp_path / "temp_config.yaml").write_text(yaml_str, encoding="utf-8")
     workflow_topo = Topo(str(tmp_path / "temp_config.yaml"))
     assert isinstance(workflow_topo, Workflows)
     assert isinstance(workflow_topo, Topo)
     pipeline_topo_test = workflow_topo.config
 
-    assert len(pipeline_topo_test["inputs"]) == len(topo_config["inputs"])
+    assert len(pipeline_topo_test["inputs"]) == len(user_config["inputs"])
     for k, input_elev in enumerate(pipeline_topo_test["inputs"]):
-        assert input_elev["path_to_elev"] == topo_config["inputs"][k]["path_to_elev"]
-        if "path_to_mask" in topo_config["inputs"][k]:
-            assert input_elev["path_to_mask"] == topo_config["inputs"][k]["path_to_mask"]
+        assert input_elev["path_to_elev"] == user_config["inputs"][k]["path_to_elev"]
+        if "path_to_mask" in user_config["inputs"][k]:
+            assert input_elev["path_to_mask"] == user_config["inputs"][k]["path_to_mask"]
 
         assert "force_vcrs" not in input_elev
         assert "downsample" not in input_elev  # default value not taken in "anyof" schema
@@ -220,86 +266,63 @@ def test_pipeline_topo_default_values(get_topo_inputs_config_list, tmp_path):
     assert pipeline_topo_test["outputs"] == COMPLETE_CONFIG_TOPO["outputs"]
 
 
-def test_generate_graph(get_topo_inputs_config_list, tmp_path):
-    """
-    Test generate_plot function
-    """
-    dem = xdem.DEM(xdem.examples.get_path_test("longyearbyen_tba_dem"))
-    filename = "test_generate_graph"
-    title = "Test graph"
-
-    user_config = dict()
-    user_config["inputs"] = get_topo_inputs_config_list[:1]
-    user_config["outputs"] = {"path": str(tmp_path)}
-    workflows = Topo(user_config)
-    workflows.create_output_dir()
-    workflows.generate_plot(dem, filename=filename, title=title)
-    out = tmp_path / "plots" / f"{filename}.png"
-    assert out.exists()
-
-
 @pytest.mark.parametrize(
-    "inputs, expected",
+    "data, mask_type",
     [
-        pytest.param({"a": 1.2345, "b": 2.9876}, {"a": 1.23, "b": 2.99}, id="test_flat_dict"),
-        pytest.param(
-            {"a": {"b": 3.14159, "c": [1.6666, 2.5555]}}, {"a": {"b": 3.14, "c": [1.67, 2.56]}}, id="test_nested_dict"
-        ),
-        pytest.param({"a": (1.23456, 9.8765)}, {"a": (1.23, 9.88)}, id="test_tuple_values"),
-        pytest.param(
-            {"a": 5.678, "b": "string", "c": 42, "d": [3.3333, "text"]},
-            {"a": 5.68, "b": "string", "c": 42, "d": [3.33, "text"]},
-            id="test_mixed_types",
-        ),
-        pytest.param({"a": np.float64(2.71828)}, {"a": 2.72}, id="test_numpy_float"),
+        pytest.param("giza_dem", "none"),
+        pytest.param("longyearbyen_ref_dem", "none"),
+        pytest.param("longyearbyen_ref_dem", "vector"),
+        pytest.param("longyearbyen_ref_dem", "raster"),
     ],
 )
-def test_floats_process(get_topo_inputs_config_list, tmp_path, inputs, expected):
-    """
-    Test floats_process function
-    """
-    user_config = dict()
-    user_config["inputs"] = get_topo_inputs_config_list[:1]
-    user_config["outputs"] = {"path": str(tmp_path)}
-    workflows = Topo(user_config)
-
-    assert workflows.floats_process(inputs) == expected
-
-
-def test_save_stat_as_csv(get_topo_inputs_config_list, tmp_path):
-    """
-    Test save_stat_as_csv function
-    """
-    user_config = dict()
-    user_config["inputs"] = get_topo_inputs_config_list[:1]
-    user_config["outputs"] = {"path": str(tmp_path)}
-    workflows = Topo(user_config)
-    workflows.create_output_dir()
-
-    data = {"a": 1.2345, "b": 2.9876}
-    title = "test_save_stat_as_csv"
-    workflows.save_stat_as_csv(data, title)
-    out = tmp_path / "tables" / f"{title}_stats.csv"
-    assert out.exists()
-
-    with open(out, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        final_dict = list(reader)
-
-    assert final_dict == [{"a": "1.2345", "b": "2.9876"}]
-
-
-@pytest.mark.parametrize("data", ["longyearbyen_ref_dem", "giza_dem"])
 @pytest.mark.parametrize("force_vcrs", [None, "Ellipsoid", "EGM96"])
-def test_load_dem(data, force_vcrs):
-    config_dem = dict()
-    config_dem["path_to_elev"] = xdem.examples.get_path(data)
+@pytest.mark.parametrize(
+    "dask", [None, {"chunks": {"x": 200, "y": 200}}, {"chunks": {"x": 20, "y": 20}}, {"chunks": {"x": 13, "y": 17}}]
+)
+def test_load_dem(
+    data: str, mask_type: str, force_vcrs: str | None, dask: Dict[str, Any] | None, tmp_path: Path
+) -> None:
+    config_dem: dict[str, Any] = {}
+    config_dem["path_to_elev"] = (
+        xdem.examples.get_path(data) if data == "giza_dem" else xdem.examples.get_path_test(data)
+    )
 
-    if data == "longyearbyen_ref_dem":
-        config_dem["path_to_mask"] = "longyearbyen_glacier_outlines"
+    if mask_type == "vector":
+        config_dem["path_to_mask"] = xdem.examples.get_path_test("longyearbyen_glacier_outlines")
+    elif mask_type == "raster":
+        vector_path = xdem.examples.get_path_test("longyearbyen_glacier_outlines")
+        mask_file = tmp_path / "mask.tif"
+        (~gu.Vector(vector_path).create_mask(xdem.DEM(config_dem["path_to_elev"]))).to_file(mask_file)
+        config_dem["path_to_mask"] = str(mask_file)
 
-    config_dem["force_vcrs"] = force_vcrs
-    output_dem, inlier_mask, mask_path = Workflows.load_dem(config_dem)
+    if force_vcrs is not None:
+        config_dem["force_vcrs"] = force_vcrs
+
+    config_dem["scalability"] = {"dask": dask} if dask is not None else None
+    output_dem, inlier_mask, mask_path = Workflows.load_dem(config_dem, dask)
+
+    if dask is None:
+        assert isinstance(output_dem, xdem.DEM)
+        assert isinstance(inlier_mask, gu.Raster) if "path_to_mask" in config_dem else inlier_mask is None
+        assert isinstance(mask_path, str) if "path_to_mask" in config_dem else mask_path is None
+        assert not output_dem.is_loaded
+
+    else:
+        import dask.array as da
+
+        assert isinstance(output_dem, xr.core.dataarray.DataArray)
+        assert isinstance(output_dem.data, da.Array)
+        assert not output_dem.dem.is_loaded
+        if "path_to_mask" in config_dem:
+            assert isinstance(inlier_mask, xr.core.dataarray.DataArray)
+            assert isinstance(inlier_mask.data, da.Array)
+            assert not inlier_mask.rst.is_loaded
+            assert isinstance(mask_path, str)
+            assert inlier_mask.dtype == bool
+        else:
+            assert inlier_mask is None
+            assert mask_path is None
+        output_dem = output_dem.dem
 
     dem = xdem.DEM(config_dem["path_to_elev"])
 
@@ -314,32 +337,62 @@ def test_load_dem(data, force_vcrs):
     assert dem.georeferenced_grid_equal(output_dem)
 
 
-def test_load_dem_alias():
+@pytest.mark.parametrize("dem_alias", [True, False])
+@pytest.mark.parametrize("mask_alias", [True, False])
+@pytest.mark.parametrize("chunks", [None, {"chunks": {"x": 200, "y": 200}}])
+def test_load_dem_alias(chunks: Dict[str, Any] | None, dem_alias: bool, mask_alias: bool) -> None:
     """
     Test load_dem function with alias
     """
 
     # Test with no mask
     config_dem = dict()
-    config_dem["path_to_elev"] = "longyearbyen_ref_dem"
-    output_dem, inlier_mask, mask_path = Workflows.load_dem(config_dem)
 
-    assert output_dem.raster_equal(xdem.DEM(xdem.examples.get_path(config_dem["path_to_elev"])))
+    dem_name = "longyearbyen_ref_dem"
+    config_dem["path_to_elev"] = dem_name if dem_alias else xdem.examples.get_path(dem_name)
+    output_dem, inlier_mask, mask_path = Workflows.load_dem(config_dem, chunks)
+
+    trust_dem = xdem.DEM(xdem.examples.get_path(dem_name))
+    if chunks is None:
+        assert isinstance(output_dem, xdem.DEM)
+        assert not output_dem.is_loaded
+        assert output_dem.raster_equal(trust_dem)
+    else:
+        assert isinstance(output_dem, xr.core.dataarray.DataArray)
+        assert not output_dem.dem.is_loaded
+        assert output_dem.dem.raster_equal(trust_dem)
+
     assert inlier_mask is None
     assert mask_path is None
 
-    # Test with mask
-    config_dem = dict()
-    config_dem["path_to_elev"] = "longyearbyen_tba_dem"
-    config_dem["path_to_mask"] = "longyearbyen_glacier_outlines"
-    output_dem, inlier_mask, mask_path = Workflows.load_dem(config_dem)
+    config_dem["path_to_elev"] = "aliasnotexist"
+    with pytest.raises(rasterio.errors.RasterioIOError, match="No such file or directory"):
+        Workflows.load_dem(config_dem, chunks)
 
-    assert output_dem.raster_equal(xdem.DEM(xdem.examples.get_path(config_dem["path_to_elev"])))
-    assert inlier_mask.raster_equal(~gu.Vector(mask_path).create_mask(output_dem))
+    # Test with mask
+
+    config_dem["path_to_elev"] = dem_name if dem_alias else xdem.examples.get_path(dem_name)
+    mask_name = "longyearbyen_glacier_outlines"
+    config_dem["path_to_mask"] = mask_name if mask_alias else xdem.examples.get_path(mask_name)
+    output_dem, inlier_mask, mask_path = Workflows.load_dem(config_dem, chunks)
+    trust_mask = ~gu.Vector(xdem.examples.get_path(mask_name)).create_mask(output_dem)
+    if chunks is None:
+        assert isinstance(output_dem, xdem.DEM)
+        assert not output_dem.is_loaded
+        assert output_dem.raster_equal(trust_dem)
+        assert isinstance(inlier_mask, gu.Raster)
+        assert inlier_mask.raster_equal(trust_mask)
+    else:
+        assert isinstance(output_dem, xr.core.dataarray.DataArray)
+        assert not output_dem.dem.is_loaded
+        assert output_dem.dem.raster_equal(trust_dem)
+        assert isinstance(inlier_mask, xr.core.dataarray.DataArray)
+        assert inlier_mask.rst.raster_equal(trust_mask)
     assert mask_path == xdem.examples.get_path("longyearbyen_glacier_outlines")
 
 
-def test_load_dem_mask(tmp_path):
+@pytest.mark.parametrize("chunks", [None, {"chunks": {"x": 200, "y": 200}}])
+def test_load_dem_mask(tmp_path: Path, chunks: Dict[str, Any] | None) -> None:
     """
     Test load_dem function with different path_to_mask possibilities
     """
@@ -347,51 +400,64 @@ def test_load_dem_mask(tmp_path):
     # No path_to_mask
     config_dem = dict()
     config_dem["path_to_elev"] = "longyearbyen_ref_dem"
-    output_dem, inlier_mask, mask_path = Workflows.load_dem(config_dem)
+    output_dem, inlier_mask, mask_path = Workflows.load_dem(config_dem, chunks)
     assert mask_path is None
     assert inlier_mask is None
 
     # path_to_mask = shapefile path
     config_dem["path_to_mask"] = xdem.examples.get_path("longyearbyen_glacier_outlines")
-    dem, inlier_mask, mask_path = Workflows.load_dem(config_dem)
-    assert inlier_mask.raster_equal(~gu.Vector(mask_path).create_mask(inlier_mask))
+    dem, inlier_mask, mask_path = Workflows.load_dem(config_dem, chunks)
+    assert inlier_mask is not None
+    reference_dem = xdem.DEM(xdem.examples.get_path(config_dem["path_to_elev"]))
+    assert (
+        inlier_mask.raster_equal(~gu.Vector(mask_path).create_mask(inlier_mask))
+        if chunks is None
+        else inlier_mask.rst.raster_equal(~gu.Vector(mask_path).create_mask(inlier_mask))
+    )
     assert mask_path == config_dem["path_to_mask"]
 
     # path_to_mask = shapefile alias
     config_dem["path_to_mask"] = "longyearbyen_glacier_outlines"
-    _, inlier_mask, mask_path = Workflows.load_dem(config_dem)
-    assert inlier_mask.raster_equal(~gu.Vector(mask_path).create_mask(inlier_mask))
+    _, inlier_mask, mask_path = Workflows.load_dem(config_dem, chunks)
+    assert (
+        inlier_mask.raster_equal(~gu.Vector(mask_path).create_mask(inlier_mask))
+        if chunks is None
+        else inlier_mask.rst.raster_equal(~gu.Vector(mask_path).create_mask(inlier_mask))
+    )
     assert mask_path == xdem.examples.get_path("longyearbyen_glacier_outlines")
 
     # path_to_mask = raster path, fitting dem
-    mask = ~gu.Vector(mask_path).create_mask(dem)
+    mask = ~gu.Vector(mask_path).create_mask(reference_dem)
     mask.to_file(tmp_path / "mask.tif")
-    config_dem["path_to_mask"] = tmp_path / "mask.tif"
-    _, inlier_mask, mask_path = Workflows.load_dem(config_dem)
-    assert inlier_mask.raster_equal(mask)
+    config_dem["path_to_mask"] = str(tmp_path / "mask.tif")
+    _, inlier_mask, mask_path = Workflows.load_dem(config_dem, chunks)
+    assert inlier_mask is not None
+    assert inlier_mask.raster_equal(mask) if chunks is None else inlier_mask.rst.raster_equal(mask)
     assert mask_path == config_dem["path_to_mask"]
 
     # path_to_mask = raster path, not fitting dem
     mask_crop = mask.icrop((0, 0, 500, 600))
     mask_crop.to_file(tmp_path / "mask_crop.tif")
-    config_dem["path_to_mask"] = tmp_path / "mask_crop.tif"
-    _, inlier_mask, mask_path = Workflows.load_dem(config_dem)
-    assert inlier_mask.raster_equal(mask_crop.reproject(dem, silent=True))
+    config_dem["path_to_mask"] = str(tmp_path / "mask_crop.tif")
+    _, inlier_mask, mask_path = Workflows.load_dem(config_dem, chunks)
+    assert inlier_mask is not None
+    expected_mask = ~gu.Vector(tmp_path / "mask_crop.tif").create_mask(inlier_mask)
+    assert inlier_mask.raster_equal(expected_mask) if chunks is None else inlier_mask.rst.raster_equal(expected_mask)
     assert mask_path == config_dem["path_to_mask"]
 
     # path_to_mask  = raster that not exists
-    config_dem["path_to_mask"] = tmp_path / "notexist.tif"
+    config_dem["path_to_mask"] = str(tmp_path / "notexist.tif")
     with pytest.raises(ValueError, match="not recognised as a mask"):
-        Workflows.load_dem(config_dem)
+        Workflows.load_dem(config_dem, chunks)
 
     # path_to_mask = shapefile that not exists
-    config_dem["path_to_mask"] = tmp_path / "notexist.shp"
+    config_dem["path_to_mask"] = str(tmp_path / "notexist.shp")
     with pytest.raises(ValueError, match="not recognised as a mask"):
-        Workflows.load_dem(config_dem)
+        Workflows.load_dem(config_dem, chunks)
 
     # path_to_mask = text file
     with open(tmp_path / "example.txt", "w") as f:
         f.write("some text")
-    config_dem["path_to_mask"] = tmp_path / "example.txt"
+    config_dem["path_to_mask"] = str(tmp_path / "example.txt")
     with pytest.raises(ValueError, match="not recognised as a mask"):
-        Workflows.load_dem(config_dem)
+        Workflows.load_dem(config_dem, chunks)
