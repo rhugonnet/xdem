@@ -227,7 +227,10 @@ def test_run_without_coreg(
         (False, None, "reference_elev", "same shape, transform and CRS"),
     ],
 )
-def test_run_prepare_datas(get_accuracy_inputs_test: Dict[str, Any], tmp_path: Path, config: Any) -> None:
+@pytest.mark.parametrize("execution", [None, {"dask": {"chunks": {"x": 200, "y": 200}}}])
+def test_run_prepare_datas(
+    get_accuracy_inputs_test: Dict[str, Any], tmp_path: Path, config: Any, execution: Any
+) -> None:
     """
     Test preparation data with all sampling_grid values in a coreg/no coreg process.
     """
@@ -237,6 +240,7 @@ def test_run_prepare_datas(get_accuracy_inputs_test: Dict[str, Any], tmp_path: P
     user_config["outputs"] = {"path": str(tmp_path), "level": 2}
     user_config["coregistration"] = {"process": process}
     user_config["inputs"]["sampling_grid"] = sampling_grid
+    user_config["scalability"] = execution
 
     if dem_to_crop is not None:
         dem = xdem.DEM(user_config["inputs"][dem_to_crop]["path_to_elev"])
@@ -282,13 +286,15 @@ def test_run_prepare_datas(get_accuracy_inputs_test: Dict[str, Any], tmp_path: P
         ("to_be_aligned_elev", "to_be_aligned_elev"),
     ],
 )
+@pytest.mark.parametrize("execution", [None, {"dask": {"chunks": {"x": 200, "y": 200}}}])
 def test_prepare_datas_with_overlap(
-    get_accuracy_inputs_test: Dict[str, Any], tmp_path: Path, config: Dict[str, Any]
+    get_accuracy_inputs_test: Dict[str, Any], tmp_path: Path, config: Dict[str, Any], execution: Dict[str, Any]
 ) -> None:
     """Test preparation data with all sampling_grid values when ref and tba do overlap."""
 
     sampling_grid, dem_to_crop = config
     user_config = get_accuracy_inputs_test
+    user_config["scalability"] = execution
 
     # Save path before crop(s)
     original_ref_path = user_config["inputs"]["reference_elev"]["path_to_elev"]
@@ -364,8 +370,13 @@ def test_prepare_datas_with_overlap(
 
 @pytest.mark.parametrize("process", [True, False])
 @pytest.mark.parametrize("sampling_grid", ["reference_elev", "to_be_aligned_elev"])
+@pytest.mark.parametrize("execution", [None, {"dask": {"chunks": {"x": 200, "y": 200}}}])
 def test_no_overlap(
-    get_accuracy_inputs_test: Dict[str, Any], tmp_path: Path, process: bool, sampling_grid: str
+    get_accuracy_inputs_test: Dict[str, Any],
+    tmp_path: Path,
+    process: bool,
+    sampling_grid: str,
+    execution: dict[str, Any] | None,
 ) -> None:
     """Test coreg/no coreg processes when ref and tba do not overlap."""
     user_config = get_accuracy_inputs_test
@@ -404,13 +415,21 @@ def test_no_overlap(
         (False, False),
     ],
 )
-def test_mask(tmp_path: Path, get_accuracy_inputs_test: Dict[str, Any], masked: tuple[bool, bool]) -> None:
+@pytest.mark.parametrize("execution", [None, {"dask": {"chunks": {"x": 200, "y": 200}}}])
+def test_mask(
+    tmp_path: Path,
+    get_accuracy_inputs_test: Dict[str, Any],
+    masked: tuple[bool, bool],
+    execution: dict[str, Any] | None,
+) -> None:
     """
     Test mask initialization and correg
     """
     user_config = get_accuracy_inputs_test
     masked_ref, masked_tba = masked
     user_config["outputs"] = {"path": str(tmp_path), "level": 2}
+    user_config["scalability"] = execution
+
     ref_dem_path = xdem.examples.get_path_test("longyearbyen_ref_dem")
     tba_dem_path = xdem.examples.get_path_test("longyearbyen_tba_dem")
     mask_ref_dem_path = xdem.examples.get_path_test("longyearbyen_glacier_outlines")
@@ -473,15 +492,18 @@ def test_mask(tmp_path: Path, get_accuracy_inputs_test: Dict[str, Any], masked: 
 # @pytest.mark.parametrize("vcrs_second_step", [[None, "EGM96"],["EGM96", None]])
 @pytest.mark.parametrize("sampling_grid_first_step", ["reference_elev", "to_be_aligned_elev"])
 # @pytest.mark.parametrize("sampling_grid_second_step", ["reference_elev", "to_be_aligned_elev"])
+@pytest.mark.parametrize("execution", [None, {"dask": {"chunks": {"x": 200, "y": 200}}}])
 def test_vcrs_change(
     tmp_path: Path,
     get_accuracy_inputs_test: Dict[str, Any],
     vcrs_first_step: list[str | None],
     sampling_grid_first_step: str,
+    execution: dict[str, Any] | None,
 ) -> None:
     user_config = get_accuracy_inputs_test
     user_config["inputs"]["reference_elev"]["force_vcrs"] = vcrs_first_step[0]
     user_config["inputs"]["to_be_aligned_elev"]["force_vcrs"] = vcrs_first_step[1]
+    user_config["scalability"] = execution
 
     ref = xdem.DEM(user_config["inputs"]["reference_elev"]["path_to_elev"])
     ref.set_vcrs("Ellipsoid")
